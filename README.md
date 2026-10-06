@@ -7,7 +7,8 @@ foreground task trees as checkpointed phase handlers, with durable waits, held
 outcomes, subtree cancellation, and bottom-up abort cleanup. Startup normalization
 changes interrupted running tasks back to pending. A provider-neutral agent layer
 adds durable model/tool turns using host-supplied callbacks. There is no automatic
-scheduler or built-in network provider.
+scheduler. An opt-in OpenAI Responses package provides asynchronous networking
+without adding a provider or executor dependency to the core libraries.
 
 ## Try the persistence demo
 
@@ -43,12 +44,16 @@ from allocation but is not automatically created; ordinary IDs start at 2.
 - `agent/` — `publicworks-agent`: immutable model/tool installation, atomic turn
   admission, pinned requests, fork-aware context projection, ordered tool children,
   and conservative interrupted-effect recovery. No provider or executor dependency.
+- `providers/openai/` — `publicworks-provider-openai`: opt-in, non-streaming
+  OpenAI Responses text/function-call adapter using reqwest/rustls. Requires a
+  Tokio host; excluded from the workspace's default members.
 - `storage/sqlite/` — `publicworks-storage-sqlite`: `SqliteStorage::open(path)`;
   bundled SQLite through rusqlite, no external server.
 - `cli/` — `publicworks-cli`: the `publicworks` binary, composing the public
   Session interface and SQLite with futures-lite.
 
-Both adapters return boxed futures but **block while polled**. SQLite uses WAL,
+The in-memory and SQLite storage adapters return boxed futures but **block while
+polled**. The opt-in HTTP provider uses asynchronous network I/O. SQLite uses WAL,
 NORMAL synchronization, and one transaction per batch. This is an embedded,
 single-logical-owner foundation, not a multiwriter runtime or a power-loss
 persistence guarantee. The current schema is Public Works' own v3. There are no
@@ -191,6 +196,46 @@ under its model-round limit. A model can request a similar action with a new cal
 ID, so approvals and external idempotency remain application responsibilities.
 Cancellation does not undo effects. See the
 agent contract for the API and limits.
+
+## Opt in to OpenAI Responses
+
+`publicworks-provider-openai` implements the same `Model` interface with a real
+asynchronous HTTP client. Use `OpenAiResponses::new(api_key)` or
+`OpenAiResponses::with_config(api_key, Config { .. })` and install it in the agent.
+Poll the host on a Tokio runtime with I/O and time enabled; a current-thread
+runtime is enough. Runtime and agent themselves remain executor-neutral.
+
+The live example uses `gpt-4.1-mini`. It is not run by the test suite and requires
+an explicit credential; running it sends data to OpenAI and can incur charges:
+
+```sh
+# Set OPENAI_API_KEY securely in your host environment first.
+cargo run -p publicworks-provider-openai --example openai_turn
+```
+
+Credentials belong in the host environment/memory, never durable turn
+configuration. The default endpoint is `https://api.openai.com/v1/responses`,
+with a 120-second timeout and an 8 MiB response cap. Configuration accepts a
+validated full HTTPS URL (numeric loopback HTTP is allowed for fixtures).
+Redirects, retries, and ambient proxies are disabled.
+
+The adapter supports text and local function calls, not every OpenAI model:
+reasoning, streaming, images, OAuth, and built-in remote tools are unsupported.
+Unknown semantic output, refusals, or incomplete output fail rather than produce
+executable calls. Local tools still execute sequentially.
+
+Model inputs, outputs, tool data, partial text, and usage can be persisted; this
+adapter is not a secret scrubber. Cancellation and timeouts cannot undo server
+work or billing. Recovery may replay a request and bill twice. `store:false`
+is sent on every request but is not a zero-retention guarantee. See the
+provider contract for the full boundary.
+
+No credentials or real API calls are needed for provider tests:
+
+```sh
+cargo test -p publicworks-provider-openai --locked
+cargo test -p publicworks-provider-openai --locked --features serde_json/arbitrary_precision
+```
 
 ## Cancel a task durably
 

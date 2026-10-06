@@ -20,6 +20,7 @@ pub use task::{
     JoinPolicy, TaskOutcome, TaskOutcomeError, TaskQuery, TaskRecord, TaskState, TaskStatus,
 };
 mod json;
+pub use json::decode_native_json;
 mod memory;
 pub use memory::MemoryStorage;
 #[doc(hidden)]

@@ -32,6 +32,22 @@ pub(crate) fn native_number(number: &Number) -> Result<(), StorageError> {
     }
 }
 
+/// Decode one complete JSON value into the runtime's native payload domain.
+///
+/// This is a pure parser: it performs no storage operation and reports validation
+/// failures as [`StorageError::Other`]. Arrays and objects are limited to 64
+/// levels. Numbers use serde_json's native i64, u64, or finite f64
+/// representation; canonical f64 spellings round-trip with `float_roundtrip`.
+/// When `serde_json/arbitrary_precision` is unified into the build, retained
+/// non-native or noncanonical number tokens are conservatively rejected. This
+/// API does not promise arbitrary decimal precision or preservation of number
+/// spelling.
+pub fn decode_native_json(bytes: &[u8]) -> Result<serde_json::Value, StorageError> {
+    let raw: &RawValue =
+        serde_json::from_slice(bytes).map_err(|error| invalid(&error.to_string()))?;
+    decode(raw, 0)
+}
+
 pub(crate) fn decode(raw: &RawValue, parents: usize) -> Result<Value, StorageError> {
     let text = raw.get();
     let parse_error = |e: serde_json::Error| invalid(&e.to_string());
