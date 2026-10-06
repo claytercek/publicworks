@@ -12,7 +12,6 @@ pub(super) async fn execute(
 ) -> Result<RunResult, RunError> {
     let definitions = registry.clone();
     let inv = invocation.clone();
-    let control = Rc::downgrade(&session.control);
     let reservation = session
         .commit_reservation(invocation.clone(), move |tx| {
             Box::pin(async move {
@@ -23,11 +22,19 @@ pub(super) async fn execute(
                 let Some(mut record) = tx.task(inv.id).await? else {
                     return Ok(Some(RunResult::Blocked(BlockReason::MissingTask)));
                 };
+                if record.status() == TaskStatus::Terminal {
+                    // Initial terminal roots were blocked by the drive. Here an
+                    // acknowledged abort may have orphaned a selected task.
+                    return Ok(Some(RunResult::Terminal(record)));
+                }
                 if record.status() != TaskStatus::Pending {
                     return Ok(Some(RunResult::Blocked(BlockReason::NotPending)));
                 }
                 if !supported(tx, &record).await? {
                     return Ok(Some(RunResult::Blocked(BlockReason::UnsupportedScope)));
+                }
+                if record.abort_requested && tx.tree().await?.owned_live(record.id) {
+                    return Ok(Some(RunResult::Suspended(record)));
                 }
                 let definition = definitions.0.get(&record.kind);
                 let missing = definition.is_none();
@@ -56,11 +63,6 @@ pub(super) async fn execute(
                     unreachable!()
                 };
                 record.state = TaskState::Running { checkpoint };
-                control
-                    .upgrade()
-                    .ok_or(SessionError::DriverStopped)?
-                    .borrow_mut()
-                    .leaf = Rc::downgrade(&inv);
                 tx.set_task(record).await?;
                 Ok(None)
             })
@@ -79,7 +81,7 @@ pub(super) async fn execute(
             .commit_join(invocation.clone(), move |tx| {
                 Box::pin(async move {
                     tx.fence(inv.clone(), true);
-                    let record = tx
+                    let mut record = tx
                         .task(inv.id)
                         .await?
                         .ok_or_else(|| SessionError::Invalid("Task disappeared".into()))?;
@@ -90,6 +92,14 @@ pub(super) async fn execute(
                     if inv.check().is_err() || record.status() != TaskStatus::Running {
                         inv.end();
                         return Ok(Decision::Done(RunResult::Interrupted));
+                    }
+                    if record.abort_requested && tx.tree().await?.owned_live(record.id) {
+                        if let TaskState::Running { checkpoint } = record.state {
+                            record.state = TaskState::Pending { checkpoint };
+                        }
+                        tx.set_task(record.clone()).await?;
+                        inv.end();
+                        return Ok(Decision::Done(RunResult::Suspended(record)));
                     }
                     let definition = definitions
                         .0
@@ -169,7 +179,7 @@ pub(super) async fn execute(
                         return Ok(Some(if record.status() == TaskStatus::Terminal {
                             RunResult::Terminal(record)
                         } else {
-                            RunResult::Interrupted
+                            RunResult::Suspended(record)
                         }));
                     }
                     if inv.check().is_err() {
@@ -194,13 +204,21 @@ pub(super) async fn execute(
                         }
                     });
                     if let Some(error) = failure {
-                        record.state = TaskState::Terminal {
-                            outcome: TaskOutcome::Faulted { error },
+                        let held = tx.tree().await?.owned_live(record.id);
+                        let outcome = TaskOutcome::Faulted { error };
+                        record.state = if held {
+                            TaskState::Completing { outcome }
+                        } else {
+                            TaskState::Terminal { outcome }
                         };
                         record.memos = None;
                         tx.set_task(record.clone()).await?;
                         inv.end();
-                        Ok(Some(RunResult::Terminal(record)))
+                        Ok(Some(if held {
+                            RunResult::Suspended(record)
+                        } else {
+                            RunResult::Terminal(record)
+                        }))
                     } else {
                         Ok(None)
                     }
@@ -219,39 +237,11 @@ pub(super) async fn execute(
     }
 }
 pub(super) async fn supported(tx: &Tx, record: &TaskRecord) -> Result<bool, SessionError> {
-    if record.background || record.owner.is_some() {
-        return Ok(false);
-    }
-    let conversation = tx.conversation(record.conversation_id).await?;
-    Ok(conversation.is_some_and(|c| c.owner.is_none()) && !has_owned(tx, record.id).await?)
-}
-async fn has_owned(tx: &Tx, task: Id) -> Result<bool, SessionError> {
-    if !tx
-        .scan_conversations(
-            ConversationQuery {
-                owner_task_id: Some(task),
-                ..Default::default()
-            },
-            1,
-            None,
-        )
-        .await?
-        .items
-        .is_empty()
-    {
-        return Ok(true);
-    }
-    let mut cursor = None;
-    loop {
-        let page = tx.scan_tasks(TaskQuery::default(), 128, cursor).await?;
-        if page.items.iter().any(|record| record.owner == Some(task)) {
-            return Ok(true);
-        }
-        cursor = page.next;
-        if cursor.is_none() {
-            return Ok(false);
-        }
-    }
+    let tree = tx.tree().await?;
+    Ok(tree
+        .root(record.id)
+        .and_then(|root| tree.scope(root))
+        .is_some())
 }
 
 // Numeric equality follows JSON value semantics rather than integer/float encoding.

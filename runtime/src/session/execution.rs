@@ -1,4 +1,4 @@
-//! Explicit foreground leaf execution, outside the Session mutation queue.
+//! Explicit foreground tree execution, outside the Session mutation queue.
 use super::*;
 use std::{cell::Cell, collections::BTreeMap, rc::Weak};
 
@@ -88,6 +88,7 @@ pub enum BlockReason {
 #[derive(Clone, Debug, PartialEq)]
 pub enum RunResult {
     Terminal(TaskRecord),
+    Suspended(TaskRecord),
     Blocked(BlockReason),
     Interrupted,
 }
@@ -157,6 +158,7 @@ struct RunnerState {
     session_error: Option<SessionError>,
     waker: Option<Waker>,
     active: Weak<Invocation>,
+    drive: Weak<drive::Drive>,
 }
 pub(super) struct RunnerControl(RefCell<RunnerState>);
 impl RunnerControl {
@@ -199,9 +201,6 @@ pub(super) struct Invocation {
     runner: Weak<RunnerControl>,
 }
 impl Invocation {
-    pub(super) fn guards(&self, id: Id) -> bool {
-        self.id == id && !self.ended.get()
-    }
     fn signal(&self) {
         self.cancelled.set(true);
         for waker in self.waiters.take() {
@@ -251,13 +250,19 @@ impl Invocation {
 
 // Driver forfeiture fences writes even while private preparation reads await.
 // Closing alone does not cancel a callback that already passed its entry gate.
-pub(super) struct PersistenceFence {
-    pub(super) invocation: Rc<Invocation>,
-    pub(super) ending: bool,
+pub(super) enum PersistenceFence {
+    Invocation {
+        invocation: Rc<Invocation>,
+        ending: bool,
+    },
+    Drive(Rc<drive::Drive>),
 }
 impl PersistenceFence {
     pub(super) fn check(&self) -> Result<(), SessionError> {
-        let inv = &self.invocation;
+        let (inv, ending) = match self {
+            Self::Drive(drive) => return drive.check(),
+            Self::Invocation { invocation, ending } => (invocation, ending),
+        };
         let valid = inv.runner.upgrade().is_some_and(|runner| {
             let state = runner.0.borrow();
             !state.finished
@@ -267,7 +272,7 @@ impl PersistenceFence {
                     .upgrade()
                     .is_some_and(|active| Rc::ptr_eq(&active, inv))
         });
-        if !valid || (inv.ended.get() && !self.ending) {
+        if !valid || (inv.ended.get() && !*ending) {
             Err(SessionError::Invalid(
                 "Task invocation ended before persistence".into(),
             ))
@@ -304,6 +309,9 @@ impl Drop for TaskDriver {
         state.finished = true;
         let requests = std::mem::take(&mut state.requests);
         let active = state.active.upgrade();
+        if let Some(drive) = state.drive.upgrade() {
+            drive.ended.set(true);
+        }
         drop(state);
         if let Some(active) = active {
             active.end();
@@ -327,7 +335,7 @@ impl TaskRunner {
         }
         let control = Rc::new(RunnerControl(RefCell::new(RunnerState::default())));
         session_control.runner = Rc::downgrade(&control);
-        session_control.leaf = Weak::new();
+        session_control.tree = Weak::new();
         drop(session_control);
         let session = session.clone();
         let (sender, receiver) = oneshot::channel();
@@ -359,24 +367,20 @@ impl TaskRunner {
                     let _ = request.sender.send(Ok(RunResult::Interrupted));
                     continue;
                 }
-                let invocation = Rc::new(Invocation {
-                    id: request.id,
-                    abort_mode: false,
-                    joined: RefCell::new(Vec::new()),
+                let drive = Rc::new(drive::Drive {
+                    root: request.id,
                     ended: Cell::new(false),
-                    cancelled: Cell::new(false),
-                    waiters: RefCell::new(Vec::new()),
                     runner: Rc::downgrade(&owner),
                 });
-                owner.0.borrow_mut().active = Rc::downgrade(&invocation);
-                let result = AssertUnwindSafe(execute(&session, &registry, invocation.clone()))
+                owner.0.borrow_mut().drive = Rc::downgrade(&drive);
+                let result = AssertUnwindSafe(drive::execute(&session, &registry, drive.clone()))
                     .catch_unwind()
                     .await;
+                drive.ended.set(true);
                 let active = owner.0.borrow().active.upgrade();
                 if let Some(active) = active {
                     active.end();
                 }
-                invocation.end();
                 let result =
                     result.unwrap_or_else(|panic| Err(RunError::Panicked(panic_message(&*panic))));
                 let _ = request.sender.send(result);
@@ -433,6 +437,11 @@ impl TaskRunner {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TaskUpdate {
     Checkpoint(Value),
+    Wait {
+        checkpoint: Value,
+        on: Vec<Id>,
+        policy: JoinPolicy,
+    },
     Complete(Value),
     Fail(TaskOutcomeError, Option<Value>),
     Abort {
@@ -499,6 +508,9 @@ impl TaskRuntime {
                     return Err(SessionError::Invalid("Task invocation ended".into()));
                 }
                 if let Some(update) = update {
+                    if invocation.abort_mode && matches!(update, TaskUpdate::Wait { .. }) {
+                        return Err(SessionError::Invalid("Abort handlers cannot wait".into()));
+                    }
                     tx.update_task(invocation.id, update).await?;
                 }
                 Ok(())
@@ -524,8 +536,9 @@ fn fault(message: impl Into<String>) -> TaskOutcomeError {
 }
 
 mod abort;
+pub(super) mod drive;
 mod phase;
-use phase::execute;
+pub(super) mod tree;
 
 #[cfg(test)]
 mod tests;

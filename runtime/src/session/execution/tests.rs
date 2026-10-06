@@ -66,7 +66,7 @@ fn captured() -> (TaskDefinition, oneshot::Receiver<TaskRuntime>) {
 }
 
 #[test]
-fn leaf_guard_checks_all_transactions_and_both_staging_orders() {
+fn tree_guard_checks_all_transactions_and_both_staging_orders() {
     block_on(async {
         let (definition, context) = captured();
         let (session, driver) = Session::new(MemoryStorage::new());
@@ -100,7 +100,11 @@ fn leaf_guard_checks_all_transactions_and_both_staging_orders() {
                                 })
                             })
                             .await;
-                        assert!(matches!(result, Err(SessionError::Invalid(_))));
+                        if conversation {
+                            assert!(matches!(result, Err(SessionError::Invalid(_))));
+                        } else {
+                            result.unwrap();
+                        }
                     }
                 }
                 let result = runtime
@@ -329,6 +333,8 @@ fn driver_drop_fences_pending_callbacks_releases_lease_and_wakes_waiters() {
         tick(&mut driver).await;
         let task = seeding.await;
         let run = runner.run(task.id);
+        tick(&mut task_driver).await;
+        tick(&mut driver).await;
         tick(&mut task_driver).await;
         tick(&mut driver).await;
         tick(&mut task_driver).await;
@@ -586,6 +592,8 @@ fn runner_close_joins_dropped_runtime_mutation_during_session_close() {
         tick(&mut task_driver).await;
         tick(&mut driver).await;
         tick(&mut task_driver).await;
+        tick(&mut driver).await;
+        tick(&mut task_driver).await;
         let runtime = context.await.unwrap();
         let gate = Gate::default();
         *probe.commit_gate.borrow_mut() = Some(gate.clone());
@@ -767,6 +775,8 @@ fn cancellation_wakers_can_reenter_session_admission_without_borrow_panics() {
             tick(&mut task_driver).await;
             tick(&mut driver).await;
             tick(&mut task_driver).await;
+            tick(&mut driver).await;
+            tick(&mut task_driver).await;
             let runtime = context.await.unwrap();
             REENTER.with(|slot| *slot.borrow_mut() = Some(session.clone()));
             WAKES.with(|count| count.set(0));
@@ -821,6 +831,8 @@ fn task_driver_drop_does_not_cancel_a_storage_commit_already_started() {
         tick(&mut driver).await;
         let task = seeding.await;
         let run = runner.run(task.id);
+        tick(&mut task_driver).await;
+        tick(&mut driver).await;
         tick(&mut task_driver).await;
         tick(&mut driver).await;
         tick(&mut task_driver).await;
@@ -892,3 +904,5 @@ fn memo_only_commits_are_not_checkpoint_progress() {
 }
 
 mod abort;
+
+mod tree;

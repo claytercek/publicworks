@@ -3,8 +3,8 @@
 Public Works is our own Rust runtime project, modeled on Pi Durable. The working
 slice is a **Session transaction layer for conversations, immutable entries, and
 durable tasks**, with in-memory and SQLite storage. Hosts can explicitly run
-foreground leaf tasks as checkpointed phase handlers, including durable cancellation
-and abort cleanup. Startup normalization
+foreground task trees as checkpointed phase handlers, with durable waits, held
+outcomes, subtree cancellation, and bottom-up abort cleanup. Startup normalization
 changes interrupted running tasks back to pending. There is no automatic scheduler,
 LLM integration, or agent executor.
 
@@ -108,7 +108,7 @@ public commit stream or view subscription yet, so no subscriber queue to grow.
 See the design contract for the boundary
 between inherited Pi behavior and Rust driver/cancellation mapping.
 
-## Create and execute a leaf task
+## Create and execute a task tree
 
 `TaskDefinition::new(kind, version, initial, phases)` combines a reusable
 synchronous initial-checkpoint function with a `BTreeMap<String, PhaseHandler>`.
@@ -128,25 +128,34 @@ admitted run requests and handler futures; SessionDriver remains the only Storag
 owner. A handler awaiting external work does not occupy the Session queue.
 Dropping a run waiter does not cancel its request.
 
-Only pending foreground tasks owned by an ownerless conversation
-and owning no tasks or conversations can run. The installed definition's version
-must exactly match the stored version. Other cases return `RunResult::Blocked`
-without writes. There is one active invocation per attached runner, with no
-background scheduling, task waits, cascades, or owned-completion supervision.
-An abort-marked pending task runs its abort handler instead of its normal phases.
+`run(root)` drives a foreground root and its task-owned descendants in one
+ownerless conversation, with only one handler active at a time. Background work
+and task-owned conversations anywhere below the root are unsupported. The root
+must be conversation-owned; `run(child)` is not a second hosting mode. Pending,
+waiting, and completing roots can be driven, but unrecovered running records
+require `Session::open_recovered` first. Terminal roots return `Blocked(NotPending)`.
+
+Normal execution requires an exact definition version. A blocked root does not
+prevent eligible children from running. `RunResult::Terminal` is a durable root
+receipt; `Suspended(TaskRecord)` is the durable root at quiescence, when no
+supported work can execute. There is no global scheduler, timer, or automatic
+retry: explicitly run the root again when an observed external dependency changes.
 
 A handler receives its detached task and a `TaskRuntime`. It calls
 `runtime.commit(|tx, current| ...)` to atomically write entries and return an
-optional `TaskUpdate::Checkpoint`, `Complete`, `Fail`, or `Abort { reason, result }`. Entries receive task
+optional `TaskUpdate::Checkpoint`, `Wait { checkpoint, on, policy }`, `Complete`,
+`Fail`, or `Abort { reason, result }`. Entries receive task
 attribution automatically. Each successful phase must change its structural
-checkpoint or commit an outcome; returning without durable progress faults the
+checkpoint, commit a wait, or commit an outcome; returning without durable progress faults the
 task. External effects are not part of the storage transaction and are not
 exactly-once.
 
-Run the complete [host example](runtime/examples/task_execution.rs):
+Run the [leaf host example](runtime/examples/task_execution.rs) or the
+[tree example](runtime/examples/task_tree.rs):
 
 ```sh
 cargo run -p publicworks-runtime --example task_execution
+cargo run -p publicworks-runtime --example task_tree
 ```
 
 On shutdown, await `runner.close()` while polling both drivers, then await
@@ -163,21 +172,23 @@ See the execution contract for details.
 `runner.abort(id)` immediately admits a Session-owned command. Its `AbortWaiter`
 returns `Result<AbortResult, RunError>`: `Marked`, `Terminal`, or
 `Blocked(BlockReason)`. `Marked` means the mutation was acknowledged and the
-normal invocation observed on the Session line has ended. It does **not** mean
+target's normal invocation observed on the Session line has ended. It does **not** mean
 cleanup finished or the task has an aborted outcome. Missing targets error;
-unsupported scopes are untouched. Terminal targets and repeated marks consume no
-commit sequence. Missing definitions or exact-version mismatches orphan an
-eligible target directly and also return `Marked`.
+unsupported scopes are untouched. Abort can target the root or a descendant;
+it marks that subtree, not unrelated siblings. Terminal targets and unchanged
+repeated marks consume no commit sequence. Missing definitions or exact-version
+mismatches orphan a target only after its owned descendants have drained.
 
-The normal handler is signalled only after durable acknowledgement. An active run
-hands off to a fresh, initially unsignalled abort invocation. Repeated requests do
+Affected normal handlers are signalled only after durable acknowledgement,
+even when a child is waiting for cancellation while its parent is waiting on it.
+Cleanup runs bottom-up with fresh, initially unsignalled abort invocations. Repeated requests do
 not cancel cleanup. The default handler commits `Aborted`; use
 `definition.with_abort_handler(handler)` to install a `PhaseHandler`-shaped custom
 handler. It must commit `Abort`, `Complete`, or `Fail`. Returning without an outcome
 faults, even after checkpoint or entry writes. Abort dispatch does not validate
 the normal checkpoint's phase.
 
-An **inactive** marked pending task needs an explicit `runner.run(id)` to execute
+An **inactive** marked task needs an explicit `runner.run(root)` to execute
 cleanup. There is no automatic scan or cleanup queue. Never await your own
 `runner.abort(id)` from its current normal handler: it joins that invocation and
 would deadlock. Enqueuing without awaiting is allowed.
@@ -201,7 +212,9 @@ Plain `Session::new` remains unchanged.
 
 Opening runs no task code. Unknown kinds/versions are preserved, and waiting,
 completing, and terminal states are not reconciled. After opening, explicitly
-attach a runner and request each desired run. There is no definition migration or
+attach a runner and request each desired root run. Waits, completing outcomes,
+and cascades are reconciled lazily by those explicit runs, not on opening as in
+Pi's full scheduler. There is no definition migration or
 schema migration framework. Dropping the opening waiter still leaves normalization
 and close owned by the driver. See the task persistence contract.
 
@@ -221,9 +234,10 @@ schemas, corrupt reads, and Session transactions across reopen. Session tests
 cover FIFO settlement, failed callbacks, fork validation, poison classification,
 panics, abandoned operations, waiter/driver drops, close, task ownership and
 replacement validation, and startup normalization. Execution tests cover phase
-progress and error precedence, attribution, leaf guards, invocation fencing,
+progress and error precedence, attribution, drive-lifetime tree guards, invocation fencing,
 rejection versus uncertain commits, cooperative shutdown, and SQLite reopen.
-Task storage checks run under
+Tree tests cover joins, held outcomes, bottom-up cancellation, acknowledgement
+races, scope validation, quiescence, and SQLite recovery. Task storage checks run under
 both default and feature-unified serde_json. SQLite rejects incompatible schemas
 rather than migrating them. The executable
 smoke test runs create/append/show in

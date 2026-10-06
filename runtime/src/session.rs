@@ -95,7 +95,7 @@ struct Control {
     handles: usize,
     waker: Option<Waker>,
     runner: std::rc::Weak<execution::RunnerControl>,
-    leaf: std::rc::Weak<execution::Invocation>,
+    tree: std::rc::Weak<execution::drive::Drive>,
 }
 type RunnerNotification = (Rc<execution::RunnerControl>, bool, bool, bool);
 fn notify_runner(notification: Option<RunnerNotification>) {
@@ -201,7 +201,7 @@ impl Session {
             handles: 1,
             waker: None,
             runner: Default::default(),
-            leaf: Default::default(),
+            tree: Default::default(),
         }));
         let (sender, receiver) = oneshot::channel();
         let close: CloseWaiter =

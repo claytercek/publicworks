@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) struct TaskCandidate {
     created: bool,
+    validate_wait: bool,
     record: TaskRecord,
 }
 pub(super) async fn current_task(
@@ -107,6 +108,7 @@ impl Tx {
                     id,
                     TaskCandidate {
                         created: true,
+                        validate_wait: false,
                         record: record.clone(),
                     },
                 );
@@ -120,8 +122,18 @@ impl Tx {
                 let mut record = current_task(storage, &state, id)
                     .await?
                     .ok_or_else(|| SessionError::Invalid("Task disappeared".into()))?;
+                let validate_wait = matches!(update, TaskUpdate::Wait { .. });
                 record.state = match update {
                     TaskUpdate::Checkpoint(checkpoint) => TaskState::Running { checkpoint },
+                    TaskUpdate::Wait {
+                        checkpoint,
+                        on,
+                        policy,
+                    } => TaskState::Waiting {
+                        checkpoint,
+                        on,
+                        policy,
+                    },
                     TaskUpdate::Complete(result) => TaskState::Terminal {
                         outcome: TaskOutcome::Completed { result },
                     },
@@ -142,7 +154,14 @@ impl Tx {
                     replaceable(&previous.record, &record)?;
                 }
                 let created = previous.is_some_and(|v| v.created);
-                state.tasks.insert(id, TaskCandidate { created, record });
+                state.tasks.insert(
+                    id,
+                    TaskCandidate {
+                        created,
+                        validate_wait,
+                        record,
+                    },
+                );
                 Ok(())
             })
         })
@@ -158,9 +177,15 @@ impl Tx {
                     replaceable(&previous.record, &record)?;
                 }
                 let created = previous.is_some_and(|v| v.created);
-                state
-                    .tasks
-                    .insert(record.id, TaskCandidate { created, record });
+                let validate_wait = previous.is_some_and(|v| v.validate_wait);
+                state.tasks.insert(
+                    record.id,
+                    TaskCandidate {
+                        created,
+                        validate_wait,
+                        record,
+                    },
+                );
                 Ok(())
             })
         })
@@ -196,7 +221,7 @@ async fn final_task(
 pub(super) async fn assemble(
     storage: &mut dyn Storage,
     mut writes: Vec<StorageWrite>,
-    tasks: BTreeMap<Id, TaskCandidate>,
+    mut tasks: BTreeMap<Id, TaskCandidate>,
     control: Rc<RefCell<Control>>,
 ) -> Result<Vec<StorageWrite>, SessionError> {
     let mut owners = Vec::new();
@@ -239,16 +264,6 @@ pub(super) async fn assemble(
         }
     }
     for (id, conversation) in owners {
-        if control
-            .borrow()
-            .leaf
-            .upgrade()
-            .is_some_and(|inv| inv.guards(id))
-        {
-            return Err(SessionError::Invalid(
-                "Reserved leaf task cannot acquire owned work".into(),
-            ));
-        }
         let owner = final_task(storage, &tasks, id).await?;
         if matches!(
             owner.status(),
@@ -261,6 +276,50 @@ pub(super) async fn assemble(
         }
         if owner.conversation_id != conversation {
             return Err(SessionError::Invalid("Owner conversation mismatch".into()));
+        }
+    }
+    let guarded = control.borrow().tree.upgrade().is_some_and(|d| d.live());
+    let changes_ownership = !tasks.is_empty()
+        || writes
+            .iter()
+            .any(|w| matches!(w, StorageWrite::Conversation(r) if r.owner.is_some()));
+    let needs_outcome_view = tasks
+        .values()
+        .any(|c| c.validate_wait || c.record.status() == TaskStatus::Terminal);
+    if needs_outcome_view || (guarded && changes_ownership) {
+        let mut tree = execution::tree::Tree::load(storage).await?;
+        for candidate in tasks.values() {
+            tree.tasks
+                .insert(candidate.record.id, candidate.record.clone());
+        }
+        for write in &writes {
+            if let StorageWrite::Conversation(record) = write {
+                tree.conversations.insert(record.id, record.clone());
+            }
+        }
+        for candidate in tasks.values().filter(|c| c.validate_wait) {
+            tree.validate_wait(&candidate.record)?;
+        }
+        // Final-owner validation above deliberately runs BEFORE outcome holding.
+        // Spawn+Complete is not permission to acquire work on a final owner.
+        for candidate in tasks.values_mut() {
+            if let TaskState::Terminal { outcome } = &candidate.record.state
+                && tree.owned_live(candidate.record.id)
+            {
+                candidate.record.state = TaskState::Completing {
+                    outcome: outcome.clone(),
+                };
+                tree.tasks
+                    .insert(candidate.record.id, candidate.record.clone());
+            }
+        }
+        let drive = control.borrow().tree.upgrade().filter(|d| d.live());
+        if let Some(drive) = drive
+            && tree.scope(drive.root).is_none()
+        {
+            return Err(SessionError::Invalid(
+                "Active task tree cannot acquire unsupported scope".into(),
+            ));
         }
     }
     writes.extend(tasks.into_values().map(|v| StorageWrite::Task(v.record)));

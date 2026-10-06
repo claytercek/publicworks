@@ -38,6 +38,8 @@ enum Fault {
 struct Probe {
     events: RefCell<Vec<&'static str>>,
     task_reads: Cell<usize>,
+    scan_reads: Cell<usize>,
+    scan_gate: RefCell<Option<(usize, Gate)>>,
     task_gate: RefCell<Option<(usize, Gate)>>,
     commit_gate: RefCell<Option<Gate>>,
     fault: RefCell<Fault>,
@@ -121,7 +123,13 @@ impl Storage for Store {
         limit: usize,
         cursor: Option<Cursor>,
     ) -> StorageFuture<'_, Page<TaskRecord>> {
-        self.memory.scan_tasks(query, limit, cursor)
+        Box::pin(async move {
+            let count = self.probe.scan_reads.get() + 1;
+            self.probe.scan_reads.set(count);
+            let gate = self.probe.scan_gate.borrow().clone();
+            if let Some((at, gate)) = gate && at == count { gate.wait().await; }
+            self.memory.scan_tasks(query, limit, cursor).await
+        })
     }
     fn entry(&mut self, id: Id) -> StorageFuture<'_, Option<StoredEntry>> {
         self.memory.entry(id)

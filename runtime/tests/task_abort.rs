@@ -795,10 +795,11 @@ fn abort_handles_orphans_unsupported_scope_missing_tasks_and_terminal_noops() {
 }
 
 #[test]
-fn owned_terminal_child_after_first_scan_page_blocks_without_writes() {
+fn owned_terminal_child_after_first_scan_page_is_supported() {
     block_on(async {
         let mut storage = memory().await;
-        let target = seeded_abort_task(10);
+        let mut target = seeded_abort_task(10);
+        target.abort_requested = false;
         let mut writes = vec![StorageWrite::Task(target.clone())];
         for id in 20..170 {
             let mut child = seeded_abort_task(id);
@@ -845,17 +846,16 @@ fn owned_terminal_child_after_first_scan_page_blocks_without_writes() {
         zip(
             async {
                 let before = marker(&session).await;
-                assert_eq!(
-                    runner.abort(target.id).await.unwrap(),
-                    AbortResult::Blocked(BlockReason::UnsupportedScope)
-                );
-                assert_eq!(read(&session, target.id).await, target);
+                assert_eq!(runner.abort(target.id).await.unwrap(), AbortResult::Marked);
+                let mut marked = target.clone();
+                marked.abort_requested = true;
+                assert_eq!(read(&session, target.id).await, marked);
                 assert_eq!(
                     runner.abort(terminal_target.id).await.unwrap(),
                     AbortResult::Terminal
                 );
                 assert_eq!(read(&session, terminal_target.id).await, terminal_target);
-                assert_eq!(marker(&session).await.get(), before.get() + 1);
+                assert_eq!(marker(&session).await.get(), before.get() + 2);
                 runner.close().await.unwrap();
                 session.close().await.unwrap();
             },

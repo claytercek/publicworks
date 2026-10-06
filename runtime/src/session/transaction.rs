@@ -62,7 +62,16 @@ pub struct Tx {
 }
 impl Tx {
     pub(super) fn fence(&self, invocation: Rc<execution::Invocation>, ending: bool) {
-        self.state.borrow_mut().fence = Some(execution::PersistenceFence { invocation, ending });
+        self.state.borrow_mut().fence =
+            Some(execution::PersistenceFence::Invocation { invocation, ending });
+    }
+    pub(super) fn drive_fence(&self, drive: Rc<execution::drive::Drive>) {
+        self.state.borrow_mut().fence = Some(execution::PersistenceFence::Drive(drive));
+    }
+    pub(super) fn tree(&self) -> TxFuture<'_, execution::tree::Tree> {
+        self.operation(false, move |storage, _| {
+            Box::pin(execution::tree::Tree::load(storage))
+        })
     }
     pub(super) fn attribute(&self, task: Id) {
         self.state.borrow_mut().by_task_id = Some(task);

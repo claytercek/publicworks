@@ -421,7 +421,7 @@ fn driver_drop_fences_abort_reservation_and_outcome_preparation_not_dispatched_s
 }
 
 #[test]
-fn abort_handoff_keeps_leaf_guard_for_both_candidate_staging_orders() {
+fn abort_handoff_keeps_tree_guard_for_both_candidate_staging_orders() {
     block_on(async {
         let (definition, context) = captured();
         let definition = definition.with_abort_handler(Rc::new(|_, runtime| {

@@ -477,6 +477,7 @@ fn blocked_requests_do_not_write_or_advance_sequence() {
                 }
                 5 => {
                     task.owner = Some(Id::new(10).unwrap());
+                    task.background = true; // Unsupported anywhere in the requested tree.
                     BlockReason::UnsupportedScope
                 }
                 6 => {
@@ -497,7 +498,7 @@ fn blocked_requests_do_not_write_or_advance_sequence() {
                     };
                     BlockReason::NotPending
                 }
-                _ => BlockReason::UnsupportedScope, // 10 owns task 5; 11 owns conversation 20.
+                _ => BlockReason::UnsupportedScope, // 10 owns background task 5; 11 owns conversation 20.
             };
             cases.push((task.id, reason));
             records.push(task);
@@ -608,7 +609,7 @@ fn dropped_waiters_still_run_and_drain_commits_before_phase_decisions() {
 }
 
 #[test]
-fn pending_handler_does_not_block_session_and_leaf_ownership_is_guarded() {
+fn pending_handler_does_not_block_session_and_tree_ownership_is_guarded() {
     block_on(async {
         let entered = Gate::default();
         let release = Gate::default();
@@ -650,8 +651,8 @@ fn pending_handler_does_not_block_session_and_leaf_ownership_is_guarded() {
                     TaskState::Running { .. }
                 ));
                 marker(&session).await;
-                // A separate public transaction must not introduce owned work while
-                // an external handler is suspended, regardless of staging order.
+                // Supported children may be admitted while a handler is suspended,
+                // regardless of staging order. Owned conversations remain forbidden.
                 for reverse in [false, true] {
                     let def = def.clone();
                     let result = session
@@ -685,7 +686,7 @@ fn pending_handler_does_not_block_session_and_leaf_ownership_is_guarded() {
                             })
                         })
                         .await;
-                    assert!(result.is_err());
+                    result.unwrap();
                 }
                 assert!(
                     session
@@ -951,17 +952,12 @@ fn owned_creation_racing_reservation_is_serialized_in_both_admission_orders() {
                     });
                     zip(
                         async {
-                            if reservation_first {
-                                assert!(owned.await.is_err());
-                                terminal(waiter.await.unwrap());
-                            } else {
-                                owned.await.unwrap();
-                                assert_eq!(
-                                    waiter.await.unwrap(),
-                                    RunResult::Blocked(BlockReason::UnsupportedScope)
-                                );
-                                assert_eq!(read(&session, task.id).await, task);
-                            }
+                            let child = owned.await.unwrap().value;
+                            terminal(waiter.await.unwrap());
+                            assert_eq!(
+                                read(&session, child.id).await.status(),
+                                TaskStatus::Terminal
+                            );
                             runner.close().await.unwrap();
                             session.close().await.unwrap();
                         },
