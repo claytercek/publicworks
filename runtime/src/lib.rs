@@ -1,9 +1,16 @@
-//! Public Works' storage kernel, not yet a Session or agent executor.
+//! Public Works' conversation/entry Session and storage kernel, not an agent executor.
+//! Hosts poll a local SessionDriver concurrently with commit and close waiters.
 //! Adapters are trusted. Boxed futures permit async hosts, but the built-in
 //! adapters perform synchronous work when polled. See the workspace design doc.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{fmt, future::Future, pin::Pin};
+
+mod session;
+pub use session::{
+    CloseWaiter, CommitReceipt, CommitWaiter, EntryDraft, Head, Session, SessionDriver,
+    SessionError, Tx, TxFuture,
+};
 
 mod json;
 mod memory;
@@ -254,7 +261,7 @@ pub type StorageFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, StorageErr
 /// Methods take an exclusive borrow, including reads. Futures need not be Send.
 /// A dropped, unpolled future does nothing in the built-in adapters; once polled,
 /// synchronous operations settle in that poll. This is NOT Session cancellation ownership.
-/// Semantic references/ancestry/ownership are the future Session's responsibility.
+/// Semantic references/ancestry belong to Session; task ownership is out of scope.
 pub trait Storage {
     /// Ordered atomic batch, including empty batches, consumes one global Seq on success.
     /// Duplicate/global ID collisions are ordinary Other errors, not safe Rejected errors.

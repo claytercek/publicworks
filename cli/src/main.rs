@@ -3,7 +3,7 @@ use publicworks_storage_sqlite::SqliteStorage;
 use serde_json::{Value, json};
 use std::{error::Error, path::Path};
 
-const USAGE: &str = "Public Works: low-level transcript/storage demo (no Session or agent)\n\
+const USAGE: &str = "Public Works: transactional transcript demo (Session, no agent)\n\
 Usage:\n  publicworks create DB\n  publicworks append DB CONVERSATION TEXT\n  publicworks show DB CONVERSATION";
 
 fn main() {
@@ -37,45 +37,72 @@ async fn run(args: &[String]) -> Result<Value, Box<dyn Error>> {
     if command != "create" && !Path::new(&args[1]).is_file() {
         return Err("Database does not exist; use create first".into());
     }
-    let mut adapter = SqliteStorage::open(&args[1])?;
-    let store: &mut dyn Storage = &mut adapter;
-    let output = if let Some(conversation_id) = conversation {
-        if store.conversation(conversation_id).await?.is_none() {
-            return Err(format!("Unknown conversation: {conversation_id}").into());
-        }
+    let (session, driver) = Session::new(SqliteStorage::open(&args[1])?);
+    let command = async {
+        let result = execute(&session, command, conversation, args.get(3).cloned()).await;
+        // Command failure must not skip shutdown. The host keeps polling the
+        // driver until all admitted work and Storage.close have settled.
+        let closed = session.close().await;
+        let output = result?;
+        closed?;
+        Ok(output)
+    };
+    let (result, ()) = futures_lite::future::zip(command, driver).await;
+    result
+}
+
+async fn execute(
+    session: &Session,
+    command: &str,
+    conversation: Option<Id>,
+    text: Option<String>,
+) -> Result<Value, Box<dyn Error>> {
+    if let Some(conversation_id) = conversation {
         if command == "append" {
-            let id = store.mint_id().await?;
-            let mut entry = EntryRecord::new(id, conversation_id, "publicworks.text");
-            entry.data = Some(json!({"text": args[3]}));
-            let seq = store.commit(vec![StorageWrite::Entry(entry)]).await?;
-            json!({"conversationId": conversation_id, "entryId": id, "commitSeq": seq})
+            let receipt = session
+                .commit(move |tx| {
+                    Box::pin(async move {
+                        let mut draft = EntryDraft::new("publicworks.text");
+                        draft.data =
+                            Some(json!({"text": text.expect("append arguments validated")}));
+                        tx.append_entry(conversation_id, draft).await
+                    })
+                })
+                .await?;
+            Ok(
+                json!({"conversationId": conversation_id, "entryId": receipt.value.id, "commitSeq": receipt.seq}),
+            )
         } else {
-            let mut entries = Vec::new();
-            let mut cursor = None;
-            loop {
-                let page = store
-                    .scan_entries(EntryQuery::new(conversation_id), 100, cursor)
-                    .await?;
-                entries.extend(page.items);
-                cursor = page.next;
-                if cursor.is_none() {
-                    break;
-                }
-            }
-            json!({"conversationId": conversation_id, "entries": entries})
+            let receipt = session
+                .commit(move |tx| {
+                    Box::pin(async move {
+                        if tx.conversation(conversation_id).await?.is_none() {
+                            return Err(SessionError::Invalid(format!(
+                                "Unknown conversation: {conversation_id}"
+                            )));
+                        }
+                        let mut entries = Vec::new();
+                        let mut cursor = None;
+                        loop {
+                            let page = tx
+                                .scan_entries(EntryQuery::new(conversation_id), 100, cursor)
+                                .await?;
+                            entries.extend(page.items);
+                            cursor = page.next;
+                            if cursor.is_none() {
+                                break;
+                            }
+                        }
+                        Ok(entries)
+                    })
+                })
+                .await?;
+            Ok(json!({"conversationId": conversation_id, "entries": receipt.value}))
         }
     } else {
-        let id = store.mint_id().await?;
-        let record = ConversationRecord {
-            id,
-            parent: None,
-            owner: None,
-        };
-        let seq = store
-            .commit(vec![StorageWrite::Conversation(record)])
+        let receipt = session
+            .commit(|tx| Box::pin(async move { tx.create_conversation().await }))
             .await?;
-        json!({"conversationId": id, "commitSeq": seq})
-    };
-    store.close().await?;
-    Ok(output)
+        Ok(json!({"conversationId": receipt.value.id, "commitSeq": receipt.seq}))
+    }
 }

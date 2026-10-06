@@ -274,3 +274,97 @@ fn baseline_json_fixture_survives_feature_unification() {
         }])
     );
 }
+
+#[test]
+fn session_transactions_survive_sqlite_reopen() {
+    use futures_lite::future::{block_on, zip};
+    let db = Database::new();
+    let (parent, cutoff, last, child) = block_on(async {
+        let (session, driver) = Session::new(SqliteStorage::open(&db.path).unwrap());
+        let (records, ()) = zip(async {
+            let receipt = session.commit(|tx| Box::pin(async move {
+                let parent = tx.create_conversation().await?;
+                let mut draft = EntryDraft::new("first");
+                draft.data = Some(serde_json::json!({"$serde_json::private::Number":"object", "data":null}));
+                draft.head = Some(Head::SelfEntry);
+                let first = tx.append_entry(parent.id, draft).await?;
+                let last = tx.append_entry(parent.id, EntryDraft::new("last")).await?;
+                Ok((parent.id, first, last.id))
+            })).await.unwrap();
+            assert_eq!(receipt.seq.unwrap().get(), 1);
+            let (parent, first, last) = receipt.value;
+            let cutoff = first.id;
+            let child = session.commit(move |tx| Box::pin(async move {
+                tx.fork_conversation(parent, cutoff).await
+            })).await.unwrap();
+            assert_eq!(child.seq.unwrap().get(), 2);
+            // A failed callback must not leave its created conversation on disk.
+            let failed = session.commit(|tx| Box::pin(async move {
+                tx.create_conversation().await?;
+                Err::<(), _>(SessionError::Invalid("discard".into()))
+            })).await;
+            assert!(failed.is_err());
+            session.close().await.unwrap();
+            (parent, first, last, child.value.id)
+        }, driver).await;
+        records
+    });
+    block_on(async {
+        let (session, driver) = Session::new(SqliteStorage::open(&db.path).unwrap());
+        zip(
+            async {
+                let expected_cutoff = cutoff.clone();
+                let read = session
+                    .commit(move |tx| {
+                        Box::pin(async move {
+                            assert_eq!(
+                                tx.scan_conversations(ConversationQuery::default(), 10, None)
+                                    .await?
+                                    .items
+                                    .len(),
+                                2
+                            );
+                            assert_eq!(
+                                tx.conversation(child)
+                                    .await?
+                                    .unwrap()
+                                    .parent
+                                    .unwrap()
+                                    .conversation_id,
+                                parent
+                            );
+                            assert!(tx.visible_entry(child, last).await?.is_none());
+                            assert_eq!(
+                                tx.visible_entry(child, expected_cutoff.id)
+                                    .await?
+                                    .unwrap()
+                                    .entry,
+                                expected_cutoff
+                            );
+                            tx.scan_entries(EntryQuery::new(parent), 10, None).await
+                        })
+                    })
+                    .await
+                    .unwrap();
+                assert!(read.seq.is_none());
+                assert_eq!(
+                    read.value.items.iter().map(|e| e.id).collect::<Vec<_>>(),
+                    vec![last, cutoff.id]
+                );
+                let append = session
+                    .commit(move |tx| {
+                        Box::pin(
+                            async move { tx.append_entry(child, EntryDraft::new("child")).await },
+                        )
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(append.seq.unwrap().get(), 3);
+                assert!(append.value.id > child);
+                session.close().await.unwrap();
+            },
+            driver,
+        )
+        .await;
+    });
+}
