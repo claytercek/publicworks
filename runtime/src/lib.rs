@@ -1,4 +1,4 @@
-//! Public Works' conversation/entry Session and storage kernel, not an agent executor.
+//! Public Works' conversation/entry/task Session and storage kernel, not an agent executor.
 //! Hosts poll a local SessionDriver concurrently with commit and close waiters.
 //! Adapters are trusted. Boxed futures permit async hosts, but the built-in
 //! adapters perform synchronous work when polled. See the workspace design doc.
@@ -8,10 +8,14 @@ use std::{fmt, future::Future, pin::Pin};
 
 mod session;
 pub use session::{
-    CloseWaiter, CommitReceipt, CommitWaiter, EntryDraft, Head, Session, SessionDriver,
-    SessionError, Tx, TxFuture,
+    CloseWaiter, CommitReceipt, CommitWaiter, EntryDraft, Head, Owner, Session, SessionDriver,
+    SessionError, TaskInitializer, TaskOptions, TaskOwnership, Tx, TxFuture,
 };
 
+mod task;
+pub use task::{
+    JoinPolicy, TaskOutcome, TaskOutcomeError, TaskQuery, TaskRecord, TaskState, TaskStatus,
+};
 mod json;
 mod memory;
 pub use memory::MemoryStorage;
@@ -22,8 +26,8 @@ pub mod test_support;
 
 /// Largest exactly representable JavaScript integer used by the ID wire format.
 pub const MAX_NUMBER: u64 = 9_007_199_254_740_991;
-/// Maximum payload container nesting, excluding the EntryRecord envelope.
-/// Includes the model array and edits array/edit object/messages array wrappers.
+/// Maximum payload container nesting, excluding the record envelope.
+/// Includes model/edit wrappers and task state/outcome/error/memo wrappers.
 pub const MAX_JSON_DEPTH: usize = 64;
 
 macro_rules! number {
@@ -89,7 +93,7 @@ pub struct ConversationRecord {
     pub id: Id,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ParentLink>,
-    /// Attribution only: task storage and ownership validation are not implemented.
+    /// Task ownership, validated against final candidates by Session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<OwnerLink>,
 }
@@ -151,21 +155,7 @@ impl EntryRecord {
                 }
             }
         }
-        while let Some((value, parents)) = pending.pop() {
-            let depth = parents + usize::from(value.is_array() || value.is_object());
-            if depth > MAX_JSON_DEPTH {
-                return Err(StorageError::Other(format!(
-                    "JSON payload nesting exceeds {MAX_JSON_DEPTH}"
-                )));
-            }
-            match value {
-                Value::Array(values) => pending.extend(values.iter().map(|v| (v, depth))),
-                Value::Object(values) => pending.extend(values.values().map(|v| (v, depth))),
-                Value::Number(number) => json::native_number(number)?,
-                _ => {}
-            }
-        }
-        Ok(())
+        json::validate(pending)
     }
 
     pub fn new(id: Id, conversation_id: Id, kind: impl Into<String>) -> Self {
@@ -191,12 +181,14 @@ impl EntryRecord {
 pub enum StorageWrite {
     Conversation(ConversationRecord),
     Entry(EntryRecord),
+    Task(TaskRecord),
 }
 impl StorageWrite {
     pub fn id(&self) -> Id {
         match self {
             Self::Conversation(r) => r.id,
             Self::Entry(r) => r.id,
+            Self::Task(r) => r.id,
         }
     }
 }
@@ -261,7 +253,7 @@ pub type StorageFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, StorageErr
 /// Methods take an exclusive borrow, including reads. Futures need not be Send.
 /// A dropped, unpolled future does nothing in the built-in adapters; once polled,
 /// synchronous operations settle in that poll. This is NOT Session cancellation ownership.
-/// Semantic references/ancestry belong to Session; task ownership is out of scope.
+/// Semantic references/ancestry and task ownership belong to Session.
 pub trait Storage {
     /// Ordered atomic batch, including empty batches, consumes one global Seq on success.
     /// Duplicate/global ID collisions are ordinary Other errors, not safe Rejected errors.
@@ -274,6 +266,13 @@ pub trait Storage {
         limit: usize,
         cursor: Option<Cursor>,
     ) -> StorageFuture<'_, Page<ConversationRecord>>;
+    fn task(&mut self, id: Id) -> StorageFuture<'_, Option<TaskRecord>>;
+    fn scan_tasks(
+        &mut self,
+        query: TaskQuery,
+        limit: usize,
+        cursor: Option<Cursor>,
+    ) -> StorageFuture<'_, Page<TaskRecord>>;
     fn entry(&mut self, id: Id) -> StorageFuture<'_, Option<StoredEntry>>;
     fn visible_entry(&mut self, conversation: Id, id: Id)
     -> StorageFuture<'_, Option<StoredEntry>>;

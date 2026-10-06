@@ -82,6 +82,9 @@ struct Probe {
     read_gate: Option<Gate>,
     fault: RefCell<Fault>,
     close_error: bool,
+    close_panic: bool,
+    close_gate: Option<Gate>,
+    closed_tasks: RefCell<Vec<TaskRecord>>,
 }
 struct Store {
     memory: MemoryStorage,
@@ -148,6 +151,17 @@ impl Storage for Store {
     ) -> StorageFuture<'_, Page<ConversationRecord>> {
         self.memory.scan_conversations(query, limit, cursor)
     }
+    fn task(&mut self, id: Id) -> StorageFuture<'_, Option<TaskRecord>> {
+        self.memory.task(id)
+    }
+    fn scan_tasks(
+        &mut self,
+        query: TaskQuery,
+        limit: usize,
+        cursor: Option<Cursor>,
+    ) -> StorageFuture<'_, Page<TaskRecord>> {
+        self.memory.scan_tasks(query, limit, cursor)
+    }
     fn entry(&mut self, id: Id) -> StorageFuture<'_, Option<StoredEntry>> {
         self.memory.entry(id)
     }
@@ -176,6 +190,17 @@ impl Storage for Store {
     fn close(&mut self) -> StorageFuture<'_, ()> {
         Box::pin(async move {
             self.probe.events.borrow_mut().push("close");
+            if let Some(gate) = &self.probe.close_gate {
+                gate.wait().await;
+            }
+            if self.probe.close_panic {
+                panic!("close poll");
+            }
+            *self.probe.closed_tasks.borrow_mut() = self
+                .memory
+                .scan_tasks(TaskQuery::default(), 1000, None)
+                .await?
+                .items;
             self.memory.close().await?;
             if self.probe.close_error {
                 Err(StorageError::Other("close failed".into()))
@@ -643,5 +668,247 @@ fn dropping_driver_actually_wakes_registered_waiters() {
         assert_eq!(active.await.unwrap_err(), SessionError::DriverStopped);
         assert_eq!(queued.await.unwrap_err(), SessionError::DriverStopped);
         assert_eq!(close.await.unwrap_err(), SessionError::DriverStopped);
+    });
+}
+
+async fn recovery_store(probe: Rc<Probe>) -> Store {
+    let mut storage = store(probe);
+    let record = TaskRecord {
+        id: Id::new(2).unwrap(),
+        conversation_id: ROOT_CONVERSATION,
+        kind: "unregistered".into(),
+        version: 321,
+        input: serde_json::Value::Null,
+        owner: None,
+        background: false,
+        abort_requested: true,
+        state: TaskState::Running {
+            checkpoint: serde_json::json!({"phase":"retained"}),
+        },
+        memos: None,
+    };
+    storage
+        .memory
+        .commit(vec![
+            StorageWrite::Conversation(ConversationRecord {
+                id: ROOT_CONVERSATION,
+                parent: None,
+                owner: None,
+            }),
+            StorageWrite::Task(record),
+        ])
+        .await
+        .unwrap();
+    storage
+}
+#[test]
+fn recovery_waiter_drop_never_cancels_normalization_or_close() {
+    block_on(async {
+        for in_storage in [false, true] {
+            let gate = Gate::default();
+            let probe = Rc::new(Probe {
+                commit_gate: Some(gate.clone()),
+                ..Probe::default()
+            });
+            let storage = recovery_store(probe.clone()).await;
+            let (opening, mut driver) = Session::open_recovered(storage);
+            if in_storage {
+                assert!(tick(&mut driver).await.is_none());
+                assert!(probe.events.borrow().contains(&"commit entered"));
+            }
+            drop(opening);
+            assert!(tick(&mut driver).await.is_none());
+            assert!(!probe.events.borrow().contains(&"close"));
+            gate.release();
+            driver.await;
+            let events = probe.events.borrow();
+            assert_eq!(events.iter().filter(|e| **e == "persisted").count(), 1);
+            assert_eq!(events.iter().filter(|e| **e == "close").count(), 1);
+            let tasks = probe.closed_tasks.borrow();
+            assert_eq!(tasks[0].status(), TaskStatus::Pending);
+            assert!(tasks[0].abort_requested);
+            assert_eq!(tasks[0].version, 321);
+        }
+    });
+}
+#[test]
+fn recovery_failure_yields_no_handle_and_requests_close_preserving_atomic_state() {
+    block_on(async {
+        for fault in [Fault::Rejected, Fault::Before] {
+            let probe = Rc::new(Probe {
+                fault: RefCell::new(fault),
+                ..Probe::default()
+            });
+            let (mut opening, mut driver) =
+                Session::open_recovered(recovery_store(probe.clone()).await);
+            // Cleanup does not depend on polling or dropping the failed waiter.
+            assert!(tick(&mut driver).await.is_some());
+            assert!(matches!(
+                poll_once(&mut opening).await,
+                Some(Err(SessionError::Storage(_)))
+            ));
+            assert_eq!(probe.closed_tasks.borrow()[0].status(), TaskStatus::Running);
+            assert_eq!(
+                probe
+                    .events
+                    .borrow()
+                    .iter()
+                    .filter(|e| **e == "close")
+                    .count(),
+                1
+            );
+            assert!(!probe.events.borrow().contains(&"persisted"));
+        }
+        let probe = Rc::new(Probe {
+            fault: RefCell::new(Fault::Before),
+            ..Probe::default()
+        });
+        let (opening, driver) = Session::open_recovered(recovery_store(probe.clone()).await);
+        drop(opening);
+        driver.await;
+        assert_eq!(probe.closed_tasks.borrow()[0].status(), TaskStatus::Running);
+    });
+}
+#[test]
+fn task_creation_waiter_drop_keeps_started_mint_owned_and_stops_staging_after_seal() {
+    block_on(async {
+        let gate = Gate::default();
+        let probe = Rc::new(Probe {
+            mint_gate: Some(gate.clone()),
+            ..Probe::default()
+        });
+        let mut storage = store(probe.clone());
+        storage
+            .memory
+            .commit(vec![StorageWrite::Conversation(ConversationRecord {
+                id: ROOT_CONVERSATION,
+                parent: None,
+                owner: None,
+            })])
+            .await
+            .unwrap();
+        let (session, mut driver) = Session::new(storage);
+        let callback_gate = Gate::default();
+        let exit = callback_gate.clone();
+        let waiter = session.commit(move |tx| {
+            Box::pin(async move {
+                let mut pending = tx.create_task(
+                    TaskInitializer::new("only.initial", 1, |_| Ok(serde_json::Value::Null)),
+                    serde_json::Value::Null,
+                    TaskOptions {
+                        ownership: TaskOwnership::Conversation,
+                        conversation_id: Some(ROOT_CONVERSATION),
+                        background: false,
+                    },
+                );
+                assert!(poll_once(&mut pending).await.is_none());
+                exit.wait().await;
+                drop(pending);
+                Ok(())
+            })
+        });
+        assert!(tick(&mut driver).await.is_none());
+        assert!(probe.events.borrow().contains(&"mint entered"));
+        callback_gate.release();
+        assert!(tick(&mut driver).await.is_none());
+        drop(waiter);
+        let closing = session.close();
+        gate.release();
+        driver.await;
+        closing.await.unwrap();
+        assert!(probe.events.borrow().contains(&"mint settled"));
+        assert!(!probe.events.borrow().contains(&"persisted"));
+        assert!(probe.closed_tasks.borrow().is_empty());
+    });
+}
+
+#[test]
+fn failed_open_settles_only_after_owned_close_including_panics() {
+    block_on(async {
+        for fault in [Fault::Before, Fault::ConstructPanic, Fault::PollPanic] {
+            for close_failure in 0..3 {
+                let close_gate = Gate::default();
+                let probe = Rc::new(Probe {
+                    fault: RefCell::new(fault),
+                    close_gate: Some(close_gate.clone()),
+                    close_error: close_failure == 1,
+                    close_panic: close_failure == 2,
+                    ..Probe::default()
+                });
+                let (opening, mut driver) =
+                    Session::open_recovered(recovery_store(probe.clone()).await);
+                let mut opening = Box::pin(AssertUnwindSafe(opening).catch_unwind());
+                assert!(tick(&mut driver).await.is_none());
+                assert!(probe.events.borrow().contains(&"close"));
+                // Neither the original error nor panic may escape before async cleanup.
+                assert!(poll_once(&mut opening).await.is_none());
+                close_gate.release();
+                driver.await;
+                let result = opening.await;
+                if matches!(fault, Fault::Before) {
+                    assert!(
+                        matches!(result, Ok(Err(SessionError::Storage(StorageError::Other(ref message)))) if message == "before persistence")
+                    );
+                } else {
+                    let panic = match result {
+                        Err(panic) => panic,
+                        _ => panic!("original normalization panic lost"),
+                    };
+                    let expected = if matches!(fault, Fault::ConstructPanic) {
+                        "commit construction"
+                    } else {
+                        "commit poll"
+                    };
+                    assert_eq!(panic.downcast_ref::<&str>(), Some(&expected));
+                }
+                assert_eq!(
+                    probe
+                        .events
+                        .borrow()
+                        .iter()
+                        .filter(|e| **e == "close")
+                        .count(),
+                    1
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn unpolled_or_dropped_failed_open_waiter_does_not_own_async_close() {
+    block_on(async {
+        for fault in [Fault::Before, Fault::PollPanic] {
+            for drop_before_drive in [false, true] {
+                let close_gate = Gate::default();
+                let probe = Rc::new(Probe {
+                    fault: RefCell::new(fault),
+                    close_gate: Some(close_gate.clone()),
+                    ..Probe::default()
+                });
+                let (opening, mut driver) =
+                    Session::open_recovered(recovery_store(probe.clone()).await);
+                let mut opening = Some(opening);
+                if drop_before_drive {
+                    drop(opening.take());
+                }
+                assert!(tick(&mut driver).await.is_none());
+                assert!(probe.events.borrow().contains(&"close"));
+                // Also drop an unpolled observer while close is suspended.
+                drop(opening);
+                close_gate.release();
+                driver.await;
+                assert_eq!(probe.closed_tasks.borrow()[0].status(), TaskStatus::Running);
+                assert_eq!(
+                    probe
+                        .events
+                        .borrow()
+                        .iter()
+                        .filter(|e| **e == "close")
+                        .count(),
+                    1
+                );
+            }
+        }
     });
 }

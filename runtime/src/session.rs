@@ -11,7 +11,9 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+mod tasks;
 mod transaction;
+pub use tasks::{Owner, TaskInitializer, TaskOptions, TaskOwnership};
 pub use transaction::{EntryDraft, Head, Tx};
 
 /// Local, scoped callback future. The transaction cannot escape the callback.
@@ -218,6 +220,13 @@ impl Session {
     where
         F: for<'a> FnOnce(&'a Tx) -> TxFuture<'a, T> + 'static,
     {
+        self.commit_owned(callback, false)
+    }
+
+    fn commit_owned<T: 'static, F>(&self, callback: F, close_on_failure: bool) -> CommitWaiter<T>
+    where
+        F: for<'a> FnOnce(&'a Tx) -> TxFuture<'a, T> + 'static,
+    {
         let mut control = self.control.borrow_mut();
         if let Err(error) = control.admission() {
             return CommitWaiter(Box::pin(async { Err(error) }));
@@ -258,6 +267,10 @@ impl Session {
                     Ok(Err(error)) => Ok(Err(error)),
                     Err(panic) => Err(panic),
                 };
+                // Failed startup must close even if its observer remains unpolled.
+                if close_on_failure && !matches!(&result, Ok(Ok(_))) {
+                    owner.borrow_mut().closing = true;
+                }
                 // No cache to adopt and no stream to publish in this subset.
                 let _ = sender.send(result);
             })
@@ -291,3 +304,6 @@ async fn receive<T>(receiver: oneshot::Receiver<Outcome<T>>) -> Result<T, Sessio
         Err(_) => Err(SessionError::DriverStopped),
     }
 }
+
+#[cfg(test)]
+mod task_tests;

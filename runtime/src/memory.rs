@@ -34,8 +34,10 @@ impl Storage for MemoryStorage {
         Box::pin(async move {
             self.open()?;
             for write in &writes {
-                if let StorageWrite::Entry(entry) = write {
-                    entry.validate_payloads()?;
+                match write {
+                    StorageWrite::Entry(entry) => entry.validate_payloads()?,
+                    StorageWrite::Task(task) => task.validate_payloads()?,
+                    _ => {}
                 }
             }
             let seq = Seq::new(self.next_seq)?;
@@ -43,12 +45,18 @@ impl Storage for MemoryStorage {
             let mut next_id = self.next_id;
             for write in writes {
                 let id = write.id();
-                if candidate.conversations.contains_key(&id) || candidate.entries.contains_key(&id)
+                if candidate.conversations.contains_key(&id)
+                    || candidate.entries.contains_key(&id)
+                    || (candidate.tasks.contains_key(&id)
+                        && !matches!(write, StorageWrite::Task(_)))
                 {
                     return Err(StorageError::Other(format!("ID {id} is already claimed")));
                 }
                 next_id = next_id.max(id.get() + 1);
                 match write {
+                    StorageWrite::Task(record) => {
+                        candidate.tasks.insert(id, record);
+                    }
                     StorageWrite::Conversation(record) => {
                         candidate.conversations.insert(id, record);
                     }
@@ -81,6 +89,23 @@ impl Storage for MemoryStorage {
         Box::pin(async move {
             self.open()?;
             Ok(self.records.conversations.get(&id).cloned())
+        })
+    }
+    fn task(&mut self, id: Id) -> StorageFuture<'_, Option<TaskRecord>> {
+        Box::pin(async move {
+            self.open()?;
+            Ok(self.records.task(id))
+        })
+    }
+    fn scan_tasks(
+        &mut self,
+        query: TaskQuery,
+        limit: usize,
+        cursor: Option<Cursor>,
+    ) -> StorageFuture<'_, Page<TaskRecord>> {
+        Box::pin(async move {
+            self.open()?;
+            self.records.scan_tasks(query, limit, cursor)
         })
     }
     fn entry(&mut self, id: Id) -> StorageFuture<'_, Option<StoredEntry>> {

@@ -32,7 +32,7 @@ pub(crate) fn native_number(number: &Number) -> Result<(), StorageError> {
     }
 }
 
-fn decode(raw: &RawValue, parents: usize) -> Result<Value, StorageError> {
+pub(crate) fn decode(raw: &RawValue, parents: usize) -> Result<Value, StorageError> {
     let text = raw.get();
     let parse_error = |e: serde_json::Error| invalid(&e.to_string());
     match text.trim_start().as_bytes().first() {
@@ -125,9 +125,26 @@ impl TryFrom<WriteFields> for crate::StorageWrite {
     fn try_from(fields: WriteFields) -> Result<Self, Self::Error> {
         let result = match fields.kind.as_str() {
             "conversation" => serde_json::from_str(fields.value.get()).map(Self::Conversation),
+            "task" => serde_json::from_str(fields.value.get()).map(Self::Task),
             "entry" => serde_json::from_str(fields.value.get()).map(Self::Entry),
             _ => return Err(invalid("Unknown storage write type")),
         };
         result.map_err(|error| invalid(&error.to_string()))
     }
+}
+
+pub(crate) fn validate(mut pending: Vec<(&Value, usize)>) -> Result<(), StorageError> {
+    while let Some((value, parents)) = pending.pop() {
+        let depth = parents + usize::from(value.is_array() || value.is_object());
+        if depth > MAX_JSON_DEPTH {
+            return Err(invalid("JSON payload nesting exceeds 64"));
+        }
+        match value {
+            Value::Array(values) => pending.extend(values.iter().map(|v| (v, depth))),
+            Value::Object(values) => pending.extend(values.values().map(|v| (v, depth))),
+            Value::Number(number) => native_number(number)?,
+            _ => {}
+        }
+    }
+    Ok(())
 }

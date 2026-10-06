@@ -1,5 +1,8 @@
 use super::*;
 use futures_util::future::{Either, select};
+use std::collections::BTreeMap;
+mod tasks;
+use tasks::TaskCandidate;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Head {
@@ -32,6 +35,7 @@ type Operation = Box<dyn for<'a> FnOnce(&'a mut dyn Storage) -> LocalFuture<'a, 
 #[derive(Default)]
 struct State {
     writes: Vec<StorageWrite>,
+    tasks: BTreeMap<Id, TaskCandidate>,
     operations: VecDeque<Operation>,
     pending: usize,
     mutated: bool,
@@ -97,15 +101,33 @@ impl Tx {
     }
 
     pub fn create_conversation(&self) -> TxFuture<'_, ConversationRecord> {
-        self.stage_conversation(None)
+        self.create_conversation_owned(Owner::Ownerless)
     }
     pub fn fork_conversation(&self, parent: Id, at: Id) -> TxFuture<'_, ConversationRecord> {
-        self.stage_conversation(Some(ParentLink {
-            conversation_id: parent,
-            at,
-        }))
+        self.fork_conversation_owned(parent, at, Owner::Ownerless)
     }
-    fn stage_conversation(&self, parent: Option<ParentLink>) -> TxFuture<'_, ConversationRecord> {
+    pub fn create_conversation_owned(&self, owner: Owner) -> TxFuture<'_, ConversationRecord> {
+        self.stage_conversation(None, owner)
+    }
+    pub fn fork_conversation_owned(
+        &self,
+        parent: Id,
+        at: Id,
+        owner: Owner,
+    ) -> TxFuture<'_, ConversationRecord> {
+        self.stage_conversation(
+            Some(ParentLink {
+                conversation_id: parent,
+                at,
+            }),
+            owner,
+        )
+    }
+    fn stage_conversation(
+        &self,
+        parent: Option<ParentLink>,
+        owner: Owner,
+    ) -> TxFuture<'_, ConversationRecord> {
         self.operation(true, move |storage, state| {
             Box::pin(async move {
                 let id = storage.mint_id().await?;
@@ -123,11 +145,22 @@ impl Tx {
                     }
                     state.borrow().open()?;
                 }
-                let record = ConversationRecord {
-                    id,
-                    parent,
-                    owner: None,
+                let owner = match owner {
+                    Owner::Ownerless => None,
+                    Owner::Task(task_id) => {
+                        let task = tasks::current_task(storage, &state, task_id)
+                            .await?
+                            .ok_or_else(|| {
+                                SessionError::Invalid(format!("Unknown owner task: {task_id}"))
+                            })?;
+                        state.borrow().open()?;
+                        Some(OwnerLink {
+                            conversation_id: task.conversation_id,
+                            task_id,
+                        })
+                    }
                 };
+                let record = ConversationRecord { id, parent, owner };
                 state
                     .borrow_mut()
                     .writes
@@ -268,7 +301,21 @@ where
     pump.await;
     match result {
         Ok(Ok(_)) if pending => Ok(Err(SessionError::PendingOperations)),
-        Ok(Ok(value)) => Ok(Ok((value, std::mem::take(&mut state.borrow_mut().writes)))),
+        Ok(Ok(value)) => {
+            AssertUnwindSafe(async {
+                let (writes, tasks) = {
+                    let mut state = state.borrow_mut();
+                    (
+                        std::mem::take(&mut state.writes),
+                        std::mem::take(&mut state.tasks),
+                    )
+                };
+                let writes = tasks::assemble(storage, writes, tasks).await?;
+                Ok((value, writes))
+            })
+            .catch_unwind()
+            .await
+        }
         Ok(Err(error)) => Ok(Err(error)),
         Err(panic) => Err(panic),
     }

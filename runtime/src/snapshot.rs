@@ -5,9 +5,29 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Default)]
 pub struct RecordSnapshot {
     pub conversations: BTreeMap<Id, ConversationRecord>,
+    pub tasks: BTreeMap<Id, TaskRecord>,
     pub entries: BTreeMap<Id, StoredEntry>,
 }
 impl RecordSnapshot {
+    pub fn task(&self, id: Id) -> Option<TaskRecord> {
+        self.tasks.get(&id).cloned()
+    }
+    pub fn scan_tasks(
+        &self,
+        query: TaskQuery,
+        limit: usize,
+        cursor: Option<Cursor>,
+    ) -> Result<Page<TaskRecord>, StorageError> {
+        page(
+            self.tasks
+                .values()
+                .filter(|r| cursor.as_ref().is_none_or(|c| r.id > c.after) && query.matches(r))
+                .cloned(),
+            limit,
+            |r| r.id,
+        )
+    }
+
     pub fn scan_conversations(
         &self,
         query: ConversationQuery,

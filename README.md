@@ -1,8 +1,9 @@
 # Public Works
 
 Public Works is our own Rust runtime project, modeled on Pi Durable. The working
-slice is a **Session transaction layer for conversations and immutable entries**,
-with in-memory and SQLite storage. There is no scheduler, LLM integration, or
+slice is a **Session transaction layer for conversations, immutable entries, and
+durable task records**, with in-memory and SQLite storage. Explicit startup
+normalization changes interrupted running tasks back to pending. There is no scheduler, LLM integration, or
 agent executor yet.
 
 ## Try the persistence demo
@@ -33,7 +34,8 @@ from allocation but is not automatically created; ordinary IDs start at 2.
 
 - `runtime/` — `publicworks-runtime`: records, object-safe async-compatible
   `Storage`, `Session`/`Tx`, host-polled `SessionDriver`, fork-aware reads, and
-  public `MemoryStorage`. Uses serde/serde_json and small futures primitives;
+  task creation/ownership validation, startup normalization, and public
+  `MemoryStorage`. Uses serde/serde_json and small futures primitives;
   no SQL, Tokio, or executor dependency.
 - `storage/sqlite/` — `publicworks-storage-sqlite`: `SqliteStorage::open(path)`;
   bundled SQLite through rusqlite, no external server.
@@ -43,11 +45,15 @@ from allocation but is not automatically created; ordinary IDs start at 2.
 Both adapters return boxed futures but **block while polled**. SQLite uses WAL,
 NORMAL synchronization, and one transaction per batch. This is an embedded,
 single-logical-owner foundation, not a multiwriter runtime or a power-loss
-persistence guarantee. The schema is Public Works' own v2; it cannot open Pi's
-JavaScript databases or the initial unpublished v1 format. Payloads use finite
+persistence guarantee. The current schema is Public Works' own v3. There are no
+existing users or schema migrations: incompatible databases reject without being
+deleted or rewritten. Use a new path or manually recreate a disposable development
+database when the format changes. Backward compatibility is not promised during
+this pre-user phase. Atomic write rollback remains required; it prevents partial
+batches and is separate from migrating old formats. Payloads use finite
 native serde_json numbers (full i64/u64 and round-trippable f64), not arbitrary
 precision decimal text, and have a maximum nesting depth of 64. See the contract
-for how model/edit wrappers count toward that limit. Opaque JSON decoding remains
+for how model/edit and task state/outcome/memo wrappers count toward that limit. Opaque JSON decoding remains
 correct when an embedding application enables additional serde_json features.
 
 ## Host a Session
@@ -100,6 +106,28 @@ public commit stream or view subscription yet, so no subscriber queue to grow.
 See the design contract for the boundary
 between inherited Pi behavior and Rust driver/cancellation mapping.
 
+## Persist tasks without executing them
+
+Inside a Session callback, `tx.create_task(initializer, input, options)` creates a
+pending task and returns a detached `TaskRecord`. `TaskInitializer::new(kind,
+version, initial)` owns only the synchronous initial-checkpoint hook; it does not
+register executable code. `TaskOptions` requires explicit conversation or task
+ownership. Task-owned children inherit their owner's conversation and cannot be
+background. Use `tx.task` and `tx.scan_tasks` for committed reads before mutations.
+
+`Session::open_recovered(storage)` returns `(CommitWaiter<Session>, SessionDriver)`.
+Poll the driver concurrently with the opening waiter, then take the usable Session
+from the successful receipt's `value`. Its `seq` is present only when startup
+normalized running tasks to pending. All running pages are read before one atomic
+replacement batch; checkpoints, input, version, owner, flags, and memos survive.
+Plain `Session::new` remains unchanged.
+
+Opening runs no task code. Unknown kinds/versions are preserved, and waiting,
+completing, and terminal states are not reconciled. There are no scheduler,
+wait/abort execution, definition migration, or owned-completion APIs yet. Dropping
+the opening waiter still leaves normalization and close owned by the driver.
+See the task contract for the full boundary.
+
 ## Development
 
 ```sh
@@ -114,7 +142,10 @@ The shared conformance checks exercise the public `Storage` seam against both
 adapters. SQLite tests also cover reopen, allocator continuity, rollback, invalid
 schemas, corrupt reads, and Session transactions across reopen. Session tests
 cover FIFO settlement, failed callbacks, fork validation, poison classification,
-panics, abandoned operations, waiter/driver drops, and close. The executable
+panics, abandoned operations, waiter/driver drops, close, task ownership and
+replacement validation, and startup normalization. Task storage checks run under
+both default and feature-unified serde_json. SQLite rejects incompatible schemas
+rather than migrating them. The executable
 smoke test runs create/append/show in
 separate processes. See the contract for what
 these checks do and do not establish. Packages remain unpublished; `Cargo.lock`
