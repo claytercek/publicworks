@@ -81,6 +81,8 @@ impl<T> Future for CommitWaiter<T> {
 /// Cloneable observation of the one storage-close result.
 pub type CloseWaiter = Shared<LocalFuture<'static, Result<(), SessionError>>>;
 
+type Settlement<T> = Box<dyn FnOnce(&Outcome<CommitReceipt<T>>)>;
+
 type Job =
     Box<dyn for<'a> FnOnce(&'a mut dyn Storage, Rc<RefCell<Control>>) -> LocalFuture<'a, ()>>;
 struct Control {
@@ -177,9 +179,11 @@ impl Drop for SessionDriver {
                 notification,
             )
         };
-        // Dropping callbacks can drop Session handles; do it outside the borrow.
-        drop(jobs);
+        // Publish forfeiture before dropping jobs: their ownership guards can wake
+        // a reentrant task driver, which must not report successful close. Both
+        // notification and callback destruction happen outside the Session borrow.
         notify_runner(notification);
+        drop(jobs);
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -258,7 +262,7 @@ impl Session {
     where
         F: for<'a> FnOnce(&'a Tx) -> TxFuture<'a, T> + 'static,
     {
-        self.commit_options(callback, close_on_failure, false, None)
+        self.commit_options(callback, close_on_failure, false, None, None)
     }
 
     // A runner settlement barrier may join the already-admitted mutation line
@@ -271,7 +275,7 @@ impl Session {
     where
         F: for<'a> FnOnce(&'a Tx) -> TxFuture<'a, T> + 'static,
     {
-        self.commit_options(callback, false, true, Some(invocation))
+        self.commit_options(callback, false, true, Some(invocation), None)
     }
 
     fn commit_reservation<T: 'static, F>(
@@ -282,7 +286,7 @@ impl Session {
     where
         F: for<'a> FnOnce(&'a Tx) -> TxFuture<'a, T> + 'static,
     {
-        self.commit_options(callback, false, false, Some(invocation))
+        self.commit_options(callback, false, false, Some(invocation), None)
     }
 
     fn commit_options<T: 'static, F>(
@@ -291,6 +295,7 @@ impl Session {
         close_on_failure: bool,
         join: bool,
         fence_on_failure: Option<Rc<execution::Invocation>>,
+        settled: Option<Settlement<T>>,
     ) -> CommitWaiter<T>
     where
         F: for<'a> FnOnce(&'a Tx) -> TxFuture<'a, T> + 'static,
@@ -304,6 +309,9 @@ impl Session {
             if let Some(invocation) = &fence_on_failure {
                 invocation.end();
             }
+            if let Some(settled) = settled {
+                settled(&Ok(Err(error.clone())));
+            }
             return CommitWaiter(Box::pin(async { Err(error) }));
         }
         let (sender, receiver) = oneshot::channel();
@@ -312,6 +320,9 @@ impl Session {
                 if owner.borrow().poisoned {
                     if let Some(invocation) = &fence_on_failure {
                         invocation.end();
+                    }
+                    if let Some(settled) = settled {
+                        settled(&Ok(Err(SessionError::Poisoned)));
                     }
                     let _ = sender.send(Ok(Err(SessionError::Poisoned)));
                     return;
@@ -366,7 +377,10 @@ impl Session {
                 }
                 let notification = owner.borrow().runner_notification();
                 notify_runner(notification);
-                // No cache to adopt and no stream to publish in this subset.
+                if let Some(settled) = settled {
+                    settled(&result);
+                }
+                // Private settlement effects belong to the driver, not observers.
                 let _ = sender.send(result);
             })
         }));

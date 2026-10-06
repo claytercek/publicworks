@@ -13,6 +13,7 @@ pub struct TaskDefinition {
     version: u64,
     initial: Initial,
     phases: BTreeMap<String, PhaseHandler>,
+    abort_handler: PhaseHandler,
 }
 impl TaskDefinition {
     pub fn new(
@@ -26,7 +27,27 @@ impl TaskDefinition {
             version,
             initial: Rc::new(initial),
             phases,
+            abort_handler: Rc::new(|_, runtime| {
+                Box::pin(async move {
+                    runtime
+                        .commit(|_, _| {
+                            Box::pin(async {
+                                Ok(Some(TaskUpdate::Abort {
+                                    reason: None,
+                                    result: None,
+                                }))
+                            })
+                        })
+                        .await
+                        .map_err(|e| fault(e.to_string()))?;
+                    Ok(())
+                })
+            }),
         }
+    }
+    pub fn with_abort_handler(mut self, handler: PhaseHandler) -> Self {
+        self.abort_handler = handler;
+        self
     }
     pub fn kind(&self) -> &str {
         &self.kind
@@ -61,7 +82,6 @@ pub enum BlockReason {
     VersionMismatch,
     UnsupportedScope,
     NotPending,
-    AbortRequested,
 }
 // Keep the detached receipt directly usable, like Session task reads.
 #[allow(clippy::large_enum_variant)]
@@ -108,6 +128,19 @@ impl Future for RunWaiter {
         self.0.as_mut().poll(cx)
     }
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AbortResult {
+    Marked,
+    Terminal,
+    Blocked(BlockReason),
+}
+pub struct AbortWaiter(LocalFuture<'static, Result<AbortResult, RunError>>);
+impl Future for AbortWaiter {
+    type Output = Result<AbortResult, RunError>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.as_mut().poll(cx)
+    }
+}
 pub type RunnerCloseWaiter = Shared<LocalFuture<'static, Result<(), RunError>>>;
 
 struct Request {
@@ -117,6 +150,7 @@ struct Request {
 #[derive(Default)]
 struct RunnerState {
     requests: VecDeque<Request>,
+    aborts: usize,
     closing: bool,
     finished: bool,
     dropped: bool,
@@ -157,6 +191,8 @@ impl RunnerControl {
 
 pub(super) struct Invocation {
     id: Id,
+    abort_mode: bool,
+    joined: RefCell<Vec<Waker>>,
     ended: Cell<bool>,
     cancelled: Cell<bool>,
     waiters: RefCell<Vec<Waker>>,
@@ -175,6 +211,23 @@ impl Invocation {
     pub(super) fn end(&self) {
         self.ended.set(true);
         self.signal();
+        for waker in self.joined.take() {
+            waker.wake();
+        }
+    }
+    async fn join(&self) {
+        std::future::poll_fn(|cx| {
+            if self.ended.get() {
+                Poll::Ready(())
+            } else {
+                let mut waiters = self.joined.borrow_mut();
+                if !waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                    waiters.push(cx.waker().clone());
+                }
+                Poll::Pending
+            }
+        })
+        .await
     }
     fn check(&self) -> Result<(), SessionError> {
         let active = self.runner.upgrade().is_some_and(|runner| {
@@ -229,6 +282,8 @@ impl PersistenceFence {
 pub struct TaskRunner {
     control: Rc<RunnerControl>,
     close: RunnerCloseWaiter,
+    session: Session,
+    registry: TaskRegistry,
 }
 /// Host-owned local future. Dropping it fences contexts and forfeits settlement.
 pub struct TaskDriver {
@@ -281,13 +336,15 @@ impl TaskRunner {
                 as LocalFuture<'static, _>)
                 .shared();
         let owner = control.clone();
+        let handle_session = session.clone();
+        let handle_registry = registry.clone();
         let work = Box::pin(async move {
             loop {
                 let request = std::future::poll_fn(|cx| {
                     let mut state = owner.0.borrow_mut();
                     if let Some(request) = state.requests.pop_front() {
                         Poll::Ready(Some(request))
-                    } else if state.closing {
+                    } else if state.closing && state.aborts == 0 {
                         Poll::Ready(None)
                     } else {
                         state.waker = Some(cx.waker().clone());
@@ -304,6 +361,8 @@ impl TaskRunner {
                 }
                 let invocation = Rc::new(Invocation {
                     id: request.id,
+                    abort_mode: false,
+                    joined: RefCell::new(Vec::new()),
                     ended: Cell::new(false),
                     cancelled: Cell::new(false),
                     waiters: RefCell::new(Vec::new()),
@@ -313,6 +372,10 @@ impl TaskRunner {
                 let result = AssertUnwindSafe(execute(&session, &registry, invocation.clone()))
                     .catch_unwind()
                     .await;
+                let active = owner.0.borrow().active.upgrade();
+                if let Some(active) = active {
+                    active.end();
+                }
                 invocation.end();
                 let result =
                     result.unwrap_or_else(|panic| Err(RunError::Panicked(panic_message(&*panic))));
@@ -331,6 +394,8 @@ impl TaskRunner {
             Self {
                 control: control.clone(),
                 close,
+                session: handle_session,
+                registry: handle_registry,
             },
             TaskDriver { work, control },
         ))
@@ -370,6 +435,10 @@ pub enum TaskUpdate {
     Checkpoint(Value),
     Complete(Value),
     Fail(TaskOutcomeError, Option<Value>),
+    Abort {
+        reason: Option<String>,
+        result: Option<Value>,
+    },
 }
 #[derive(Clone)]
 pub struct TaskRuntime {
@@ -416,7 +485,9 @@ impl TaskRuntime {
                     .await?
                     .ok_or_else(|| SessionError::Invalid("Task disappeared".into()))?;
                 invocation.check()?;
-                if record.status() != TaskStatus::Running || record.abort_requested {
+                if record.status() != TaskStatus::Running
+                    || (record.abort_requested && !invocation.abort_mode)
+                {
                     return Err(SessionError::Invalid(
                         "Task is not running or is abort-marked".into(),
                     ));
@@ -452,6 +523,7 @@ fn fault(message: impl Into<String>) -> TaskOutcomeError {
     }
 }
 
+mod abort;
 mod phase;
 use phase::execute;
 

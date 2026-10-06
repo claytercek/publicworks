@@ -3,7 +3,8 @@
 Public Works is our own Rust runtime project, modeled on Pi Durable. The working
 slice is a **Session transaction layer for conversations, immutable entries, and
 durable tasks**, with in-memory and SQLite storage. Hosts can explicitly run
-foreground leaf tasks as checkpointed phase handlers. Startup normalization
+foreground leaf tasks as checkpointed phase handlers, including durable cancellation
+and abort cleanup. Startup normalization
 changes interrupted running tasks back to pending. There is no automatic scheduler,
 LLM integration, or agent executor.
 
@@ -127,15 +128,16 @@ admitted run requests and handler futures; SessionDriver remains the only Storag
 owner. A handler awaiting external work does not occupy the Session queue.
 Dropping a run waiter does not cancel its request.
 
-Only pending, non-abort-marked, foreground tasks owned by an ownerless conversation
+Only pending foreground tasks owned by an ownerless conversation
 and owning no tasks or conversations can run. The installed definition's version
 must exactly match the stored version. Other cases return `RunResult::Blocked`
 without writes. There is one active invocation per attached runner, with no
-background scheduling, wait/abort execution, or owned-completion supervision.
+background scheduling, task waits, cascades, or owned-completion supervision.
+An abort-marked pending task runs its abort handler instead of its normal phases.
 
 A handler receives its detached task and a `TaskRuntime`. It calls
 `runtime.commit(|tx, current| ...)` to atomically write entries and return an
-optional `TaskUpdate::Checkpoint`, `Complete`, or `Fail`. Entries receive task
+optional `TaskUpdate::Checkpoint`, `Complete`, `Fail`, or `Abort { reason, result }`. Entries receive task
 attribution automatically. Each successful phase must change its structural
 checkpoint or commit an outcome; returning without durable progress faults the
 task. External effects are not part of the storage transaction and are not
@@ -155,6 +157,38 @@ gate; draining does not promise it will apply. A noncooperative handler can keep
 runner close pending. Session close signals the runner but does not join external
 handler code. Dropping TaskDriver forfeits settlement and fences old contexts.
 See the execution contract for details.
+
+## Cancel a task durably
+
+`runner.abort(id)` immediately admits a Session-owned command. Its `AbortWaiter`
+returns `Result<AbortResult, RunError>`: `Marked`, `Terminal`, or
+`Blocked(BlockReason)`. `Marked` means the mutation was acknowledged and the
+normal invocation observed on the Session line has ended. It does **not** mean
+cleanup finished or the task has an aborted outcome. Missing targets error;
+unsupported scopes are untouched. Terminal targets and repeated marks consume no
+commit sequence. Missing definitions or exact-version mismatches orphan an
+eligible target directly and also return `Marked`.
+
+The normal handler is signalled only after durable acknowledgement. An active run
+hands off to a fresh, initially unsignalled abort invocation. Repeated requests do
+not cancel cleanup. The default handler commits `Aborted`; use
+`definition.with_abort_handler(handler)` to install a `PhaseHandler`-shaped custom
+handler. It must commit `Abort`, `Complete`, or `Fail`. Returning without an outcome
+faults, even after checkpoint or entry writes. Abort dispatch does not validate
+the normal checkpoint's phase.
+
+An **inactive** marked pending task needs an explicit `runner.run(id)` to execute
+cleanup. There is no automatic scan or cleanup queue. Never await your own
+`runner.abort(id)` from its current normal handler: it joins that invocation and
+would deadlock. Enqueuing without awaiting is allowed.
+
+Dropping an abort waiter never cancels the admitted command. Dropping TaskDriver
+also leaves admitted abort mutations owned by SessionDriver, but forfeits handler
+settlement. In contrast, `runner.close()` requests cooperative shutdown without
+persisting abort intent; reopening can resume normal work. Close does not start
+fresh cleanup. Keep both drivers polling to drain admitted mutations. External
+cleanup must tolerate replay after a crash. See the
+cancellation contract.
 
 ## Reopen interrupted tasks
 

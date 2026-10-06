@@ -9,10 +9,10 @@ use std::{fmt, future::Future, pin::Pin};
 
 mod session;
 pub use session::{
-    BlockReason, CloseWaiter, CommitReceipt, CommitWaiter, EntryDraft, Head, Owner, PhaseFuture,
-    PhaseHandler, RunError, RunResult, RunWaiter, RunnerCloseWaiter, Session, SessionDriver,
-    SessionError, TaskDefinition, TaskDriver, TaskOptions, TaskOwnership, TaskRegistry, TaskRunner,
-    TaskRuntime, TaskUpdate, Tx, TxFuture,
+    AbortResult, AbortWaiter, BlockReason, CloseWaiter, CommitReceipt, CommitWaiter, EntryDraft,
+    Head, Owner, PhaseFuture, PhaseHandler, RunError, RunResult, RunWaiter, RunnerCloseWaiter,
+    Session, SessionDriver, SessionError, TaskDefinition, TaskDriver, TaskOptions, TaskOwnership,
+    TaskRegistry, TaskRunner, TaskRuntime, TaskUpdate, Tx, TxFuture,
 };
 
 mod task;

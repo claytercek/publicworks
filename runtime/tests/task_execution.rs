@@ -460,7 +460,7 @@ fn blocked_requests_do_not_write_or_advance_sequence() {
         let mut store = memory().await;
         let mut records = Vec::new();
         let mut cases = vec![(Id::new(99).unwrap(), BlockReason::MissingTask)];
-        for n in 2..=11 {
+        for n in (2..=11).filter(|n| *n != 8) {
             let mut task = seeded_task(n);
             let reason = match n {
                 2 => {
@@ -488,10 +488,6 @@ fn blocked_requests_do_not_write_or_advance_sequence() {
                         checkpoint: json!({"phase":"work"}),
                     };
                     BlockReason::NotPending
-                }
-                8 => {
-                    task.abort_requested = true;
-                    BlockReason::AbortRequested
                 }
                 9 => {
                     task.state = TaskState::Terminal {

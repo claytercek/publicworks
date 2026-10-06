@@ -1,16 +1,16 @@
 //! Reservation and phase-boundary decisions always run on the Session line.
 use super::*;
 
-enum Reservation {
+enum Decision {
     Ready(TaskRecord, TaskDefinition),
     Done(RunResult),
 }
 pub(super) async fn execute(
     session: &Session,
     registry: &TaskRegistry,
-    invocation: Rc<Invocation>,
+    mut invocation: Rc<Invocation>,
 ) -> Result<RunResult, RunError> {
-    let registry = registry.clone();
+    let definitions = registry.clone();
     let inv = invocation.clone();
     let control = Rc::downgrade(&session.control);
     let reservation = session
@@ -18,90 +18,132 @@ pub(super) async fn execute(
             Box::pin(async move {
                 tx.fence(inv.clone(), false);
                 if inv.check().is_err() {
-                    return Ok(Reservation::Done(RunResult::Interrupted));
+                    return Ok(Some(RunResult::Interrupted));
                 }
                 let Some(mut record) = tx.task(inv.id).await? else {
-                    return Ok(Reservation::Done(RunResult::Blocked(
-                        BlockReason::MissingTask,
-                    )));
+                    return Ok(Some(RunResult::Blocked(BlockReason::MissingTask)));
                 };
-                let blocked = if record.status() != TaskStatus::Pending {
-                    Some(BlockReason::NotPending)
-                } else if record.abort_requested {
-                    Some(BlockReason::AbortRequested)
-                } else if record.background || record.owner.is_some() {
-                    Some(BlockReason::UnsupportedScope)
-                } else {
-                    None
-                };
-                if let Some(reason) = blocked {
-                    return Ok(Reservation::Done(RunResult::Blocked(reason)));
+                if record.status() != TaskStatus::Pending {
+                    return Ok(Some(RunResult::Blocked(BlockReason::NotPending)));
                 }
-                let Some(definition) = registry.0.get(&record.kind).cloned() else {
-                    return Ok(Reservation::Done(RunResult::Blocked(
-                        BlockReason::MissingDefinition,
-                    )));
-                };
-                if definition.version != record.version {
-                    return Ok(Reservation::Done(RunResult::Blocked(
-                        BlockReason::VersionMismatch,
-                    )));
+                if !supported(tx, &record).await? {
+                    return Ok(Some(RunResult::Blocked(BlockReason::UnsupportedScope)));
                 }
-                let conversation = tx.conversation(record.conversation_id).await?;
-                if conversation.is_none_or(|c| c.owner.is_some())
-                    || has_owned(tx, record.id).await?
-                {
-                    return Ok(Reservation::Done(RunResult::Blocked(
-                        BlockReason::UnsupportedScope,
-                    )));
+                let definition = definitions.0.get(&record.kind);
+                let missing = definition.is_none();
+                let mismatched = definition.is_some_and(|d| d.version != record.version);
+                if missing || mismatched {
+                    if record.abort_requested {
+                        record.state = TaskState::Terminal {
+                            outcome: TaskOutcome::Orphaned {
+                                reason: "Missing task definition or exact version for abort".into(),
+                            },
+                        };
+                        record.memos = None;
+                        tx.set_task(record.clone()).await?;
+                        return Ok(Some(RunResult::Terminal(record)));
+                    }
+                    return Ok(Some(RunResult::Blocked(if missing {
+                        BlockReason::MissingDefinition
+                    } else {
+                        BlockReason::VersionMismatch
+                    })));
                 }
                 if inv.check().is_err() {
-                    return Ok(Reservation::Done(RunResult::Interrupted));
+                    return Ok(Some(RunResult::Interrupted));
                 }
                 let TaskState::Pending { checkpoint } = record.state else {
                     unreachable!()
                 };
                 record.state = TaskState::Running { checkpoint };
-                // Register on the mutation line before adoption; final assembly of every
-                // Session transaction consults this guard, regardless of staging order.
                 control
                     .upgrade()
                     .ok_or(SessionError::DriverStopped)?
                     .borrow_mut()
                     .leaf = Rc::downgrade(&inv);
-                tx.set_task(record.clone()).await?;
-                Ok(Reservation::Ready(record, definition))
+                tx.set_task(record).await?;
+                Ok(None)
             })
         })
         .await?
         .value;
-    let Reservation::Ready(mut current, definition) = reservation else {
-        let Reservation::Done(result) = reservation else {
-            unreachable!()
-        };
+    if let Some(result) = reservation {
         return Ok(result);
-    };
-    let runtime = TaskRuntime {
-        session: session.clone(),
-        invocation: invocation.clone(),
-        conversation_id: current.conversation_id,
-    };
+    }
     loop {
+        // A fresh Session-line decision is essential: abort can be queued behind
+        // reservation while its storage acknowledgement is still pending.
+        let inv = invocation.clone();
+        let definitions = registry.clone();
+        let dispatch = session
+            .commit_join(invocation.clone(), move |tx| {
+                Box::pin(async move {
+                    tx.fence(inv.clone(), true);
+                    let record = tx
+                        .task(inv.id)
+                        .await?
+                        .ok_or_else(|| SessionError::Invalid("Task disappeared".into()))?;
+                    if record.status() == TaskStatus::Terminal {
+                        inv.end();
+                        return Ok(Decision::Done(RunResult::Terminal(record)));
+                    }
+                    if inv.check().is_err() || record.status() != TaskStatus::Running {
+                        inv.end();
+                        return Ok(Decision::Done(RunResult::Interrupted));
+                    }
+                    let definition = definitions
+                        .0
+                        .get(&record.kind)
+                        .filter(|d| d.version == record.version)
+                        .cloned()
+                        .ok_or_else(|| {
+                            SessionError::Invalid("Running task definition changed".into())
+                        })?;
+                    Ok(Decision::Ready(record, definition))
+                })
+            })
+            .await;
+        let (current, definition) = match dispatch {
+            Ok(receipt) => match receipt.value {
+                Decision::Done(result) => return Ok(result),
+                Decision::Ready(record, definition) => (record, definition),
+            },
+            Err(SessionError::Closed) => return Ok(RunResult::Interrupted),
+            Err(error) => return Err(error.into()),
+        };
+        if invocation.check().is_err() {
+            return Ok(RunResult::Interrupted);
+        }
+        if invocation.cancelled.get() && !invocation.abort_mode && !current.abort_requested {
+            continue; // A durable abort acknowledgement overtook the dispatch receipt.
+        }
+        if current.abort_requested && !invocation.abort_mode {
+            invocation = abort::handoff(session, &invocation);
+        }
+        let runtime = TaskRuntime {
+            session: session.clone(),
+            invocation: invocation.clone(),
+            conversation_id: current.conversation_id,
+        };
         let TaskState::Running { checkpoint } = &current.state else {
             unreachable!()
         };
         let previous = checkpoint.clone();
-        let phase = checkpoint
-            .as_object()
-            .and_then(|v| v.get("phase"))
-            .and_then(Value::as_str);
-        let handler = phase
-            .and_then(|phase| definition.phases.get(phase))
-            .cloned();
-        let failure = if invocation.check().is_err() {
-            None
-        } else if let Some(handler) = handler {
-            match AssertUnwindSafe(async { handler(current, runtime.clone()).await })
+        let handler = if invocation.abort_mode {
+            Some(definition.abort_handler.clone())
+        } else {
+            checkpoint
+                .as_object()
+                .and_then(|v| v.get("phase"))
+                .and_then(Value::as_str)
+                .and_then(|phase| definition.phases.get(phase))
+                .cloned()
+        };
+        if invocation.check().is_err() {
+            return Ok(RunResult::Interrupted);
+        }
+        let failure = if let Some(handler) = handler {
+            match AssertUnwindSafe(async { handler(current, runtime).await })
                 .catch_unwind()
                 .await
             {
@@ -113,7 +155,7 @@ pub(super) async fn execute(
             Some(fault("Task checkpoint has a malformed or unknown phase"))
         };
         let inv = invocation.clone();
-        // Eagerly queued behind every runtime commit, including abandoned waiters.
+        // Join every admitted runtime/abort mutation, including dropped waiters.
         let decision = session
             .commit_join(invocation.clone(), move |tx| {
                 Box::pin(async move {
@@ -124,22 +166,32 @@ pub(super) async fn execute(
                         .ok_or_else(|| SessionError::Invalid("Task disappeared".into()))?;
                     if record.status() != TaskStatus::Running {
                         inv.end();
-                        return Ok(Decision::Done(if record.status() == TaskStatus::Terminal {
+                        return Ok(Some(if record.status() == TaskStatus::Terminal {
                             RunResult::Terminal(record)
                         } else {
                             RunResult::Interrupted
                         }));
                     }
-                    if inv.check().is_err() || record.abort_requested {
+                    if inv.check().is_err() {
                         inv.end();
-                        return Ok(Decision::Done(RunResult::Interrupted));
+                        return Ok(Some(RunResult::Interrupted));
+                    }
+                    // Durable intent suppresses even a normal handler's error.
+                    if record.abort_requested && !inv.abort_mode {
+                        return Ok(None);
                     }
                     let TaskState::Running { checkpoint } = &record.state else {
                         unreachable!()
                     };
                     let failure = failure.or_else(|| {
-                        json_equal(checkpoint, &previous)
-                            .then(|| fault("Task phase returned without durable progress"))
+                        if inv.abort_mode {
+                            Some(fault(
+                                "Task abort handler returned without a durable outcome",
+                            ))
+                        } else {
+                            json_equal(checkpoint, &previous)
+                                .then(|| fault("Task phase returned without durable progress"))
+                        }
                     });
                     if let Some(error) = failure {
                         record.state = TaskState::Terminal {
@@ -148,26 +200,30 @@ pub(super) async fn execute(
                         record.memos = None;
                         tx.set_task(record.clone()).await?;
                         inv.end();
-                        Ok(Decision::Done(RunResult::Terminal(record)))
+                        Ok(Some(RunResult::Terminal(record)))
                     } else {
-                        Ok(Decision::Continue(record))
+                        Ok(None)
                     }
                 })
             })
             .await;
         match decision {
-            Ok(receipt) => match receipt.value {
-                Decision::Done(result) => return Ok(result),
-                Decision::Continue(record) => current = record,
-            },
+            Ok(receipt) => {
+                if let Some(result) = receipt.value {
+                    return Ok(result);
+                }
+            }
             Err(SessionError::Closed) => return Ok(RunResult::Interrupted),
             Err(error) => return Err(error.into()),
         }
     }
 }
-enum Decision {
-    Done(RunResult),
-    Continue(TaskRecord),
+pub(super) async fn supported(tx: &Tx, record: &TaskRecord) -> Result<bool, SessionError> {
+    if record.background || record.owner.is_some() {
+        return Ok(false);
+    }
+    let conversation = tx.conversation(record.conversation_id).await?;
+    Ok(conversation.is_some_and(|c| c.owner.is_none()) && !has_owned(tx, record.id).await?)
 }
 async fn has_owned(tx: &Tx, task: Id) -> Result<bool, SessionError> {
     if !tx

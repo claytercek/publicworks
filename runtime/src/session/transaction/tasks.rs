@@ -125,6 +125,9 @@ impl Tx {
                     TaskUpdate::Complete(result) => TaskState::Terminal {
                         outcome: TaskOutcome::Completed { result },
                     },
+                    TaskUpdate::Abort { reason, result } => TaskState::Terminal {
+                        outcome: TaskOutcome::Aborted { reason, result },
+                    },
                     TaskUpdate::Fail(error, result) => TaskState::Terminal {
                         outcome: TaskOutcome::Failed { error, result },
                     },

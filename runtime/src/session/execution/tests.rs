@@ -332,6 +332,8 @@ fn driver_drop_fences_pending_callbacks_releases_lease_and_wakes_waiters() {
         tick(&mut task_driver).await;
         tick(&mut driver).await;
         tick(&mut task_driver).await;
+        tick(&mut driver).await;
+        tick(&mut task_driver).await;
         let runtime = context.await.unwrap();
         let (gate, receiver) = oneshot::channel();
         let mutation = runtime.commit(move |tx, record| {
@@ -582,6 +584,8 @@ fn runner_close_joins_dropped_runtime_mutation_during_session_close() {
         tick(&mut task_driver).await;
         tick(&mut driver).await;
         tick(&mut task_driver).await;
+        tick(&mut driver).await;
+        tick(&mut task_driver).await;
         let runtime = context.await.unwrap();
         let gate = Gate::default();
         *probe.commit_gate.borrow_mut() = Some(gate.clone());
@@ -619,10 +623,10 @@ fn runner_close_joins_dropped_runtime_mutation_during_session_close() {
 
 #[test]
 fn final_fence_covers_reservation_candidate_and_assembly_awaits() {
-    // Reads: reserve (#1), reservation assembly (#2), runtime gate (#3),
-    // candidate lookup (#4), runtime assembly (#5). A fault decision instead
-    // reads current (#3) and then assembles (#4).
-    for (at, decision) in [(2, false), (4, false), (5, false), (4, true)] {
+    // Reads: reserve (#1), reservation assembly (#2), dispatch (#3), runtime gate (#4),
+    // candidate lookup (#5), runtime assembly (#6). A fault decision instead
+    // reads current (#4) and then assembles (#5).
+    for (at, decision) in [(2, false), (5, false), (6, false), (5, true)] {
         block_on(async {
             let probe = Rc::new(Probe::default());
             let gate = Gate::default();
@@ -683,7 +687,7 @@ fn final_fence_covers_reservation_candidate_and_assembly_awaits() {
 
 #[test]
 fn graceful_close_during_candidate_or_assembly_await_allows_started_callback_to_settle() {
-    for at in [4, 5] {
+    for at in [5, 6] {
         block_on(async {
             let probe = Rc::new(Probe::default());
             let gate = Gate::default();
@@ -745,7 +749,7 @@ fn cancellation_wakers_can_reenter_session_admission_without_borrow_panics() {
             WAKES.with(|count| count.set(count.get() + 1));
         }
     }
-    for mode in 0..4 {
+    for mode in 0..5 {
         block_on(async {
             let probe = Rc::new(Probe::default());
             let (definition, context) = captured();
@@ -758,6 +762,8 @@ fn cancellation_wakers_can_reenter_session_admission_without_borrow_panics() {
             tick(&mut driver).await;
             let task = seeding.await;
             drop(runner.run(task.id));
+            tick(&mut task_driver).await;
+            tick(&mut driver).await;
             tick(&mut task_driver).await;
             tick(&mut driver).await;
             tick(&mut task_driver).await;
@@ -782,6 +788,10 @@ fn cancellation_wakers_can_reenter_session_admission_without_borrow_panics() {
                 2 => {
                     *probe.fault.borrow_mut() = Fault::Before;
                     drop(session.commit(|tx| Box::pin(async { tx.create_conversation().await })));
+                    tick(&mut driver).await;
+                }
+                3 => {
+                    drop(runner.abort(task.id));
                     tick(&mut driver).await;
                 }
                 _ => {
@@ -811,6 +821,8 @@ fn task_driver_drop_does_not_cancel_a_storage_commit_already_started() {
         tick(&mut driver).await;
         let task = seeding.await;
         let run = runner.run(task.id);
+        tick(&mut task_driver).await;
+        tick(&mut driver).await;
         tick(&mut task_driver).await;
         tick(&mut driver).await;
         tick(&mut task_driver).await;
@@ -878,3 +890,5 @@ fn memo_only_commits_are_not_checkpoint_progress() {
         .await;
     });
 }
+
+mod abort;
