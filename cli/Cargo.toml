@@ -1,0 +1,15 @@
+[package]
+name = "publicworks-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "publicworks"
+path = "src/main.rs"
+
+[dependencies]
+publicworks-runtime = { path = "../runtime", version = "0.1.0" }
+publicworks-storage-sqlite = { path = "../storage/sqlite", version = "0.1.0" }
+serde_json = "1"
+futures-lite = "2"
