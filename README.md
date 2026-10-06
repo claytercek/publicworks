@@ -5,8 +5,9 @@ slice is a **Session transaction layer for conversations, immutable entries, and
 durable tasks**, with in-memory and SQLite storage. Hosts can explicitly run
 foreground task trees as checkpointed phase handlers, with durable waits, held
 outcomes, subtree cancellation, and bottom-up abort cleanup. Startup normalization
-changes interrupted running tasks back to pending. There is no automatic scheduler,
-LLM integration, or agent executor.
+changes interrupted running tasks back to pending. A provider-neutral agent layer
+adds durable model/tool turns using host-supplied callbacks. There is no automatic
+scheduler or built-in network provider.
 
 ## Try the persistence demo
 
@@ -39,6 +40,9 @@ from allocation but is not automatically created; ordinary IDs start at 2.
   task creation/ownership validation, startup normalization, a host-polled
   `TaskRunner`/`TaskDriver`, and public `MemoryStorage`. Uses serde/serde_json and small futures primitives;
   no SQL, Tokio, or executor dependency.
+- `agent/` — `publicworks-agent`: immutable model/tool installation, atomic turn
+  admission, pinned requests, fork-aware context projection, ordered tool children,
+  and conservative interrupted-effect recovery. No provider or executor dependency.
 - `storage/sqlite/` — `publicworks-storage-sqlite`: `SqliteStorage::open(path)`;
   bundled SQLite through rusqlite, no external server.
 - `cli/` — `publicworks-cli`: the `publicworks` binary, composing the public
@@ -166,6 +170,27 @@ gate; draining does not promise it will apply. A noncooperative handler can keep
 runner close pending. Session close signals the runner but does not join external
 handler code. Dropping TaskDriver forfeits settlement and fences old contexts.
 See the execution contract for details.
+
+## Run a durable agent turn
+
+Install a local `Model` implementation and `Tool` callbacks with `Agent::new` from
+`publicworks-agent`, register `agent.definitions()`, and use `agent.admit_turn`
+inside a Session transaction. Admission atomically appends user text and creates
+the foreground root, rejecting a busy conversation without writes. Explicitly
+run that root while polling both drivers.
+
+```sh
+cargo run -p publicworks-agent --example agent_turn
+```
+
+The example uses a fake provider and tool; no credentials or network are needed.
+Requests pin model identity, instructions, offered tool versions, and projected
+messages. Calls execute one at a time after durable intent. An interrupted tool
+is not replayed: it records an uncertain-effect error, then the turn continues
+under its model-round limit. A model can request a similar action with a new call
+ID, so approvals and external idempotency remain application responsibilities.
+Cancellation does not undo effects. See the
+agent contract for the API and limits.
 
 ## Cancel a task durably
 

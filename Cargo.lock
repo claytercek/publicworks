@@ -169,6 +169,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "publicworks-agent"
+version = "0.1.0"
+dependencies = [
+ "futures-lite",
+ "futures-util",
+ "publicworks-runtime",
+ "publicworks-storage-sqlite",
+ "serde_json",
+]
+
+[[package]]
 name = "publicworks-cli"
 version = "0.1.0"
 dependencies = [

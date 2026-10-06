@@ -39,6 +39,7 @@ struct State {
     operations: VecDeque<Operation>,
     pending: usize,
     mutated: bool,
+    read_only: bool,
     sealed: bool,
     waker: Option<Waker>,
     by_task_id: Option<Id>,
@@ -76,6 +77,9 @@ impl Tx {
     pub(super) fn attribute(&self, task: Id) {
         self.state.borrow_mut().by_task_id = Some(task);
     }
+    pub(super) fn make_read_only(&self) {
+        self.state.borrow_mut().read_only = true;
+    }
 
     fn operation<T: 'static, F>(&self, mutation: bool, operation: F) -> TxFuture<'_, T>
     where
@@ -85,7 +89,13 @@ impl Tx {
         let admission = state.open().and_then(|()| {
             if mutation {
                 state.mutated = true;
-                Ok(())
+                if state.read_only {
+                    Err(SessionError::Invalid(
+                        "TaskRuntime read callbacks cannot mutate".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
             } else if state.mutated {
                 Err(SessionError::ReadAfterWrite)
             } else {

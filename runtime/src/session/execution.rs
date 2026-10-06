@@ -484,6 +484,27 @@ impl TaskRuntime {
     where
         F: for<'a> FnOnce(&'a Tx, TaskRecord) -> TxFuture<'a, Option<TaskUpdate>> + 'static,
     {
+        self.access(false, move |tx, record| {
+            Box::pin(async move { Ok(((), change(tx, record).await?)) })
+        })
+    }
+
+    /// Queue a read-only transaction on Session and return detached application data.
+    pub fn read<F, T>(&self, read: F) -> CommitWaiter<T>
+    where
+        T: 'static,
+        F: for<'a> FnOnce(&'a Tx, TaskRecord) -> TxFuture<'a, T> + 'static,
+    {
+        self.access(true, move |tx, record| {
+            Box::pin(async move { Ok((read(tx, record).await?, None)) })
+        })
+    }
+
+    fn access<F, T>(&self, read_only: bool, callback: F) -> CommitWaiter<T>
+    where
+        T: 'static,
+        F: for<'a> FnOnce(&'a Tx, TaskRecord) -> TxFuture<'a, (T, Option<TaskUpdate>)> + 'static,
+    {
         let invocation = self.invocation.clone();
         self.session.commit(move |tx| {
             Box::pin(async move {
@@ -501,9 +522,14 @@ impl TaskRuntime {
                         "Task is not running or is abort-marked".into(),
                     ));
                 }
-                tx.attribute(invocation.id);
-                let update = change(tx, record).await?;
-                // Driver drop while an application callback awaits must fence its writes too.
+                if read_only {
+                    tx.make_read_only();
+                } else {
+                    tx.attribute(invocation.id);
+                }
+                let (value, update) = callback(tx, record).await?;
+                // Driver drop while an application callback awaits must fence its
+                // reads and writes before publishing their receipt.
                 if invocation.ended.get() {
                     return Err(SessionError::Invalid("Task invocation ended".into()));
                 }
@@ -513,7 +539,7 @@ impl TaskRuntime {
                     }
                     tx.update_task(invocation.id, update).await?;
                 }
-                Ok(())
+                Ok(value)
             })
         })
     }
