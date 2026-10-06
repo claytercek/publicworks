@@ -41,6 +41,8 @@ struct State {
     mutated: bool,
     sealed: bool,
     waker: Option<Waker>,
+    by_task_id: Option<Id>,
+    fence: Option<execution::PersistenceFence>,
 }
 impl State {
     fn open(&self) -> Result<(), SessionError> {
@@ -59,6 +61,13 @@ pub struct Tx {
     state: Rc<RefCell<State>>,
 }
 impl Tx {
+    pub(super) fn fence(&self, invocation: Rc<execution::Invocation>, ending: bool) {
+        self.state.borrow_mut().fence = Some(execution::PersistenceFence { invocation, ending });
+    }
+    pub(super) fn attribute(&self, task: Id) {
+        self.state.borrow_mut().by_task_id = Some(task);
+    }
+
     fn operation<T: 'static, F>(&self, mutation: bool, operation: F) -> TxFuture<'_, T>
     where
         F: for<'a> FnOnce(&'a mut dyn Storage, Rc<RefCell<State>>) -> TxFuture<'a, T> + 'static,
@@ -189,7 +198,7 @@ impl Tx {
                     model: draft.model,
                     data: draft.data,
                     edits: draft.edits,
-                    by_task_id: None,
+                    by_task_id: state.borrow().by_task_id,
                     head: draft.head.map(|head| match head {
                         Head::SelfEntry => id,
                         Head::Entry(id) => id,
@@ -253,7 +262,8 @@ impl Tx {
 pub(super) async fn prepare<T: 'static, F>(
     storage: &mut dyn Storage,
     callback: F,
-) -> Outcome<(T, Vec<StorageWrite>)>
+    control: Rc<RefCell<Control>>,
+) -> Outcome<(T, Vec<StorageWrite>, Option<execution::PersistenceFence>)>
 where
     F: for<'a> FnOnce(&'a Tx) -> TxFuture<'a, T>,
 {
@@ -310,8 +320,9 @@ where
                         std::mem::take(&mut state.tasks),
                     )
                 };
-                let writes = tasks::assemble(storage, writes, tasks).await?;
-                Ok((value, writes))
+                let writes = tasks::assemble(storage, writes, tasks, control).await?;
+                let fence = state.borrow_mut().fence.take();
+                Ok((value, writes, fence))
             })
             .catch_unwind()
             .await

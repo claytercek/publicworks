@@ -1,5 +1,6 @@
-//! Public Works' conversation/entry/task Session and storage kernel, not an agent executor.
-//! Hosts poll a local SessionDriver concurrently with commit and close waiters.
+//! Public Works' Session/storage kernel and explicit foreground leaf task runner.
+//! Hosts poll local SessionDriver and TaskDriver futures through shutdown.
+//! No automatic scheduler or agent executor is included.
 //! Adapters are trusted. Boxed futures permit async hosts, but the built-in
 //! adapters perform synchronous work when polled. See the workspace design doc.
 use serde::{Deserialize, Serialize};
@@ -8,8 +9,10 @@ use std::{fmt, future::Future, pin::Pin};
 
 mod session;
 pub use session::{
-    CloseWaiter, CommitReceipt, CommitWaiter, EntryDraft, Head, Owner, Session, SessionDriver,
-    SessionError, TaskInitializer, TaskOptions, TaskOwnership, Tx, TxFuture,
+    BlockReason, CloseWaiter, CommitReceipt, CommitWaiter, EntryDraft, Head, Owner, PhaseFuture,
+    PhaseHandler, RunError, RunResult, RunWaiter, RunnerCloseWaiter, Session, SessionDriver,
+    SessionError, TaskDefinition, TaskDriver, TaskOptions, TaskOwnership, TaskRegistry, TaskRunner,
+    TaskRuntime, TaskUpdate, Tx, TxFuture,
 };
 
 mod task;

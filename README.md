@@ -2,9 +2,10 @@
 
 Public Works is our own Rust runtime project, modeled on Pi Durable. The working
 slice is a **Session transaction layer for conversations, immutable entries, and
-durable task records**, with in-memory and SQLite storage. Explicit startup
-normalization changes interrupted running tasks back to pending. There is no scheduler, LLM integration, or
-agent executor yet.
+durable tasks**, with in-memory and SQLite storage. Hosts can explicitly run
+foreground leaf tasks as checkpointed phase handlers. Startup normalization
+changes interrupted running tasks back to pending. There is no automatic scheduler,
+LLM integration, or agent executor.
 
 ## Try the persistence demo
 
@@ -34,8 +35,8 @@ from allocation but is not automatically created; ordinary IDs start at 2.
 
 - `runtime/` — `publicworks-runtime`: records, object-safe async-compatible
   `Storage`, `Session`/`Tx`, host-polled `SessionDriver`, fork-aware reads, and
-  task creation/ownership validation, startup normalization, and public
-  `MemoryStorage`. Uses serde/serde_json and small futures primitives;
+  task creation/ownership validation, startup normalization, a host-polled
+  `TaskRunner`/`TaskDriver`, and public `MemoryStorage`. Uses serde/serde_json and small futures primitives;
   no SQL, Tokio, or executor dependency.
 - `storage/sqlite/` — `publicworks-storage-sqlite`: `SqliteStorage::open(path)`;
   bundled SQLite through rusqlite, no external server.
@@ -106,14 +107,56 @@ public commit stream or view subscription yet, so no subscriber queue to grow.
 See the design contract for the boundary
 between inherited Pi behavior and Rust driver/cancellation mapping.
 
-## Persist tasks without executing them
+## Create and execute a leaf task
 
-Inside a Session callback, `tx.create_task(initializer, input, options)` creates a
-pending task and returns a detached `TaskRecord`. `TaskInitializer::new(kind,
-version, initial)` owns only the synchronous initial-checkpoint hook; it does not
-register executable code. `TaskOptions` requires explicit conversation or task
-ownership. Task-owned children inherit their owner's conversation and cannot be
-background. Use `tx.task` and `tx.scan_tasks` for committed reads before mutations.
+`TaskDefinition::new(kind, version, initial, phases)` combines a reusable
+synchronous initial-checkpoint function with a `BTreeMap<String, PhaseHandler>`.
+Definitions are immutable and cloneable. `TaskRegistry::new(definitions)` rejects
+duplicate kinds. Neither creating a definition nor registering it runs code.
+
+Inside a Session callback, `tx.create_task(definition, input, options)` persists a
+pending task and returns a detached `TaskRecord`. `TaskOptions` requires explicit
+conversation or task ownership. Task-owned children inherit their owner's
+conversation and cannot be background. Use `tx.task` and `tx.scan_tasks` for
+committed reads before mutations.
+
+For execution, attach one runner with
+`TaskRunner::attach(&session, registry)`, then call `runner.run(task.id)`.
+The host must poll **both** the SessionDriver and TaskDriver. The TaskDriver owns
+admitted run requests and handler futures; SessionDriver remains the only Storage
+owner. A handler awaiting external work does not occupy the Session queue.
+Dropping a run waiter does not cancel its request.
+
+Only pending, non-abort-marked, foreground tasks owned by an ownerless conversation
+and owning no tasks or conversations can run. The installed definition's version
+must exactly match the stored version. Other cases return `RunResult::Blocked`
+without writes. There is one active invocation per attached runner, with no
+background scheduling, wait/abort execution, or owned-completion supervision.
+
+A handler receives its detached task and a `TaskRuntime`. It calls
+`runtime.commit(|tx, current| ...)` to atomically write entries and return an
+optional `TaskUpdate::Checkpoint`, `Complete`, or `Fail`. Entries receive task
+attribution automatically. Each successful phase must change its structural
+checkpoint or commit an outcome; returning without durable progress faults the
+task. External effects are not part of the storage transaction and are not
+exactly-once.
+
+Run the complete [host example](runtime/examples/task_execution.rs):
+
+```sh
+cargo run -p publicworks-runtime --example task_execution
+```
+
+On shutdown, await `runner.close()` while polling both drivers, then await
+`session.close()`. Runner close signals `runtime.cancelled()`, interrupts queued
+unreserved requests, joins the cooperative handler, and drains runner-admitted
+mutations. A queued mutation whose callback has not started rejects at the closing
+gate; draining does not promise it will apply. A noncooperative handler can keep
+runner close pending. Session close signals the runner but does not join external
+handler code. Dropping TaskDriver forfeits settlement and fences old contexts.
+See the execution contract for details.
+
+## Reopen interrupted tasks
 
 `Session::open_recovered(storage)` returns `(CommitWaiter<Session>, SessionDriver)`.
 Poll the driver concurrently with the opening waiter, then take the usable Session
@@ -123,10 +166,10 @@ replacement batch; checkpoints, input, version, owner, flags, and memos survive.
 Plain `Session::new` remains unchanged.
 
 Opening runs no task code. Unknown kinds/versions are preserved, and waiting,
-completing, and terminal states are not reconciled. There are no scheduler,
-wait/abort execution, definition migration, or owned-completion APIs yet. Dropping
-the opening waiter still leaves normalization and close owned by the driver.
-See the task contract for the full boundary.
+completing, and terminal states are not reconciled. After opening, explicitly
+attach a runner and request each desired run. There is no definition migration or
+schema migration framework. Dropping the opening waiter still leaves normalization
+and close owned by the driver. See the task persistence contract.
 
 ## Development
 
@@ -143,7 +186,10 @@ adapters. SQLite tests also cover reopen, allocator continuity, rollback, invali
 schemas, corrupt reads, and Session transactions across reopen. Session tests
 cover FIFO settlement, failed callbacks, fork validation, poison classification,
 panics, abandoned operations, waiter/driver drops, close, task ownership and
-replacement validation, and startup normalization. Task storage checks run under
+replacement validation, and startup normalization. Execution tests cover phase
+progress and error precedence, attribution, leaf guards, invocation fencing,
+rejection versus uncertain commits, cooperative shutdown, and SQLite reopen.
+Task storage checks run under
 both default and feature-unified serde_json. SQLite rejects incompatible schemas
 rather than migrating them. The executable
 smoke test runs create/append/show in

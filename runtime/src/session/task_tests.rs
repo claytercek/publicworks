@@ -3,8 +3,13 @@ use super::*;
 use futures_lite::future::{block_on, zip};
 use serde_json::json;
 
-fn initial() -> TaskInitializer {
-    TaskInitializer::new("test", 9, |input| Ok(json!({"input":input})))
+fn initial() -> TaskDefinition {
+    TaskDefinition::new(
+        "test",
+        9,
+        |input| Ok(json!({"input":input})),
+        Default::default(),
+    )
 }
 fn options(conversation: Id) -> TaskOptions {
     TaskOptions {

@@ -50,7 +50,7 @@ impl Tx {
     }
     pub fn create_task(
         &self,
-        initializer: TaskInitializer,
+        definition: TaskDefinition,
         input: Value,
         options: TaskOptions,
     ) -> TxFuture<'_, TaskRecord> {
@@ -87,14 +87,14 @@ impl Tx {
                     })?
                 };
                 require_conversation(storage, &state, conversation_id).await?;
-                let checkpoint = (initializer.initial)(&input)?;
+                let checkpoint = definition.initial(&input)?;
                 let id = storage.mint_id().await?;
                 state.borrow().open()?;
                 let record = TaskRecord {
                     id,
                     conversation_id,
-                    kind: initializer.kind,
-                    version: initializer.version,
+                    kind: definition.kind().to_owned(),
+                    version: definition.version(),
                     input,
                     owner: owner.map(|r| r.id),
                     background: options.background,
@@ -111,6 +111,36 @@ impl Tx {
                     },
                 );
                 Ok(record)
+            })
+        })
+    }
+    pub(in crate::session) fn update_task(&self, id: Id, update: TaskUpdate) -> TxFuture<'_, ()> {
+        self.operation(true, move |storage, state| {
+            Box::pin(async move {
+                let mut record = current_task(storage, &state, id)
+                    .await?
+                    .ok_or_else(|| SessionError::Invalid("Task disappeared".into()))?;
+                record.state = match update {
+                    TaskUpdate::Checkpoint(checkpoint) => TaskState::Running { checkpoint },
+                    TaskUpdate::Complete(result) => TaskState::Terminal {
+                        outcome: TaskOutcome::Completed { result },
+                    },
+                    TaskUpdate::Fail(error, result) => TaskState::Terminal {
+                        outcome: TaskOutcome::Failed { error, result },
+                    },
+                };
+                if record.status() == TaskStatus::Terminal {
+                    record.memos = None;
+                }
+                record.validate_payloads()?;
+                let mut state = state.borrow_mut();
+                let previous = state.tasks.get(&id);
+                if let Some(previous) = previous {
+                    replaceable(&previous.record, &record)?;
+                }
+                let created = previous.is_some_and(|v| v.created);
+                state.tasks.insert(id, TaskCandidate { created, record });
+                Ok(())
             })
         })
     }
@@ -164,6 +194,7 @@ pub(super) async fn assemble(
     storage: &mut dyn Storage,
     mut writes: Vec<StorageWrite>,
     tasks: BTreeMap<Id, TaskCandidate>,
+    control: Rc<RefCell<Control>>,
 ) -> Result<Vec<StorageWrite>, SessionError> {
     let mut owners = Vec::new();
     for write in &writes {
@@ -205,6 +236,16 @@ pub(super) async fn assemble(
         }
     }
     for (id, conversation) in owners {
+        if control
+            .borrow()
+            .leaf
+            .upgrade()
+            .is_some_and(|inv| inv.guards(id))
+        {
+            return Err(SessionError::Invalid(
+                "Reserved leaf task cannot acquire owned work".into(),
+            ));
+        }
         let owner = final_task(storage, &tasks, id).await?;
         if matches!(
             owner.status(),

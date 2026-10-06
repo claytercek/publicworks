@@ -40,8 +40,13 @@ fn tasks_replace_and_roundtrip() {
     });
 }
 
-fn initializer() -> TaskInitializer {
-    TaskInitializer::new("creation.only", 11, |input| Ok(json!({"initial":input})))
+fn initializer() -> TaskDefinition {
+    TaskDefinition::new(
+        "creation.only",
+        11,
+        |input| Ok(json!({"initial":input})),
+        Default::default(),
+    )
 }
 fn options(conversation_id: Option<Id>, ownership: TaskOwnership) -> TaskOptions {
     TaskOptions {
@@ -193,9 +198,14 @@ fn creation_failures_discard_batch_and_latch_reads_without_poison() {
                                     }
                                     4 => {
                                         tx.create_task(
-                                            TaskInitializer::new("fails", 1, |_| {
-                                                Err(SessionError::Invalid("initializer".into()))
-                                            }),
+                                            TaskDefinition::new(
+                                                "fails",
+                                                1,
+                                                |_| {
+                                                    Err(SessionError::Invalid("initializer".into()))
+                                                },
+                                                Default::default(),
+                                            ),
                                             json!(null),
                                             options(Some(c.id), TaskOwnership::Conversation),
                                         )
@@ -207,7 +217,12 @@ fn creation_failures_discard_batch_and_latch_reads_without_poison() {
                                             v = json!([v]);
                                         }
                                         tx.create_task(
-                                            TaskInitializer::new("deep", 1, move |_| Ok(v)),
+                                            TaskDefinition::new(
+                                                "deep",
+                                                1,
+                                                move |_| Ok(v.clone()),
+                                                Default::default(),
+                                            ),
                                             json!(null),
                                             options(Some(c.id), TaskOwnership::Conversation),
                                         )

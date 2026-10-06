@@ -1,26 +1,5 @@
 use super::*;
 
-type Initializer = Box<dyn FnOnce(&Value) -> Result<Value, SessionError>>;
-
-/// Creation hook only: not a registered or executable task definition.
-pub struct TaskInitializer {
-    pub kind: String,
-    pub version: u64,
-    pub(crate) initial: Initializer,
-}
-impl TaskInitializer {
-    pub fn new(
-        kind: impl Into<String>,
-        version: u64,
-        initial: impl FnOnce(&Value) -> Result<Value, SessionError> + 'static,
-    ) -> Self {
-        Self {
-            kind: kind.into(),
-            version,
-            initial: Box::new(initial),
-        }
-    }
-}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskOwnership {
     Conversation,

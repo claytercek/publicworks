@@ -793,7 +793,12 @@ fn task_creation_waiter_drop_keeps_started_mint_owned_and_stops_staging_after_se
         let waiter = session.commit(move |tx| {
             Box::pin(async move {
                 let mut pending = tx.create_task(
-                    TaskInitializer::new("only.initial", 1, |_| Ok(serde_json::Value::Null)),
+                    TaskDefinition::new(
+                        "only.initial",
+                        1,
+                        |_| Ok(serde_json::Value::Null),
+                        Default::default(),
+                    ),
                     serde_json::Value::Null,
                     TaskOptions {
                         ownership: TaskOwnership::Conversation,

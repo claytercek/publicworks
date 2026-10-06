@@ -13,7 +13,9 @@ use std::{
 
 mod tasks;
 mod transaction;
-pub use tasks::{Owner, TaskInitializer, TaskOptions, TaskOwnership};
+pub use tasks::{Owner, TaskOptions, TaskOwnership};
+mod execution;
+pub use execution::*;
 pub use transaction::{EntryDraft, Head, Tx};
 
 /// Local, scoped callback future. The transaction cannot escape the callback.
@@ -84,12 +86,27 @@ type Job =
 struct Control {
     jobs: VecDeque<Job>,
     closing: bool,
+    drained: bool,
+    finished: bool,
     stopped: bool,
     poisoned: bool,
     handles: usize,
     waker: Option<Waker>,
+    runner: std::rc::Weak<execution::RunnerControl>,
+    leaf: std::rc::Weak<execution::Invocation>,
+}
+type RunnerNotification = (Rc<execution::RunnerControl>, bool, bool, bool);
+fn notify_runner(notification: Option<RunnerNotification>) {
+    if let Some((runner, closing, stopped, poisoned)) = notification {
+        runner.session_state(closing, stopped, poisoned);
+    }
 }
 impl Control {
+    fn runner_notification(&self) -> Option<RunnerNotification> {
+        self.runner
+            .upgrade()
+            .map(|runner| (runner, self.closing, self.stopped, self.poisoned))
+    }
     fn admission(&self) -> Result<(), SessionError> {
         if self.stopped {
             Err(SessionError::DriverStopped)
@@ -125,8 +142,10 @@ impl Drop for Session {
         if control.handles == 0 {
             control.closing = true;
         }
+        let notification = control.runner_notification();
         let waker = control.waker.take();
         drop(control);
+        notify_runner(notification);
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -147,14 +166,20 @@ impl Future for SessionDriver {
 }
 impl Drop for SessionDriver {
     fn drop(&mut self) {
-        let (jobs, waker) = {
+        let (jobs, waker, notification) = {
             let mut control = self.control.borrow_mut();
-            control.stopped = true;
+            control.stopped = !control.finished;
             control.closing = true;
-            (std::mem::take(&mut control.jobs), control.waker.take())
+            let notification = control.runner_notification();
+            (
+                std::mem::take(&mut control.jobs),
+                control.waker.take(),
+                notification,
+            )
         };
         // Dropping callbacks can drop Session handles; do it outside the borrow.
         drop(jobs);
+        notify_runner(notification);
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -165,10 +190,14 @@ impl Session {
         let control = Rc::new(RefCell::new(Control {
             jobs: VecDeque::new(),
             closing: false,
+            drained: false,
+            finished: false,
             stopped: false,
             poisoned: false,
             handles: 1,
             waker: None,
+            runner: Default::default(),
+            leaf: Default::default(),
         }));
         let (sender, receiver) = oneshot::channel();
         let close: CloseWaiter =
@@ -184,6 +213,7 @@ impl Session {
                     if let Some(job) = state.jobs.pop_front() {
                         Poll::Ready(Some(job))
                     } else if state.closing {
+                        state.drained = true;
                         Poll::Ready(None)
                     } else {
                         state.waker = Some(cx.waker().clone());
@@ -203,6 +233,7 @@ impl Session {
                 Ok(result) => result.map_err(SessionError::Storage),
                 Err(_) => Err(SessionError::ClosePanicked),
             };
+            owner.borrow_mut().finished = true;
             let _ = sender.send(result);
         });
         (
@@ -227,18 +258,75 @@ impl Session {
     where
         F: for<'a> FnOnce(&'a Tx) -> TxFuture<'a, T> + 'static,
     {
+        self.commit_options(callback, close_on_failure, false, None)
+    }
+
+    // A runner settlement barrier may join the already-admitted mutation line
+    // after close seals public admission, but never after Storage drain ends.
+    fn commit_join<T: 'static, F>(
+        &self,
+        invocation: Rc<execution::Invocation>,
+        callback: F,
+    ) -> CommitWaiter<T>
+    where
+        F: for<'a> FnOnce(&'a Tx) -> TxFuture<'a, T> + 'static,
+    {
+        self.commit_options(callback, false, true, Some(invocation))
+    }
+
+    fn commit_reservation<T: 'static, F>(
+        &self,
+        invocation: Rc<execution::Invocation>,
+        callback: F,
+    ) -> CommitWaiter<T>
+    where
+        F: for<'a> FnOnce(&'a Tx) -> TxFuture<'a, T> + 'static,
+    {
+        self.commit_options(callback, false, false, Some(invocation))
+    }
+
+    fn commit_options<T: 'static, F>(
+        &self,
+        callback: F,
+        close_on_failure: bool,
+        join: bool,
+        fence_on_failure: Option<Rc<execution::Invocation>>,
+    ) -> CommitWaiter<T>
+    where
+        F: for<'a> FnOnce(&'a Tx) -> TxFuture<'a, T> + 'static,
+    {
         let mut control = self.control.borrow_mut();
-        if let Err(error) = control.admission() {
+        let admission = control.admission();
+        if let Err(error) = admission
+            && !(join && error == SessionError::Closed && !control.drained)
+        {
+            drop(control);
+            if let Some(invocation) = &fence_on_failure {
+                invocation.end();
+            }
             return CommitWaiter(Box::pin(async { Err(error) }));
         }
         let (sender, receiver) = oneshot::channel();
         control.jobs.push_back(Box::new(move |storage, owner| {
             Box::pin(async move {
                 if owner.borrow().poisoned {
+                    if let Some(invocation) = &fence_on_failure {
+                        invocation.end();
+                    }
                     let _ = sender.send(Ok(Err(SessionError::Poisoned)));
                     return;
                 }
-                let result = transaction::prepare(storage, callback).await;
+                let result = transaction::prepare(storage, callback, owner.clone()).await;
+                // No await between the final invocation check and Storage.commit.
+                // A started storage commit is still drained even after driver drop.
+                let result = result.map(|result| {
+                    result.and_then(|(value, writes, fence)| {
+                        if let Some(fence) = fence {
+                            fence.check()?;
+                        }
+                        Ok((value, writes))
+                    })
+                });
                 let result = match result {
                     Ok(Ok((value, writes))) if writes.is_empty() => {
                         Ok(Ok(CommitReceipt { value, seq: None }))
@@ -267,16 +355,25 @@ impl Session {
                     Ok(Err(error)) => Ok(Err(error)),
                     Err(panic) => Err(panic),
                 };
+                if !matches!(&result, Ok(Ok(_)))
+                    && let Some(invocation) = &fence_on_failure
+                {
+                    invocation.end();
+                }
                 // Failed startup must close even if its observer remains unpolled.
                 if close_on_failure && !matches!(&result, Ok(Ok(_))) {
                     owner.borrow_mut().closing = true;
                 }
+                let notification = owner.borrow().runner_notification();
+                notify_runner(notification);
                 // No cache to adopt and no stream to publish in this subset.
                 let _ = sender.send(result);
             })
         }));
+        let notification = control.runner_notification();
         let waker = control.waker.take();
         drop(control);
+        notify_runner(notification);
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -288,8 +385,10 @@ impl Session {
     pub fn close(&self) -> CloseWaiter {
         let mut control = self.control.borrow_mut();
         control.closing = true;
+        let notification = control.runner_notification();
         let waker = control.waker.take();
         drop(control);
+        notify_runner(notification);
         if let Some(waker) = waker {
             waker.wake();
         }
