@@ -974,7 +974,9 @@ fn decode_tool_checkpoint(
     cp: &Value,
     input: &ToolInput,
 ) -> Result<Option<(ToolCall, ReplayPolicy)>, SessionError> {
-    validate_entry(None, Some(cp))?;
+    // A checkpoint is persisted inside the TaskState object, which consumes one
+    // structural level beyond the checkpoint value itself.
+    publicworks_runtime::validate_native_json_value(cp, 1)?;
     let object = cp
         .as_object()
         .ok_or_else(|| invalid("Invalid tool checkpoint"))?;
@@ -1309,7 +1311,9 @@ mod tests {
             decode_tool_checkpoint(&decoded, &input).unwrap(),
             Some((call.clone(), ReplayPolicy::Safe))
         );
-        call.arguments = (0..MAX_JSON_DEPTH - 1).fold(Value::Null, |v, _| json!([v]));
+        // TaskState and the checkpoint object consume two levels before the
+        // opaque arguments value.
+        call.arguments = (0..MAX_JSON_DEPTH - 2).fold(Value::Null, |v, _| json!([v]));
         assert!(execute_checkpoint(&input, &call, ReplayPolicy::Safe).is_ok());
         call.arguments = json!([call.arguments]);
         assert!(execute_checkpoint(&input, &call, ReplayPolicy::Safe).is_err());

@@ -481,9 +481,10 @@ Harness release-gate tests cover paused opening, resume and reconciliation wakeu
 known rejection versus uncertain persistence, abandoned observers, reentrant wakes,
 noncooperative close, driver forfeiture, and SQLite recovery after uncertain commits.
 Tree tests cover joins, held outcomes, bottom-up cancellation, acknowledgement
-races, scope validation, quiescence, and SQLite recovery. Task storage checks run under
-both default and feature-unified serde_json. SQLite rejects incompatible schemas
-rather than migrating them. The executable
+races, scope validation, quiescence, and SQLite recovery. Persisted entry, task,
+submission, and conversation-state JSON checks run under both the workspace's normal
+serde_json features and `serde_json/arbitrary_precision` feature unification. SQLite
+rejects incompatible schemas rather than migrating them. The executable
 smoke test runs create/append/show in
 separate processes. See the contract for what
 these checks do and do not establish. Packages remain unpublished; `Cargo.lock`

@@ -15,6 +15,47 @@ pub fn entry(n: u64, conversation: u64) -> EntryRecord {
     EntryRecord::new(id(n), id(conversation), "test")
 }
 
+fn native_json_fixture(number_text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "$serde_json::private::Number": number_text,
+        "$serde_json::private::RawValue": "ordinary text",
+        "nested": [{"$serde_json::private::Number": "123"}],
+        "numbers": [
+            i64::MIN,
+            u64::MAX,
+            f64::MIN,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            0.12345678901234568_f64,
+            -0.0_f64
+        ]
+    })
+}
+
+fn assert_native_json_fixture(value: &serde_json::Value, number_text: &str) {
+    assert!(value.is_object());
+    assert_eq!(value["$serde_json::private::Number"], number_text);
+    assert_eq!(value["$serde_json::private::RawValue"], "ordinary text");
+    assert!(value["nested"][0].is_object());
+    assert_eq!(value["nested"][0]["$serde_json::private::Number"], "123");
+
+    let numbers = value["numbers"].as_array().unwrap();
+    assert_eq!(numbers.len(), 8);
+    assert_eq!(numbers[0].as_i64(), Some(i64::MIN));
+    assert_eq!(numbers[1].as_u64(), Some(u64::MAX));
+    for (actual, expected) in numbers[2..].iter().zip([
+        f64::MIN,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+        f64::from_bits(1),
+        0.12345678901234568_f64,
+        -0.0_f64,
+    ]) {
+        assert_eq!(actual.as_f64().unwrap().to_bits(), expected.to_bits());
+    }
+}
+
 pub async fn batches(store: &mut dyn Storage) {
     assert!(
         store
@@ -438,41 +479,29 @@ pub async fn opaque_objects(store: &mut dyn Storage) {
         .await
         .unwrap();
     for (index, text) in ["123", "ordinary text"].into_iter().enumerate() {
-        let payload = serde_json::json!({"$serde_json::private::Number": text});
-        let number = serde_json::json!([
-            u64::MAX,
-            i64::MIN,
-            f64::MIN,
-            f64::MAX,
-            f64::MIN_POSITIVE,
-            f64::from_bits(1),
-            0.12345678901234568_f64,
-            -0.0_f64
-        ]);
+        let payload = native_json_fixture(text);
         let mut record = entry(index as u64 + 2, 1);
         record.data = Some(payload.clone());
         record.model = Some(vec![
             payload.clone(),
             serde_json::json!({"nested": [payload.clone()]}),
-            number.clone(),
         ]);
         record.edits = Some(vec![ContextEdit::Replace {
             target: id(2),
-            messages: vec![
-                serde_json::json!({"nested": [payload.clone()]}),
-                payload,
-                number,
-            ],
+            messages: vec![serde_json::json!({"nested": [payload.clone()]}), payload],
         }]);
         store
             .commit(vec![StorageWrite::Entry(record.clone())])
             .await
             .unwrap();
-        assert_eq!(store.entry(record.id).await.unwrap().unwrap().entry, record);
-        assert_eq!(
-            serde_json::from_str::<EntryRecord>(&serde_json::to_string(&record).unwrap()).unwrap(),
-            record
-        );
+        let stored = store.entry(record.id).await.unwrap().unwrap().entry;
+        assert_native_json_fixture(stored.data.as_ref().unwrap(), text);
+        assert_eq!(stored, record);
+
+        let decoded =
+            serde_json::from_str::<EntryRecord>(&serde_json::to_string(&record).unwrap()).unwrap();
+        assert_native_json_fixture(decoded.data.as_ref().unwrap(), text);
+        assert_eq!(decoded, record);
         assert_eq!(
             serde_json::from_value::<EntryRecord>(serde_json::to_value(&record).unwrap()).unwrap(),
             record

@@ -10,4 +10,4 @@ publicworks-agent = { path = "../agent" }
 publicworks-storage-sqlite = { path = "../storage/sqlite" }
 futures-lite = "2"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
-serde_json = "1"
+serde_json.workspace = true

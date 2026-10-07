@@ -7,3 +7,6 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 publish = false
+
+[workspace.dependencies]
+serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }

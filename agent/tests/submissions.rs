@@ -1138,16 +1138,33 @@ fn invalid_queued_payload_rolls_back_receipt_inbox_and_sequence() {
                 })
                 .await
                 .unwrap();
+                // The encoded write object plus the inbox array and item object
+                // leave room for 61 containers in data, but not 62.
+                let boundary = (0..61).fold(json!(0), |value, _| json!([value]));
+                let mut accepted = EntryDraft::new("exact-queue-boundary");
+                accepted.data = Some(boundary.clone());
+                let receipt = a
+                    .write(
+                        &h,
+                        c,
+                        accepted,
+                        WriteOptions {
+                            request_id: Some("good".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    receipt.status().await.unwrap().status(),
+                    SubmissionStatus::Queued
+                );
+                assert_eq!(state(&h, c).await.inbox.len(), 1);
+
                 let before = state(&h, c).await;
                 let seq = h.inspect().await.unwrap().last_commit_seq;
-                // The draft itself is in the native domain; retaining it inside the
-                // inbox's additional structural wrappers exceeds the depth limit.
-                let mut deep = json!(0);
-                for _ in 0..63 {
-                    deep = json!([deep]);
-                }
                 let mut draft = EntryDraft::new("too-deep-to-queue");
-                draft.data = Some(deep);
+                draft.data = Some(json!([boundary]));
                 assert!(
                     a.write(
                         &h,
@@ -1178,7 +1195,7 @@ fn invalid_queued_payload_rolls_back_receipt_inbox_and_sequence() {
                             .await?
                             .items
                             .len(),
-                            1
+                            2
                         );
                         assert_eq!(
                             tx.scan_tasks(TaskQuery::default(), 128, None)

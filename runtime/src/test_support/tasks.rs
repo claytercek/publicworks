@@ -205,7 +205,7 @@ fn states(value: Value) -> Vec<TaskState> {
 }
 /// Every state/outcome and opaque field, explicit null versus omission, wrapper member order.
 pub async fn task_json(store: &mut dyn Storage) {
-    let opaque = json!({"nested":[{"$serde_json::private::Number":"123"},{"$serde_json::private::Number":"ordinary"}], "numbers":[u64::MAX,i64::MIN,f64::MAX,f64::from_bits(1),-0.0_f64]});
+    let opaque = native_json_fixture("ordinary text");
     for value in [opaque, Value::Null] {
         for state in states(value.clone()) {
             let mut record = task(2);
@@ -221,9 +221,18 @@ pub async fn task_json(store: &mut dyn Storage) {
                 .commit(vec![StorageWrite::Task(record.clone())])
                 .await
                 .unwrap();
-            assert_eq!(store.task(id(2)).await.unwrap(), Some(record.clone()));
+            let stored = store.task(id(2)).await.unwrap().unwrap();
+            if !value.is_null() {
+                assert_native_json_fixture(&stored.input, "ordinary text");
+            }
+            assert_eq!(stored, record);
+
             let text = serde_json::to_string(&record).unwrap();
-            assert_eq!(serde_json::from_str::<TaskRecord>(&text).unwrap(), record);
+            let decoded = serde_json::from_str::<TaskRecord>(&text).unwrap();
+            if !value.is_null() {
+                assert_native_json_fixture(&decoded.input, "ordinary text");
+            }
+            assert_eq!(decoded, record);
             assert_eq!(
                 serde_json::from_value::<TaskRecord>(serde_json::to_value(&record).unwrap())
                     .unwrap(),
@@ -260,30 +269,117 @@ pub async fn task_json(store: &mut dyn Storage) {
         }
     );
 }
-/// Native numeric and depth bounds include the state/outcome/error and memo wrappers.
+/// Native numeric and depth bounds include every state/outcome/error and memo wrapper.
 pub async fn task_payload_limits(store: &mut dyn Storage) {
-    for (field, allowed) in [(0, 64), (1, 63), (2, 62), (3, 61), (4, 63)] {
+    let cases = [
+        ("input", 64),
+        ("pendingCheckpoint", 63),
+        ("runningCheckpoint", 63),
+        ("waitingCheckpoint", 63),
+        ("completingCompletedResult", 62),
+        ("terminalCompletedResult", 62),
+        ("completingFailedResult", 62),
+        ("terminalFailedResult", 62),
+        ("completingAbortedResult", 62),
+        ("terminalAbortedResult", 62),
+        ("completingFailedDetail", 61),
+        ("terminalFailedDetail", 61),
+        ("completingFaultedDetail", 61),
+        ("terminalFaultedDetail", 61),
+        ("memo", 63),
+    ];
+    for (case, allowed) in cases.iter().copied() {
         let build = |value: Value| {
+            let error = |detail| TaskOutcomeError {
+                message: "x".into(),
+                detail,
+            };
             let mut r = task(2);
-            match field {
-                0 => r.input = value,
-                1 => r.state = TaskState::Running { checkpoint: value },
-                2 => {
+            match case {
+                "input" => r.input = value,
+                "pendingCheckpoint" => r.state = TaskState::Pending { checkpoint: value },
+                "runningCheckpoint" => r.state = TaskState::Running { checkpoint: value },
+                "waitingCheckpoint" => {
+                    r.state = TaskState::Waiting {
+                        checkpoint: value,
+                        on: vec![id(40)],
+                        policy: JoinPolicy::AllSettled,
+                    }
+                }
+                "completingCompletedResult" => {
+                    r.state = TaskState::Completing {
+                        outcome: TaskOutcome::Completed { result: value },
+                    }
+                }
+                "terminalCompletedResult" => {
                     r.state = TaskState::Terminal {
                         outcome: TaskOutcome::Completed { result: value },
                     }
                 }
-                3 => {
+                "completingFailedResult" => {
                     r.state = TaskState::Completing {
-                        outcome: TaskOutcome::Faulted {
-                            error: TaskOutcomeError {
-                                message: "x".into(),
-                                detail: Some(value),
-                            },
+                        outcome: TaskOutcome::Failed {
+                            error: error(None),
+                            result: Some(value),
                         },
                     }
                 }
-                _ => r.memos = Some(BTreeMap::from([("key".into(), value)])),
+                "terminalFailedResult" => {
+                    r.state = TaskState::Terminal {
+                        outcome: TaskOutcome::Failed {
+                            error: error(None),
+                            result: Some(value),
+                        },
+                    }
+                }
+                "completingAbortedResult" => {
+                    r.state = TaskState::Completing {
+                        outcome: TaskOutcome::Aborted {
+                            reason: None,
+                            result: Some(value),
+                        },
+                    }
+                }
+                "terminalAbortedResult" => {
+                    r.state = TaskState::Terminal {
+                        outcome: TaskOutcome::Aborted {
+                            reason: None,
+                            result: Some(value),
+                        },
+                    }
+                }
+                "completingFailedDetail" => {
+                    r.state = TaskState::Completing {
+                        outcome: TaskOutcome::Failed {
+                            error: error(Some(value)),
+                            result: None,
+                        },
+                    }
+                }
+                "terminalFailedDetail" => {
+                    r.state = TaskState::Terminal {
+                        outcome: TaskOutcome::Failed {
+                            error: error(Some(value)),
+                            result: None,
+                        },
+                    }
+                }
+                "completingFaultedDetail" => {
+                    r.state = TaskState::Completing {
+                        outcome: TaskOutcome::Faulted {
+                            error: error(Some(value)),
+                        },
+                    }
+                }
+                "terminalFaultedDetail" => {
+                    r.state = TaskState::Terminal {
+                        outcome: TaskOutcome::Faulted {
+                            error: error(Some(value)),
+                        },
+                    }
+                }
+                "memo" => r.memos = Some(BTreeMap::from([("key".into(), value)])),
+                _ => unreachable!(),
             }
             r
         };
@@ -345,7 +441,10 @@ pub async fn task_payload_limits(store: &mut dyn Storage) {
             .is_err()
     );
     assert_eq!(store.mint_id().await.unwrap(), id(3));
-    assert_eq!(store.commit(vec![]).await.unwrap(), Seq::new(6).unwrap());
+    assert_eq!(
+        store.commit(vec![]).await.unwrap(),
+        Seq::new(cases.len() as u64 + 1).unwrap()
+    );
 }
 #[cfg(test)]
 mod tests {

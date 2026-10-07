@@ -6,7 +6,7 @@ publish.workspace = true
 
 [dependencies]
 publicworks-runtime = { path = "../runtime" }
-serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
+serde_json.workspace = true
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 
 [dev-dependencies]

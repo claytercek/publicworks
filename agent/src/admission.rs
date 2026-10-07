@@ -207,6 +207,11 @@ impl Agent {
             let mut boundary = Boundary::read(tx, conversation).await?;
             validate_entry(draft.model.as_deref(), draft.data.as_ref())?;
             let payload = encode_write(&draft, options.expected_head)?;
+            if boundary.state.run.is_some() {
+                // A queued payload is retained inside the inbox array and item
+                // object, so those durable wrappers consume two more levels.
+                publicworks_runtime::validate_native_json_value(&payload, 2)?;
+            }
             let submission = tx
                 .create_submission(conversation, SubmissionType::Write, options.request_id)
                 .await?;

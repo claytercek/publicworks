@@ -175,10 +175,7 @@ pub async fn submission_storage(store: &mut dyn Storage) {
 
 /// Every legal record shape plus strict impossible-state decoding and null/omit.
 pub async fn submission_json(store: &mut dyn Storage) {
-    let opaque = json!({
-        "$serde_json::private::Number": "ordinary text",
-        "nested": [null, {"x": u64::MAX}]
-    });
+    let opaque = native_json_fixture("ordinary text");
     for state in states(opaque) {
         let mut record = submission(2, 1, state);
         record.request_id = Some("request".into());
@@ -186,7 +183,12 @@ pub async fn submission_json(store: &mut dyn Storage) {
             .commit(vec![StorageWrite::Submission(record.clone())])
             .await
             .unwrap();
-        assert_eq!(store.submission(id(2)).await.unwrap(), Some(record.clone()));
+        let stored = store.submission(id(2)).await.unwrap().unwrap();
+        if let Some(detail) = stored.state.detail() {
+            assert_native_json_fixture(detail, "ordinary text");
+        }
+        assert_eq!(stored, record);
+
         let value = serde_json::to_value(&record).unwrap();
         assert_eq!(
             value.get("detail").is_some(),
@@ -197,6 +199,11 @@ pub async fn submission_json(store: &mut dyn Storage) {
             record
         );
         let text = serde_json::to_string(&record).unwrap();
+        let decoded = serde_json::from_str::<SubmissionRecord>(&text).unwrap();
+        if let Some(detail) = decoded.state.detail() {
+            assert_native_json_fixture(detail, "ordinary text");
+        }
+        assert_eq!(decoded, record);
         for wrapper in [
             format!(r#"{{"type":"submission","value":{text}}}"#),
             format!(r#"{{"value":{text},"type":"submission"}}"#),
@@ -263,6 +270,7 @@ pub async fn submission_json(store: &mut dyn Storage) {
 
 /// Dedicated state is replaceable, ordered, detached, and in the shared ID namespace.
 pub async fn conversation_state_storage(store: &mut dyn Storage) {
+    let payload = native_json_fixture("ordinary text");
     let mut state = ConversationStateRecord {
         id: id(2),
         conversation_id: id(10),
@@ -273,24 +281,35 @@ pub async fn conversation_state_storage(store: &mut dyn Storage) {
         inbox: vec![
             InboxItem {
                 submission_id: id(5),
-                payload: json!({"mode":"followUp", "content": null}),
+                payload: payload.clone(),
             },
             InboxItem {
                 submission_id: id(6),
                 payload: json!({"mode":"write", "draft":{"kind":"note"}}),
             },
         ],
-        agent_config: Some(Value::Null),
+        agent_config: Some(payload),
     };
     store
         .commit(vec![StorageWrite::ConversationState(state.clone())])
         .await
         .unwrap();
-    assert_eq!(
-        store.conversation_state(id(10)).await.unwrap(),
-        Some(state.clone())
-    );
+    let stored = store.conversation_state(id(10)).await.unwrap().unwrap();
+    assert_native_json_fixture(&stored.inbox[0].payload, "ordinary text");
+    assert_native_json_fixture(stored.agent_config.as_ref().unwrap(), "ordinary text");
+    assert_eq!(stored, state);
     assert!(store.conversation_state(id(11)).await.unwrap().is_none());
+
+    let text = serde_json::to_string(&state).unwrap();
+    for wrapper in [
+        format!(r#"{{"type":"conversationState","value":{text}}}"#),
+        format!(r#"{{"value":{text},"type":"conversationState"}}"#),
+    ] {
+        assert_eq!(
+            serde_json::from_str::<StorageWrite>(&wrapper).unwrap(),
+            StorageWrite::ConversationState(state.clone())
+        );
+    }
 
     let mut detached = store.conversation_state(id(10)).await.unwrap().unwrap();
     detached.inbox.reverse();
