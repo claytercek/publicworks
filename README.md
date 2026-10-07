@@ -53,9 +53,6 @@ allocation but is not automatically created; ordinary IDs start at 2.
 - `agent/` — `publicworks-agent`: immutable model/tool installation, atomic turn
   admission, pinned requests, fork-aware context projection, ordered tool children,
   and conservative interrupted-effect recovery. No provider or executor dependency.
-- `extensions/permissions/` — `publicworks-extension-permissions`: optional,
-  selected `before_tool` guard that maps local allow/deny policy to immediate
-  blocked results. It is not an approval service or authorization boundary.
 - `providers/openai/` — `publicworks-provider-openai`: opt-in, non-streaming
   OpenAI Responses text/function-call adapter using reqwest/rustls. Requires a
   Tokio host; excluded from the workspace's default members.
@@ -361,25 +358,28 @@ provides cooperative cancellation and invocation-fenced, first-writer-wins memos
 it does not expose raw transaction or task-transition access. Ordinary hook errors
 are recorded, and `before_tool` errors additionally fail closed as a blocked call.
 
-Callbacks are never persisted and must be reinstalled on restart. The optional
-permissions package is a concrete selected hook:
+Callbacks are never persisted and must be reinstalled on restart. Public Works
+maintains the extension API and a small set of tested recipes, not a first-party
+extension catalog. Copy a recipe into your host or depend on a community crate.
+Extensions compile into the host; there is no dynamic Rust plugin ABI. Example
+helper APIs carry no compatibility promise.
 
-```rust,ignore
-use publicworks_extension_permissions::{PermissionDecision, permission_extension};
+Package-specific recipes live beside their owning crate; top-level examples are
+reserved for applications that compose several packages. To try a selected
+`before_tool` policy with a deterministic local model:
 
-registry.install(permission_extension(|call| {
-    if call.name == "dangerous" {
-        PermissionDecision::Deny("Needs approval".into())
-    } else {
-        PermissionDecision::Allow
-    }
-}))?;
+```sh
+cargo run -p publicworks-agent --example tool_policy
+cargo test -p publicworks-agent --example tool_policy
 ```
 
-A denial becomes an immediate `tool_blocked` result before durable effect intent.
-The guard only applies when the `permissions` extension is installed and selected;
-an exact selection that omits it runs without it. This is not a manual approval
-queue, authorization boundary, or sandbox. See the
+Copy and adapt `host_policy` in
+[`agent/examples/tool_policy.rs`](agent/examples/tool_policy.rs), then install
+and select it as shown there. Replace the example's decision with your own
+application policy. A block becomes an immediate `tool_blocked` result before
+durable effect intent. Omitting or deselecting the hook leaves tools unguarded.
+This is not a manual approval queue, authorization boundary, or sandbox. Hook
+semantics belong to the API and core tests, not to this recipe. See the
 optional integration contract.
 
 Prompt sections, wrappers, filters, yield hooks, and compaction hooks remain

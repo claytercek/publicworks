@@ -9,6 +9,10 @@ publicworks-runtime = { path = "../runtime" }
 serde_json.workspace = true
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 
+[[example]]
+name = "tool_policy"
+test = true
+
 [dev-dependencies]
 futures-lite = "2"
 publicworks-storage-sqlite = { path = "../storage/sqlite" }

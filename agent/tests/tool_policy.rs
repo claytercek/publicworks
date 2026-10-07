@@ -1,6 +1,5 @@
 use futures_lite::future::{block_on, zip};
 use publicworks_agent::*;
-use publicworks_extension_permissions::*;
 use publicworks_runtime::*;
 use publicworks_storage_sqlite::SqliteStorage;
 use serde_json::json;
@@ -37,7 +36,7 @@ fn declaration() -> ToolDeclaration {
     }
 }
 
-async fn exercise(storage: impl Storage + 'static, decision: Option<PermissionDecision>) {
+async fn exercise(storage: impl Storage + 'static, decision: Option<BeforeTool>) {
     let executions = Rc::new(Cell::new(0));
     let tool = Tool::new(declaration(), |_| Ok(()), {
         let executions = executions.clone();
@@ -57,15 +56,21 @@ async fn exercise(storage: impl Storage + 'static, decision: Option<PermissionDe
         .install(Extension::new("tools", vec![tool]))
         .unwrap();
     registry
-        .install(permission_extension({
-            let decision = decision.clone();
-            move |call| {
-                assert_eq!(call.name, "dangerous");
-                decision
-                    .clone()
-                    .expect("deselected permissions policy must not run")
-            }
-        }))
+        .install(
+            Extension::new("host-policy", vec![]).with_hooks(LifecycleHooks {
+                before_tool: Some(Rc::new({
+                    let decision = decision.clone();
+                    move |call: ToolCall, _| {
+                        assert_eq!(call.name, "dangerous");
+                        let decision = decision
+                            .clone()
+                            .expect("deselected host policy must not run");
+                        Box::pin(async move { Ok(decision) })
+                    }
+                })),
+                ..LifecycleHooks::default()
+            }),
+        )
         .unwrap();
 
     let round = Cell::new(0);
@@ -111,7 +116,7 @@ async fn exercise(storage: impl Storage + 'static, decision: Option<PermissionDe
                 .value;
             let mut selected = vec!["tools".into()];
             if decision.is_some() {
-                selected.push(EXTENSION_NAME.into());
+                selected.push("host-policy".into());
             }
             agent
                 .configure_extensions(
@@ -164,13 +169,14 @@ async fn exercise(storage: impl Storage + 'static, decision: Option<PermissionDe
                 panic!("expected tool result")
             };
             match decision {
-                Some(PermissionDecision::Deny(_)) => {
+                Some(BeforeTool::Block(_)) => {
                     assert_eq!(executions.get(), 0);
                     assert!(is_error);
-                    assert_eq!(content, "Needs approval");
+                    assert_eq!(content, "Blocked by host policy");
                     assert_eq!(result.data.as_ref().unwrap()["code"], "tool_blocked");
                 }
-                Some(PermissionDecision::Allow) | None => {
+                Some(BeforeTool::Rewrite(_)) => panic!("this policy does not rewrite arguments"),
+                Some(BeforeTool::Continue) | None => {
                     assert_eq!(executions.get(), 1);
                     assert!(!is_error);
                     assert_eq!(content, "executed");
@@ -186,8 +192,8 @@ async fn exercise(storage: impl Storage + 'static, decision: Option<PermissionDe
 #[test]
 fn memory_policy_allows_denies_and_only_runs_when_selected() {
     for decision in [
-        Some(PermissionDecision::Deny("Needs approval".into())),
-        Some(PermissionDecision::Allow),
+        Some(BeforeTool::Block("Blocked by host policy".into())),
+        Some(BeforeTool::Continue),
         None,
     ] {
         block_on(exercise(MemoryStorage::new(), decision));
@@ -197,8 +203,8 @@ fn memory_policy_allows_denies_and_only_runs_when_selected() {
 #[test]
 fn sqlite_policy_allows_denies_and_only_runs_when_selected() {
     for decision in [
-        Some(PermissionDecision::Deny("Needs approval".into())),
-        Some(PermissionDecision::Allow),
+        Some(BeforeTool::Block("Blocked by host policy".into())),
+        Some(BeforeTool::Continue),
         None,
     ] {
         let db = Database::new();
