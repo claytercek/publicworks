@@ -117,6 +117,7 @@ fn file_size(path: &Path) -> u64 {
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(format!("{}{suffix}", path.display()))
 }
+#[allow(clippy::too_many_arguments)]
 fn emit(
     profile: Profile,
     adapter: &str,
