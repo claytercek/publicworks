@@ -477,6 +477,9 @@ panics, abandoned operations, waiter/driver drops, close, task ownership and
 replacement validation, and startup normalization. Execution tests cover phase
 progress and error precedence, attribution, drive-lifetime tree guards, invocation fencing,
 rejection versus uncertain commits, cooperative shutdown, and SQLite reopen.
+Harness release-gate tests cover paused opening, resume and reconciliation wakeups,
+known rejection versus uncertain persistence, abandoned observers, reentrant wakes,
+noncooperative close, driver forfeiture, and SQLite recovery after uncertain commits.
 Tree tests cover joins, held outcomes, bottom-up cancellation, acknowledgement
 races, scope validation, quiescence, and SQLite recovery. Task storage checks run under
 both default and feature-unified serde_json. SQLite rejects incompatible schemas
