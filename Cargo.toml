@@ -13,7 +13,9 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-publish = false
+publish = true
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/claytercek/publicworks"
 
 [workspace.dependencies]
 serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }

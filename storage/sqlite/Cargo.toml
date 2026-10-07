@@ -3,6 +3,11 @@ name = "publicworks-storage-sqlite"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/publicworks-storage-sqlite"
+description = "SQLite storage adapter for the Public Works runtime"
 
 [dependencies]
 publicworks-runtime = { path = "../../runtime", version = "0.1.0" }
@@ -11,5 +16,5 @@ serde_json.workspace = true
 serde = "1"
 
 [dev-dependencies]
-publicworks-runtime = { path = "../../runtime", features = ["test-support"] }
+publicworks-runtime = { version = "0.1.0", path = "../../runtime", features = ["test-support"] }
 futures-lite = "2"

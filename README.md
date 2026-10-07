@@ -482,6 +482,19 @@ automatic progress after one resume. Neither path performs definition or schema
 migration. Dropping the Session opening waiter still leaves normalization and
 close owned by the driver. See the task persistence contract.
 
+## Releases and licensing
+
+The runtime, agent, SQLite storage, and OpenAI adapter are intended for crates.io
+and tagged source releases. The demo CLI and performance runner remain source-only.
+Release automation must be explicitly enabled by a maintainer; preparing the
+repository does not publish any packages. See the release setup guide
+for local first publication, tokenless release automation, OIDC, and archive
+attestations. No GitHub App or personal access token is required.
+
+Public Works, including its examples, is licensed under either
+[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Retain the
+applicable license notices when copying examples or redistributing code.
+
 ## Development
 
 ```sh
@@ -492,12 +505,25 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo clippy --workspace --all-targets --all-features --locked --features serde_json/arbitrary_precision -- -D warnings
 ```
 
-These commands are the documented development checks, not a statement that the
-release gate has passed. The unchecked release gates
-also require package checks, fake/local-provider examples, and Markdown-link
-checks. This repository does not currently define one checked-in release command
-or Markdown-link-checker configuration. Do not run the live OpenAI example as a
-release smoke test without explicit credential opt-in.
+Run the complete offline release check through the development environment:
+
+```sh
+devenv shell -- cargo fetch --locked
+devenv shell -- cargo fmt --all -- --check
+devenv shell -- cargo test --workspace --all-features --locked
+devenv shell -- cargo test --workspace --all-features --locked --features serde_json/arbitrary_precision
+devenv shell -- cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+devenv shell -- env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+devenv shell -- cargo package --workspace --locked
+```
+
+CI includes both JSON feature configurations, Clippy, fake/local examples,
+local Markdown file/anchor checks and their tests, and package verification. Cargo
+uses the fetched dependency cache; remote documentation links are not checked.
+A clean worktree is required for packaging; use `--allow-dirty` explicitly when
+checking uncommitted work. Passing checks does not enable publishing or satisfy
+the external setup in the release guide. Do not run the live
+OpenAI example without explicit credential opt-in.
 
 The shared conformance checks exercise the public `Storage` seam against both
 adapters. SQLite tests also cover reopen, allocator continuity, rollback, invalid
@@ -517,5 +543,5 @@ serde_json features and `serde_json/arbitrary_precision` feature unification. SQ
 rejects incompatible schemas rather than migrating them. The executable
 smoke test runs create/append/show in
 separate processes. See the contract for what
-these checks do and do not establish. Packages remain unpublished; `Cargo.lock`
-is retained for reproducible builds.
+these checks do and do not establish. Publication follows the explicit gates in
+the release guide; `Cargo.lock` is retained for reproducible builds.

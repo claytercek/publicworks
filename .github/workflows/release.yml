@@ -6,52 +6,18 @@ on:
       - main
   workflow_dispatch:
 
-# Jobs opt into only the permissions they need. Repository writes use the
-# short-lived GitHub App token generated in each release-plz job.
 permissions:
   contents: read
+
+# Publishing must finish before the next main-branch release starts.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   verify:
     name: Verify release inputs
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
-
-      - name: Configure the devenv cache
-        uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
-        with:
-          name: devenv
-
-      - name: Install devenv
-        run: nix profile add nixpkgs#devenv
-
-      - name: Check formatting
-        run: devenv shell -- cargo fmt --all -- --check
-
-      - name: Test workspace
-        run: devenv shell -- cargo test --workspace --all-features --locked --offline
-
-      - name: Test unified JSON features
-        run: devenv shell -- cargo test --workspace --all-features --locked --offline --features serde_json/arbitrary_precision
-
-      - name: Lint workspace
-        run: devenv shell -- cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
-
-      - name: Lint unified JSON features
-        run: devenv shell -- cargo clippy --workspace --all-targets --all-features --locked --offline --features serde_json/arbitrary_precision -- -D warnings
-
-      - name: Build rustdoc
-        run: devenv shell -- env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked --offline
-
-      - name: Verify packages
-        run: devenv shell -- cargo package --workspace --locked --offline
+    uses: ./.github/workflows/checks.yml
 
   release:
     name: Publish crates and GitHub releases
@@ -61,9 +27,11 @@ jobs:
       github.ref == 'refs/heads/main' &&
       vars.RELEASE_PUBLISH_ENABLED == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     environment: release
     permissions:
-      contents: read
+      contents: write
+      pull-requests: read
       id-token: write
     steps:
       - name: Checkout repository
@@ -77,31 +45,26 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          permission-contents: write
-          permission-pull-requests: read
-
       - name: Publish with release-plz
         uses: release-plz/action@18641b6c63063cc5ff8786ebf69cd57e8541bae1 # v0.5.140
         with:
           command: release
         env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   release-pr:
     name: Update release PR
     needs: verify
     if: >-
       needs.verify.result == 'success' &&
-      github.ref == 'refs/heads/main'
+      github.ref == 'refs/heads/main' &&
+      vars.RELEASE_PR_ENABLED == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
-      contents: read
+      contents: write
+      pull-requests: write
+      actions: write
     concurrency:
       group: release-plz-pr-${{ github.ref }}
       cancel-in-progress: false
@@ -117,18 +80,21 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          permission-contents: write
-          permission-pull-requests: write
-
       - name: Create or update release PR
+        id: release-pr
         uses: release-plz/action@18641b6c63063cc5ff8786ebf69cd57e8541bae1 # v0.5.140
         with:
           command: release-pr
         env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Explicit dispatch bypasses GITHUB_TOKEN's normal recursion protection.
+      # Checks run read-only on the PR branch, never in this write-enabled job.
+      - name: Dispatch checks for the release PR
+        if: steps.release-pr.outputs.pr != '' && steps.release-pr.outputs.pr != 'null'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_PR: ${{ steps.release-pr.outputs.pr }}
+        run: |
+          branch=$(jq -er '.head_branch | select(startswith("release-plz-"))' <<< "$RELEASE_PR")
+          gh workflow run checks.yml --ref "$branch"

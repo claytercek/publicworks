@@ -2,12 +2,15 @@
 name = "publicworks-perf"
 version.workspace = true
 edition.workspace = true
-publish.workspace = true
+publish = false
+license.workspace = true
+repository.workspace = true
+description = "Deterministic performance workloads for Public Works"
 
 [dependencies]
-publicworks-runtime = { path = "../runtime" }
-publicworks-agent = { path = "../agent" }
-publicworks-storage-sqlite = { path = "../storage/sqlite" }
+publicworks-runtime = { version = "0.1.0", path = "../runtime" }
+publicworks-agent = { version = "0.1.0", path = "../agent" }
+publicworks-storage-sqlite = { version = "0.1.0", path = "../storage/sqlite" }
 futures-lite = "2"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 serde_json.workspace = true
