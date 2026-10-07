@@ -49,6 +49,117 @@ fn task(id: u64, conversation_id: u64, state: TaskState) -> TaskRecord {
 }
 
 #[test]
+fn harness_reopens_owned_conversations_and_background_anchors() {
+    block_on(async {
+        let path = path().with_file_name(format!(
+            "publicworks-harness-owned-{}-{}.db",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut storage = SqliteStorage::open(&path).unwrap();
+        let root = task(
+            3,
+            2,
+            TaskState::Pending {
+                checkpoint: json!({"phase":"run"}),
+            },
+        );
+        let child = task(
+            5,
+            4,
+            TaskState::Pending {
+                checkpoint: json!({"phase":"run"}),
+            },
+        );
+        let mut background = task(
+            6,
+            4,
+            TaskState::Pending {
+                checkpoint: json!({"phase":"run"}),
+            },
+        );
+        background.background = true;
+        let background_child = task(
+            8,
+            7,
+            TaskState::Pending {
+                checkpoint: json!({"phase":"run"}),
+            },
+        );
+        storage
+            .commit(vec![
+                StorageWrite::Conversation(ConversationRecord {
+                    id: Id::new(2).unwrap(),
+                    parent: None,
+                    owner: None,
+                }),
+                StorageWrite::Task(root.clone()),
+                StorageWrite::Conversation(ConversationRecord {
+                    id: Id::new(4).unwrap(),
+                    parent: None,
+                    owner: Some(OwnerLink {
+                        conversation_id: root.conversation_id,
+                        task_id: root.id,
+                    }),
+                }),
+                StorageWrite::Task(child.clone()),
+                StorageWrite::Task(background.clone()),
+                StorageWrite::Conversation(ConversationRecord {
+                    id: Id::new(7).unwrap(),
+                    parent: None,
+                    owner: Some(OwnerLink {
+                        conversation_id: background.conversation_id,
+                        task_id: background.id,
+                    }),
+                }),
+                StorageWrite::Task(background_child.clone()),
+            ])
+            .await
+            .unwrap();
+        storage.close().await.unwrap();
+
+        let (opening, driver) = Harness::open(
+            SqliteStorage::open(&path).unwrap(),
+            TaskRegistry::new([definition()]).unwrap(),
+        );
+        let command = async move {
+            let harness = opening.await.unwrap();
+            let conversation = harness
+                .conversation(Id::new(2).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            harness.resume().unwrap();
+            for id in [root.id, child.id, background.id, background_child.id] {
+                assert_eq!(
+                    harness.wait_task(id).await.unwrap().status(),
+                    TaskStatus::Terminal
+                );
+            }
+            conversation.wait_for_idle().await.unwrap();
+            harness.wait_for_idle().await.unwrap();
+            harness.close().await.unwrap();
+        };
+        let ((), ()) = zip(command, driver).await;
+
+        let (opening, driver) = Harness::open(
+            SqliteStorage::open(&path).unwrap(),
+            TaskRegistry::new([definition()]).unwrap(),
+        );
+        let command = async move {
+            let harness = opening.await.unwrap();
+            harness.resume().unwrap();
+            harness.wait_for_idle().await.unwrap();
+            assert!(harness.inspect().await.unwrap().tasks.is_empty());
+            harness.close().await.unwrap();
+        };
+        let ((), ()) = zip(command, driver).await;
+        let _ = std::fs::remove_file(path);
+    });
+}
+
+#[test]
 fn harness_reopens_runs_all_roots_and_does_not_redispatch_terminals() {
     block_on(async {
         let path = path();
