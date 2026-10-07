@@ -8,9 +8,13 @@ mod admission;
 pub use admission::{BusyMode, ExpectedHead, QueueConfig, QueueMode, SubmitOptions, WriteOptions};
 mod context;
 mod engine;
+mod registry;
 mod wire;
 pub use context::{ContextProjection, project_context};
 pub use engine::{Agent, TOOL_KIND, TURN_KIND};
+pub use registry::{
+    AgentRegistry, AgentRegistrySnapshot, Extension, ExtensionSelection, ResolvedExtensions,
+};
 pub use wire::{decode_message, encode_message};
 
 #[derive(Clone, Debug, PartialEq)]
