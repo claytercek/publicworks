@@ -1,8 +1,24 @@
+use futures_channel::oneshot;
 use futures_lite::future::{block_on, zip};
 use futures_util::future::join_all;
 use publicworks_runtime::*;
 use serde_json::json;
 use std::{cell::Cell, collections::BTreeMap, rc::Rc};
+
+fn record(id: u64, conversation_id: u64, state: TaskState) -> TaskRecord {
+    TaskRecord {
+        id: Id::new(id).unwrap(),
+        conversation_id: Id::new(conversation_id).unwrap(),
+        kind: "recovered".into(),
+        version: 1,
+        input: json!({"task": id}),
+        owner: None,
+        background: false,
+        abort_requested: false,
+        state,
+        memos: Some(BTreeMap::from([("kept".into(), json!(id))])),
+    }
+}
 
 fn completing_definition(
     kind: &str,
@@ -114,6 +130,298 @@ fn resume_reserves_all_roots_and_runs_them_concurrently() {
             )));
             assert_eq!(calls.get(), 3);
             assert!(harness.inspect().await.unwrap().tasks.is_empty());
+            harness.close().await.unwrap();
+        };
+        let ((), ()) = zip(command, driver).await;
+    });
+}
+
+#[test]
+fn opening_normalizes_and_reconciles_without_dispatch() {
+    block_on(async {
+        let mut storage = MemoryStorage::new();
+        let conversation = ConversationRecord {
+            id: Id::new(2).unwrap(),
+            parent: None,
+            owner: None,
+        };
+        let mut terminal = record(
+            3,
+            2,
+            TaskState::Terminal {
+                outcome: TaskOutcome::Completed { result: json!(3) },
+            },
+        );
+        terminal.memos = None;
+        let mut running = record(
+            4,
+            2,
+            TaskState::Running {
+                checkpoint: json!({"phase":"run", "value":4}),
+            },
+        );
+        let mut waiting = record(
+            5,
+            2,
+            TaskState::Waiting {
+                checkpoint: json!({"phase":"run", "value":5}),
+                on: vec![terminal.id],
+                policy: JoinPolicy::AllSettled,
+            },
+        );
+        let mut completing = record(
+            6,
+            2,
+            TaskState::Completing {
+                outcome: TaskOutcome::Completed { result: json!(6) },
+            },
+        );
+        // Final records cannot retain invocation memos.
+        completing.memos = None;
+        running.memos = Some(BTreeMap::from([("kept".into(), json!(4))]));
+        waiting.memos = Some(BTreeMap::from([("kept".into(), json!(5))]));
+        storage
+            .commit(vec![
+                StorageWrite::Conversation(conversation),
+                StorageWrite::Task(terminal),
+                StorageWrite::Task(running.clone()),
+                StorageWrite::Task(waiting.clone()),
+                StorageWrite::Task(completing.clone()),
+            ])
+            .await
+            .unwrap();
+
+        let calls = Rc::new(Cell::new(0));
+        let definition = completing_definition("recovered", 2, calls.clone());
+        let (opening, driver) = Harness::open(storage, TaskRegistry::new([definition]).unwrap());
+        let command = async move {
+            let harness = opening.await.unwrap();
+            let completed = harness.wait_task(completing.id).await.unwrap();
+            assert!(matches!(completed.state, TaskState::Terminal { .. }));
+            assert_eq!(calls.get(), 0);
+
+            let inspection = harness.inspect().await.unwrap();
+            assert_eq!(inspection.tasks.len(), 2);
+            let recovered_running = inspection
+                .tasks
+                .iter()
+                .find(|task| task.task.id == running.id)
+                .unwrap();
+            assert!(matches!(
+                recovered_running.task.state,
+                TaskState::Pending { .. }
+            ));
+            assert_eq!(recovered_running.task.memos, running.memos);
+            let recovered_waiting = inspection
+                .tasks
+                .iter()
+                .find(|task| task.task.id == waiting.id)
+                .unwrap();
+            assert!(matches!(
+                recovered_waiting.task.state,
+                TaskState::Pending { .. }
+            ));
+            assert_eq!(recovered_waiting.task.memos, waiting.memos);
+            harness.close().await.unwrap();
+        };
+        let ((), ()) = zip(command, driver).await;
+    });
+}
+
+#[test]
+fn dropped_task_waiter_does_not_cancel_handler() {
+    block_on(async {
+        let (entered_sender, entered_receiver) = oneshot::channel();
+        let entered_sender = Rc::new(std::cell::RefCell::new(Some(entered_sender)));
+        let (release_sender, release_receiver) = oneshot::channel();
+        let release_receiver = Rc::new(std::cell::RefCell::new(Some(release_receiver)));
+        let handler: PhaseHandler = Rc::new(move |_, runtime| {
+            let entered_sender = entered_sender.clone();
+            let release_receiver = release_receiver.clone();
+            Box::pin(async move {
+                entered_sender
+                    .borrow_mut()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+                let release = release_receiver.borrow_mut().take().unwrap();
+                release.await.unwrap();
+                runtime
+                    .commit(|_, _| {
+                        Box::pin(async { Ok(Some(TaskUpdate::Complete(json!("done")))) })
+                    })
+                    .await
+                    .map_err(|error| TaskOutcomeError {
+                        message: error.to_string(),
+                        detail: None,
+                    })?;
+                Ok(())
+            })
+        });
+        let definition = TaskDefinition::new(
+            "gated",
+            1,
+            |_| Ok(json!({"phase":"run"})),
+            BTreeMap::from([("run".into(), handler)]),
+        );
+        let (opening, driver) = Harness::open(
+            MemoryStorage::new(),
+            TaskRegistry::new([definition.clone()]).unwrap(),
+        );
+        let command = async move {
+            let harness = opening.await.unwrap();
+            let task = harness
+                .commit(move |tx| {
+                    Box::pin(async move {
+                        let conversation = tx.create_conversation().await?;
+                        tx.create_task(
+                            definition,
+                            json!(null),
+                            TaskOptions {
+                                ownership: TaskOwnership::Conversation,
+                                conversation_id: Some(conversation.id),
+                                background: false,
+                            },
+                        )
+                        .await
+                    })
+                })
+                .await
+                .unwrap()
+                .value;
+            let abandoned = harness.wait_task(task.id);
+            harness.resume().unwrap();
+            entered_receiver.await.unwrap();
+            drop(abandoned);
+            release_sender.send(()).unwrap();
+            assert_eq!(
+                harness.wait_task(task.id).await.unwrap().status(),
+                TaskStatus::Terminal
+            );
+            harness.close().await.unwrap();
+        };
+        let ((), ()) = zip(command, driver).await;
+    });
+}
+
+#[test]
+fn close_signals_and_joins_handlers_before_storage_close() {
+    block_on(async {
+        let (entered_sender, entered_receiver) = oneshot::channel();
+        let entered_sender = Rc::new(std::cell::RefCell::new(Some(entered_sender)));
+        let cancelled = Rc::new(Cell::new(false));
+        let late_write_rejected = Rc::new(Cell::new(false));
+        let handler: PhaseHandler = Rc::new({
+            let cancelled = cancelled.clone();
+            let late_write_rejected = late_write_rejected.clone();
+            move |_, runtime| {
+                let entered_sender = entered_sender.clone();
+                let cancelled = cancelled.clone();
+                let late_write_rejected = late_write_rejected.clone();
+                Box::pin(async move {
+                    entered_sender
+                        .borrow_mut()
+                        .take()
+                        .unwrap()
+                        .send(())
+                        .unwrap();
+                    runtime.cancelled().await;
+                    cancelled.set(true);
+                    late_write_rejected.set(
+                        runtime
+                            .read(|_, _| Box::pin(async { Ok(()) }))
+                            .await
+                            .is_err(),
+                    );
+                    Ok(())
+                })
+            }
+        });
+        let definition = TaskDefinition::new(
+            "close-gate",
+            1,
+            |_| Ok(json!({"phase":"run"})),
+            BTreeMap::from([("run".into(), handler)]),
+        );
+        let (opening, driver) = Harness::open(
+            MemoryStorage::new(),
+            TaskRegistry::new([definition.clone()]).unwrap(),
+        );
+        let command = async move {
+            let harness = opening.await.unwrap();
+            harness
+                .commit(move |tx| {
+                    Box::pin(async move {
+                        let conversation = tx.create_conversation().await?;
+                        tx.create_task(
+                            definition,
+                            json!(null),
+                            TaskOptions {
+                                ownership: TaskOwnership::Conversation,
+                                conversation_id: Some(conversation.id),
+                                background: false,
+                            },
+                        )
+                        .await
+                    })
+                })
+                .await
+                .unwrap();
+            harness.resume().unwrap();
+            entered_receiver.await.unwrap();
+            let close = harness.close();
+            assert!(matches!(
+                harness.commit(|_| Box::pin(async { Ok(()) })).await,
+                Err(SessionError::Closed)
+            ));
+            close.await.unwrap();
+            assert!(cancelled.get());
+            assert!(late_write_rejected.get());
+        };
+        let ((), ()) = zip(command, driver).await;
+    });
+}
+
+#[test]
+fn paused_abort_orphans_a_missing_definition() {
+    block_on(async {
+        let definition = TaskDefinition::new(
+            "missing",
+            1,
+            |_| Ok(json!({"phase":"run"})),
+            BTreeMap::new(),
+        );
+        let (opening, driver) = Harness::open(MemoryStorage::new(), TaskRegistry::default());
+        let command = async move {
+            let harness = opening.await.unwrap();
+            let task = harness
+                .commit(move |tx| {
+                    Box::pin(async move {
+                        let conversation = tx.create_conversation().await?;
+                        tx.create_task(
+                            definition,
+                            json!(null),
+                            TaskOptions {
+                                ownership: TaskOwnership::Conversation,
+                                conversation_id: Some(conversation.id),
+                                background: false,
+                            },
+                        )
+                        .await
+                    })
+                })
+                .await
+                .unwrap()
+                .value;
+            assert_eq!(harness.abort(task.id).await.unwrap(), AbortResult::Marked);
+            let terminal = harness.wait_task(task.id).await.unwrap();
+            assert!(matches!(
+                terminal.state,
+                TaskState::Terminal {
+                    outcome: TaskOutcome::Orphaned { .. }
+                }
+            ));
             harness.close().await.unwrap();
         };
         let ((), ()) = zip(command, driver).await;
