@@ -95,12 +95,12 @@ impl RecordSnapshot {
         )
     }
 
-    fn visible(&self, query: EntryQuery) -> Result<Vec<EntryRecord>, StorageError> {
+    fn visible_segments(&self, query: &EntryQuery) -> Result<Vec<(Id, u64, u64)>, StorageError> {
         let mut current = query.conversation_id;
         let mut upper = query.max_entry_id.map_or(MAX_NUMBER, Id::get);
         let lower = query.min_entry_id.map_or(1, Id::get);
         let mut visited = BTreeSet::new();
-        let mut records = Vec::new();
+        let mut segments = Vec::new();
         loop {
             if !visited.insert(current) {
                 return Err(StorageError::Other("Cyclic conversation ancestry".into()));
@@ -109,17 +109,10 @@ impl RecordSnapshot {
                 .conversations
                 .get(&current)
                 .ok_or_else(|| StorageError::Other(format!("Unknown conversation: {current}")))?;
-            records.extend(
-                self.entries
-                    .values()
-                    .rev()
-                    .filter(|r| {
-                        r.entry.conversation_id == current
-                            && r.entry.id.get() >= lower
-                            && r.entry.id.get() <= upper
-                    })
-                    .map(|r| r.entry.clone()),
-            );
+            if lower > upper {
+                break;
+            }
+            segments.push((current, lower, upper));
             match &conversation.parent {
                 Some(parent) => {
                     upper = upper.min(parent.at.get());
@@ -131,7 +124,7 @@ impl RecordSnapshot {
                 None => break,
             }
         }
-        Ok(records)
+        Ok(segments)
     }
 
     pub fn scan_entries(
@@ -140,19 +133,72 @@ impl RecordSnapshot {
         limit: usize,
         cursor: Option<Cursor>,
     ) -> Result<Page<EntryRecord>, StorageError> {
-        // A cursor at ID 1 has no predecessor in the supported ID domain.
-        if let Some(cursor) = cursor {
-            if cursor.after.get() == 1 {
-                self.visible(query)?; // Preserve unknown-conversation errors.
-                return page(std::iter::empty(), limit, |r: &EntryRecord| r.id);
-            }
+        let exhausted = cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.after.get() == 1);
+        if let Some(cursor) = cursor.filter(|_| !exhausted) {
             let upper = query
                 .max_entry_id
                 .map_or(MAX_NUMBER, Id::get)
                 .min(cursor.after.get() - 1);
             query.max_entry_id = Some(Id::new(upper)?);
         }
-        page(self.visible(query)?.into_iter(), limit, |r| r.id)
+        let segments = self.visible_segments(&query)?;
+        if limit == 0 {
+            return Err(StorageError::Other("Scan limit must be positive".into()));
+        }
+        if exhausted {
+            return Ok(Page {
+                items: Vec::new(),
+                next: None,
+            });
+        }
+        let mut items = Vec::with_capacity(limit.min(segments.len().saturating_mul(8)));
+        'segments: for (conversation, lower, upper) in segments {
+            for (_, stored) in self
+                .entries
+                .range(id_bound(lower)?..=id_bound(upper)?)
+                .rev()
+            {
+                if stored.entry.conversation_id == conversation {
+                    if items.len() == limit {
+                        break 'segments;
+                    }
+                    items.push(stored.entry.clone());
+                }
+            }
+        }
+        let next = if items.len() == limit
+            && self.has_visible_after(&query, items.last().expect("nonempty full page").id)?
+        {
+            items.last().map(|entry| Cursor { after: entry.id })
+        } else {
+            None
+        };
+        Ok(Page { items, next })
+    }
+
+    fn has_visible_after(&self, query: &EntryQuery, after: Id) -> Result<bool, StorageError> {
+        if after.get() == 1 {
+            return Ok(false);
+        }
+        let mut remainder = query.clone();
+        let upper = remainder
+            .max_entry_id
+            .map_or(MAX_NUMBER, Id::get)
+            .min(after.get() - 1);
+        remainder.max_entry_id = Some(Id::new(upper)?);
+        for (conversation, lower, upper) in self.visible_segments(&remainder)? {
+            if self
+                .entries
+                .range(id_bound(lower)?..=id_bound(upper)?)
+                .rev()
+                .any(|(_, stored)| stored.entry.conversation_id == conversation)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn visible_entry(
@@ -165,11 +211,16 @@ impl RecordSnapshot {
             min_entry_id: Some(id),
             max_entry_id: Some(id),
         };
-        Ok(self
-            .visible(query)?
-            .first()
-            .and_then(|r| self.entries.get(&r.id))
-            .cloned())
+        let visible = self.visible_segments(&query)?.into_iter().any(
+            |(segment_conversation, lower, upper)| {
+                (lower..=upper).contains(&id.get())
+                    && self
+                        .entries
+                        .get(&id)
+                        .is_some_and(|stored| stored.entry.conversation_id == segment_conversation)
+            },
+        );
+        Ok(visible.then(|| self.entries.get(&id).expect("checked entry").clone()))
     }
 
     pub fn find_latest_head_marker(
@@ -182,8 +233,23 @@ impl RecordSnapshot {
             min_entry_id: None,
             max_entry_id: at,
         };
-        Ok(self.visible(query)?.into_iter().find(|r| r.head.is_some()))
+        for (segment_conversation, lower, upper) in self.visible_segments(&query)? {
+            if let Some(entry) = self
+                .entries
+                .range(id_bound(lower)?..=id_bound(upper)?)
+                .rev()
+                .map(|(_, stored)| &stored.entry)
+                .find(|entry| entry.conversation_id == segment_conversation && entry.head.is_some())
+            {
+                return Ok(Some(entry.clone()));
+            }
+        }
+        Ok(None)
     }
+}
+
+fn id_bound(value: u64) -> Result<Id, StorageError> {
+    Id::new(value)
 }
 
 fn page<T>(
