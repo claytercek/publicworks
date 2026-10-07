@@ -143,6 +143,8 @@ impl OpenAiResponses {
         })
     }
 
+    // Preserve the public ModelError shape used by the provider trait.
+    #[allow(clippy::result_large_err)]
     async fn send(
         &self,
         request: ModelRequest,
