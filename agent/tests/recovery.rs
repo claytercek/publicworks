@@ -154,10 +154,45 @@ async fn create_conversation(session: &Session) -> Id {
         .value
         .id
 }
-async fn admit(session: &Session, agent: Agent, conversation: Id, text: &str) -> TurnHandle {
+#[derive(Clone)]
+struct TestTurn {
+    task_id: Id,
+    user_entry_id: Id,
+}
+async fn admit(session: &Session, agent: Agent, conversation: Id, text: &str) -> TestTurn {
     let text = text.to_owned();
+    let id = session
+        .commit(move |tx| {
+            agent.admit_input(
+                tx,
+                conversation,
+                text,
+                config(),
+                publicworks_agent::SubmitOptions::default(),
+            )
+        })
+        .await
+        .unwrap()
+        .value;
     session
-        .commit(move |tx| agent.admit_turn(tx, conversation, text, config()))
+        .commit(move |tx| {
+            Box::pin(async move {
+                let run = tx
+                    .conversation_state(conversation)
+                    .await?
+                    .unwrap()
+                    .run
+                    .unwrap();
+                let record = tx.submission(id).await?.unwrap();
+                let SubmissionState::InputPlaced { entry } = record.state else {
+                    panic!("not placed")
+                };
+                Ok(TestTurn {
+                    task_id: run.task_id,
+                    user_entry_id: entry,
+                })
+            })
+        })
         .await
         .unwrap()
         .value

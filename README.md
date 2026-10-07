@@ -108,8 +108,8 @@ first-writer-wins settlement, and atomic queued withdrawal. Dedicated conversati
 state stores the run marker, ordered inbox, and opaque agent configuration. State
 updates and submission changes compose privately in either staging order; final
 assembly validates their references before persistence. Request-ID lookup is
-conversation-scoped and can return an existing receipt without writing. This is
-not yet agent admission; see the
+conversation-scoped and can return an existing receipt without writing. Agent
+admission builds on these operations; see the
 implemented Tx reference.
 
 `close()` immediately seals admission, drains admitted transactions, and calls
@@ -193,10 +193,22 @@ enables scheduler progress. `harness.withdraw_submission(id, conversation_filter
 also supports missing IDs and optional conversation filtering. Conversation
 handles provide scoped `submission(id)` and `withdraw_submission(id)` methods.
 
-These are phase 4 slice 3 lifecycle primitives. Create/place/settle records through
-`harness.commit` and Tx methods; agent admission, automatic request deduplication,
-busy modes, and inbox boundary selection remain deferred. See the
-Harness submission reference.
+`agent.submit(&harness, conversation, text, config, options)` admits a durable
+input and enables progress. Matching request IDs return the original receipt
+before validation or busy policy. Busy inputs support reject, steer, and follow-up
+(the default). `agent.write(&harness, conversation, draft, options)` admits a
+passive write without enabling progress; busy writes queue. Dropping an admission
+observer does not cancel its transaction.
+
+`agent.configure_queues` persists independent one/all modes for steers and
+follow-ups. Post-tools places writes and steers; final places writes and follow-ups,
+settles current inputs, and creates a successor atomically. Explicit run abort and
+model failure preserve queued later work. Task-owned conversations are supported.
+
+Phase 4 is still incremental: runtime-only faults, orphans, and cascades can leave
+placed receipts and live markers stranded. Conversation-abort bulk withdrawal is
+also deferred. See the agent submission reference
+for the API and exact cleanup gap.
 
 ## Create and execute one task tree explicitly
 
@@ -263,10 +275,11 @@ See the execution contract for details.
 ## Run a durable agent turn
 
 Install a local `Model` implementation and `Tool` callbacks with `Agent::new` from
-`publicworks-agent`, register `agent.definitions()`, and use `agent.admit_turn`
-inside a Session transaction. Admission atomically appends user text and creates
-the foreground root, rejecting a busy conversation without writes. Explicitly
-run that root while polling both drivers.
+`publicworks-agent`, open a Harness with `agent.definitions()`, and call
+`agent.submit` while polling the Harness driver. Idle admission atomically creates
+the user entry, placed submission, generation task, and live-run marker. Busy
+inputs follow the requested reject/steer/follow-up policy. Await the returned
+submission's `wait()` to observe its durable settlement.
 
 ```sh
 cargo run -p publicworks-agent --example agent_turn

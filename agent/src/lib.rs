@@ -4,11 +4,13 @@ use publicworks_runtime::{SessionError, TaskRuntime};
 use serde_json::Value;
 use std::{future::Future, pin::Pin, rc::Rc};
 
+mod admission;
+pub use admission::{BusyMode, ExpectedHead, QueueConfig, QueueMode, SubmitOptions, WriteOptions};
 mod context;
 mod engine;
 mod wire;
 pub use context::{ContextProjection, project_context};
-pub use engine::{Agent, TOOL_KIND, TURN_KIND, TurnHandle};
+pub use engine::{Agent, TOOL_KIND, TURN_KIND};
 pub use wire::{decode_message, encode_message};
 
 #[derive(Clone, Debug, PartialEq)]

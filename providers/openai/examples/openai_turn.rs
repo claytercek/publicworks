@@ -4,12 +4,11 @@
 //! such as the default `gpt-4.1-mini` until reasoning items can be durably replayed.
 use futures_lite::future::zip;
 use publicworks_agent::{
-    Agent, ModelMessage, Tool, ToolDeclaration, ToolResult, TurnConfig, decode_message,
+    Agent, ModelMessage, SubmitOptions, Tool, ToolDeclaration, ToolResult, TurnConfig,
+    decode_message,
 };
 use publicworks_provider_openai::OpenAiResponses;
-use publicworks_runtime::{
-    EntryQuery, MemoryStorage, RunResult, Session, TaskOutcome, TaskRegistry, TaskRunner, TaskState,
-};
+use publicworks_runtime::{Harness, MemoryStorage, SubmissionState, TaskRegistry};
 use serde_json::{Value, json};
 use std::{error::Error, io};
 
@@ -100,94 +99,61 @@ async fn run(api_key: String, model: String, prompt: String) -> Result<(), Box<d
     // durable turn configuration or task input.
     let provider = OpenAiResponses::new(api_key)?;
     let agent = Agent::new(provider, vec![calculator()])?;
-    let (session, session_driver) = Session::new(MemoryStorage::new());
-    let (runner, task_driver) =
-        TaskRunner::attach(&session, TaskRegistry::new(agent.definitions())?)?;
-
+    let (opening, driver) = Harness::open(
+        MemoryStorage::new(),
+        TaskRegistry::new(agent.definitions())?,
+    );
     let work = async {
-        let result = execute_turn(&session, &runner, agent, model, prompt).await;
-
-        // Drive both explicit shutdown paths even when the live request fails.
-        let runner_close = runner.close().await;
-        let session_close = session.close().await;
-        runner_close?;
-        session_close?;
+        let harness = opening.await?;
+        let result = execute_turn(&harness, agent, model, prompt).await;
+        harness.close().await?;
         result
     };
-
-    let (result, _) = zip(work, zip(session_driver, task_driver)).await;
+    let (result, ()) = zip(work, driver).await;
     println!("{}", result?);
     Ok(())
 }
 
 async fn execute_turn(
-    session: &Session,
-    runner: &TaskRunner,
+    harness: &Harness,
     agent: Agent,
     model: String,
     prompt: String,
 ) -> Result<String, Box<dyn Error>> {
-    let conversation = session
+    let conversation = harness
         .commit(|tx| Box::pin(async move { tx.create_conversation().await }))
         .await?
         .value
         .id;
-    let handle = session
-        .commit(move |tx| {
-            agent.admit_turn(
-                tx,
-                conversation,
-                prompt,
-                TurnConfig {
-                    model,
-                    instructions: "Use the calculator for arithmetic and answer briefly.".into(),
-                    max_model_rounds: 3,
-                },
-            )
-        })
-        .await?
-        .value;
-    let terminal = match runner.run(handle.task_id).await? {
-        RunResult::Terminal(task) => task,
-        other => {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                format!("turn did not reach a terminal state: {other:?}"),
-            )
-            .into());
-        }
+    let submission = agent
+        .submit(
+            harness,
+            conversation,
+            prompt,
+            TurnConfig {
+                model,
+                instructions: "Use the calculator for arithmetic and answer briefly.".into(),
+                max_model_rounds: 3,
+            },
+            SubmitOptions::default(),
+        )
+        .await?;
+    let receipt = submission.wait().await?;
+    let SubmissionState::InputDone { answer, .. } = receipt.state else {
+        return Err(io::Error::other(format!("submission unanswered: {:?}", receipt.state)).into());
     };
-    if let TaskState::Terminal {
-        outcome: TaskOutcome::Failed { error, .. },
-    } = &terminal.state
-    {
-        return Err(io::Error::other(error.message.clone()).into());
-    }
-    if !matches!(
-        terminal.state,
-        TaskState::Terminal {
-            outcome: TaskOutcome::Completed { .. }
-        }
-    ) {
-        return Err(io::Error::other("turn did not complete").into());
-    }
-    let mut entries = session
+    let entry = harness
         .commit(move |tx| {
-            Box::pin(async move {
-                Ok(tx
-                    .scan_entries(EntryQuery::new(conversation), 128, None)
-                    .await?
-                    .items)
-            })
+            Box::pin(
+                async move { Ok(tx.visible_entry(conversation, answer).await?.unwrap().entry) },
+            )
         })
         .await?
         .value;
-    entries.reverse();
-    entries
-        .iter()
-        .rev()
-        .filter(|entry| entry.kind == "agent.assistant")
-        .find_map(|entry| entry.model.as_ref()?.first())
+    entry
+        .model
+        .as_ref()
+        .and_then(|messages| messages.first())
         .map(decode_message)
         .transpose()?
         .and_then(|message| match message {

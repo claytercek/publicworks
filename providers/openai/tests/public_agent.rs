@@ -82,12 +82,35 @@ async fn run_turn(
             .unwrap()
             .value
             .id;
-        let admitted = session
-            .commit(move |tx| agent.admit_turn(tx, conversation, prompt, config))
+        let _submission = session
+            .commit(move |tx| {
+                agent.admit_input(
+                    tx,
+                    conversation,
+                    prompt,
+                    config,
+                    publicworks_agent::SubmitOptions::default(),
+                )
+            })
             .await
             .unwrap()
             .value;
-        let task = match runner.run(admitted.task_id).await.unwrap() {
+        let task_id = session
+            .commit(move |tx| {
+                Box::pin(async move {
+                    Ok(tx
+                        .conversation_state(conversation)
+                        .await?
+                        .unwrap()
+                        .run
+                        .unwrap()
+                        .task_id)
+                })
+            })
+            .await
+            .unwrap()
+            .value;
+        let task = match runner.run(task_id).await.unwrap() {
             RunResult::Terminal(task) => task,
             result => panic!("expected terminal turn, got {result:?}"),
         };
@@ -597,12 +620,35 @@ async fn public_abort_releases_a_header_pending_request_and_session_remains_usab
             .unwrap()
             .value
             .id;
-        let handle = session
-            .commit(move |tx| agent.admit_turn(tx, conversation, "cancel", turn_config("gpt-test")))
+        let _submission = session
+            .commit(move |tx| {
+                agent.admit_input(
+                    tx,
+                    conversation,
+                    "cancel",
+                    turn_config("gpt-test"),
+                    publicworks_agent::SubmitOptions::default(),
+                )
+            })
             .await
             .unwrap()
             .value;
-        let run = runner.run(handle.task_id);
+        let task_id = session
+            .commit(move |tx| {
+                Box::pin(async move {
+                    Ok(tx
+                        .conversation_state(conversation)
+                        .await?
+                        .unwrap()
+                        .run
+                        .unwrap()
+                        .task_id)
+                })
+            })
+            .await
+            .unwrap()
+            .value;
+        let run = runner.run(task_id);
         entered.notified().await;
         let marker = session
             .commit(move |tx| {
@@ -619,7 +665,7 @@ async fn public_abort_releases_a_header_pending_request_and_session_remains_usab
             .value;
         assert_eq!(marker.kind, "unrelated");
         assert_eq!(
-            runner.abort(handle.task_id).await.unwrap(),
+            runner.abort(task_id).await.unwrap(),
             publicworks_runtime::AbortResult::Marked
         );
         let terminal = match run.await.unwrap() {
@@ -684,14 +730,35 @@ async fn public_runner_close_releases_a_body_pending_request_and_leaves_pinned_m
             .unwrap()
             .value
             .id;
-        let handle = session
+        let _submission = session
             .commit(move |tx| {
-                agent.admit_turn(tx, conversation, "close", turn_config("gpt-pinned"))
+                agent.admit_input(
+                    tx,
+                    conversation,
+                    "close",
+                    turn_config("gpt-pinned"),
+                    publicworks_agent::SubmitOptions::default(),
+                )
             })
             .await
             .unwrap()
             .value;
-        let run = runner.run(handle.task_id);
+        let task_id = session
+            .commit(move |tx| {
+                Box::pin(async move {
+                    Ok(tx
+                        .conversation_state(conversation)
+                        .await?
+                        .unwrap()
+                        .run
+                        .unwrap()
+                        .task_id)
+                })
+            })
+            .await
+            .unwrap()
+            .value;
+        let run = runner.run(task_id);
         entered.notified().await;
         runner.close().await.unwrap();
         assert_eq!(run.await.unwrap(), RunResult::Interrupted);
@@ -699,7 +766,7 @@ async fn public_runner_close_releases_a_body_pending_request_and_leaves_pinned_m
         let (task, marker) = session
             .commit(move |tx| {
                 Box::pin(async move {
-                    let task = tx.task(handle.task_id).await?.unwrap();
+                    let task = tx.task(task_id).await?.unwrap();
                     let marker = tx
                         .append_entry(
                             conversation,

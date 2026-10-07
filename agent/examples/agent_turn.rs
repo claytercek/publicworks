@@ -90,95 +90,62 @@ fn calculator() -> Tool {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     block_on(async {
         let agent = Agent::new(CalculatorModel, vec![calculator()])?;
-        let (session, session_driver) = Session::new(MemoryStorage::new());
+        let (opening, driver) = Harness::open(
+            MemoryStorage::new(),
+            TaskRegistry::new(agent.definitions())?,
+        );
         let (result, ()) = zip(
             async {
+                let harness = opening.await?;
                 let work = async {
-                    let registry = TaskRegistry::new(agent.definitions())?;
-                    let (runner, task_driver) = TaskRunner::attach(&session, registry)?;
-                    let (result, ()) = zip(
-                        async {
-                            let result = async {
-                                let conversation = session
-                                    .commit(|tx| {
-                                        Box::pin(async move { tx.create_conversation().await })
-                                    })
-                                    .await
-                                    .map_err(RunError::Session)?
-                                    .value;
-                                let admitted_agent = agent.clone();
-                                let handle = session
-                                    .commit(move |tx| {
-                                        admitted_agent.admit_turn(
-                                            tx,
-                                            conversation.id,
-                                            "What is 20 + 22?",
-                                            TurnConfig {
-                                                model: "local-calculator-demo".into(),
-                                                instructions:
-                                                    "Use the calculator, then answer briefly."
-                                                        .into(),
-                                                max_model_rounds: 3,
-                                            },
-                                        )
-                                    })
-                                    .await
-                                    .map_err(RunError::Session)?
-                                    .value;
-                                let outcome = runner.run(handle.task_id).await?;
-                                let mut transcript = session
-                                    .commit(move |tx| {
-                                        Box::pin(async move {
-                                            Ok(tx
-                                                .scan_entries(
-                                                    EntryQuery::new(conversation.id),
-                                                    32,
-                                                    None,
-                                                )
-                                                .await?
-                                                .items)
-                                        })
-                                    })
-                                    .await
-                                    .map_err(RunError::Session)?
-                                    .value;
-                                transcript.reverse();
-                                for entry in transcript {
-                                    if let Some(messages) = entry.model {
-                                        for message in messages {
-                                            println!(
-                                                "{}: {:?}",
-                                                entry.kind,
-                                                decode_message(&message)?
-                                            );
-                                        }
-                                    }
-                                }
-                                Ok::<_, RunError>(outcome)
-                            }
-                            .await;
-                            // Always close the runner while its driver is still polled.
-                            let closed = runner.close().await;
-                            let result = result?;
-                            closed?;
-                            Ok::<_, RunError>(result)
-                        },
-                        task_driver,
-                    )
-                    .await;
-                    result
+                    let conversation = harness
+                        .commit(|tx| Box::pin(async move { tx.create_conversation().await }))
+                        .await?
+                        .value
+                        .id;
+                    let submission = agent
+                        .submit(
+                            &harness,
+                            conversation,
+                            "What is 20 + 22?",
+                            TurnConfig {
+                                model: "local-calculator-demo".into(),
+                                instructions: "Use the calculator, then answer briefly.".into(),
+                                max_model_rounds: 3,
+                            },
+                            SubmitOptions::default(),
+                        )
+                        .await?;
+                    let receipt = submission.wait().await?;
+                    let mut transcript = harness
+                        .commit(move |tx| {
+                            Box::pin(async move {
+                                Ok(tx
+                                    .scan_entries(EntryQuery::new(conversation), 32, None)
+                                    .await?
+                                    .items)
+                            })
+                        })
+                        .await?
+                        .value;
+                    transcript.reverse();
+                    for entry in transcript {
+                        for message in entry.model.into_iter().flatten() {
+                            println!("{}: {:?}", entry.kind, decode_message(&message)?);
+                        }
+                    }
+                    println!("Submission: {receipt:#?}");
+                    Ok::<_, Box<dyn std::error::Error>>(())
                 }
                 .await;
-                // Session cleanup also runs when setup or execution returns an error.
-                let closed = session.close().await;
-                let result = work?;
-                closed.map_err(RunError::Session)?;
-                Ok::<_, RunError>(result)
+                let closed = harness.close().await;
+                work?;
+                closed?;
+                Ok::<_, Box<dyn std::error::Error>>(())
             },
-            session_driver,
+            driver,
         )
         .await;
-        println!("Turn outcome: {:#?}", result?);
-        Ok::<(), Box<dyn std::error::Error>>(())
+        result
     })
 }

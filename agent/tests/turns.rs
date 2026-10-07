@@ -119,16 +119,51 @@ async fn conversation(session: &Session) -> Id {
         .value
         .id
 }
+#[derive(Clone)]
+struct TestTurn {
+    task_id: Id,
+    user_entry_id: Id,
+}
 async fn admit(
     session: &Session,
     agent: Agent,
     conversation: Id,
     text: &str,
     cfg: TurnConfig,
-) -> TurnHandle {
+) -> TestTurn {
     let text = text.to_owned();
+    let id = session
+        .commit(move |tx| {
+            agent.admit_input(
+                tx,
+                conversation,
+                text,
+                cfg,
+                publicworks_agent::SubmitOptions::default(),
+            )
+        })
+        .await
+        .unwrap()
+        .value;
     session
-        .commit(move |tx| agent.admit_turn(tx, conversation, text, cfg))
+        .commit(move |tx| {
+            Box::pin(async move {
+                let run = tx
+                    .conversation_state(conversation)
+                    .await?
+                    .unwrap()
+                    .run
+                    .unwrap();
+                let record = tx.submission(id).await?.unwrap();
+                let SubmissionState::InputPlaced { entry } = record.state else {
+                    panic!("not placed")
+                };
+                Ok(TestTurn {
+                    task_id: run.task_id,
+                    user_entry_id: entry,
+                })
+            })
+        })
         .await
         .unwrap()
         .value
@@ -403,7 +438,15 @@ fn admission_rejects_invalid_config_and_busy_turn_without_partial_writes() {
                 let conversation = conversation(&session).await;
                 let invalid_agent = agent.clone();
                 let invalid = session
-                    .commit(move |tx| invalid_agent.admit_turn(tx, conversation, "bad", config(0)))
+                    .commit(move |tx| {
+                        invalid_agent.admit_input(
+                            tx,
+                            conversation,
+                            "bad",
+                            config(0),
+                            publicworks_agent::SubmitOptions::default(),
+                        )
+                    })
                     .await;
                 assert!(matches!(invalid, Err(SessionError::Invalid(_))));
                 assert!(entries(&session, conversation).await.is_empty());
@@ -460,7 +503,16 @@ fn admission_rejects_invalid_config_and_busy_turn_without_partial_writes() {
                 let busy_agent = agent.clone();
                 let busy = session
                     .commit(move |tx| {
-                        busy_agent.admit_turn(tx, conversation, "must not append", config(2))
+                        busy_agent.admit_input(
+                            tx,
+                            conversation,
+                            "must not append",
+                            config(2),
+                            SubmitOptions {
+                                busy: BusyMode::Reject,
+                                ..Default::default()
+                            },
+                        )
                     })
                     .await;
                 assert!(matches!(busy, Err(SessionError::Invalid(_))));

@@ -1,3 +1,4 @@
+use crate::admission::{Boundary, Position, unanswered};
 use crate::{wire::*, *};
 use futures_util::future::{Either, select};
 use publicworks_runtime::*;
@@ -6,11 +7,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const TURN_KIND: &str = "agent.turn";
 pub const TOOL_KIND: &str = "agent.tool";
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TurnHandle {
-    pub task_id: Id,
-    pub user_entry_id: Id,
-}
 #[derive(Clone)]
 pub struct Agent(Rc<Installation>);
 struct Installation {
@@ -38,76 +34,14 @@ impl Agent {
     pub fn definitions(&self) -> [TaskDefinition; 2] {
         [self.turn_definition(), self.tool_definition()]
     }
-    pub fn admit_turn<'a>(
-        &self,
-        tx: &'a Tx,
-        conversation: Id,
-        text: impl Into<String>,
-        config: TurnConfig,
-    ) -> TxFuture<'a, TurnHandle> {
-        let agent = self.clone();
-        let text = text.into();
-        Box::pin(async move {
-            validate_config(&config)?;
-            let conversation_record = tx
-                .conversation(conversation)
-                .await?
-                .ok_or_else(|| invalid("Unknown conversation"))?;
-            if conversation_record.owner.is_some() {
-                return Err(invalid("Owned conversations are unsupported"));
-            }
-            let mut cursor = None;
-            let mut busy = false;
-            loop {
-                let page = tx
-                    .scan_tasks(
-                        TaskQuery {
-                            conversation_id: Some(conversation),
-                            ..TaskQuery::default()
-                        },
-                        128,
-                        cursor,
-                    )
-                    .await?;
-                busy |= page
-                    .items
-                    .iter()
-                    .any(|task| task.kind == TURN_KIND && task.status() != TaskStatus::Terminal);
-                cursor = page.next;
-                if cursor.is_none() {
-                    break;
-                }
-            }
-            if busy {
-                return Err(invalid("Conversation already has a nonterminal agent turn"));
-            }
-            let input = json!({"config":{"model":config.model,"instructions":config.instructions,"maxModelRounds":config.max_model_rounds},
-                "tools":agent.0.tools.values().map(|tool|declaration(&tool.declaration)).collect::<Vec<_>>()});
-            decode_input(&input)?;
-            let user = tx
-                .append_entry(
-                    conversation,
-                    message_draft("agent.user", ModelMessage::User { text }, None),
-                )
-                .await?;
-            let task = tx
-                .create_task(
-                    agent.turn_definition(),
-                    input,
-                    TaskOptions {
-                        ownership: TaskOwnership::Conversation,
-                        conversation_id: Some(conversation),
-                        background: false,
-                    },
-                )
-                .await?;
-            Ok(TurnHandle {
-                task_id: task.id,
-                user_entry_id: user.id,
-            })
-        })
+    pub(crate) fn turn_input(&self, config: TurnConfig) -> Result<Value, SessionError> {
+        validate_config(&config)?;
+        let input = json!({"config":{"model":config.model,"instructions":config.instructions,"maxModelRounds":config.max_model_rounds},
+            "tools":self.0.tools.values().map(|tool|declaration(&tool.declaration)).collect::<Vec<_>>()});
+        decode_input(&input)?;
+        Ok(input)
     }
-    fn turn_definition(&self) -> TaskDefinition {
+    pub(crate) fn turn_definition(&self) -> TaskDefinition {
         let mut phases = BTreeMap::new();
         for phase in ["prepare", "request", "tools"] {
             let agent = self.clone();
@@ -273,9 +207,13 @@ impl Agent {
                             unreachable!()
                         };
                         if tool_calls.is_empty() {
+                            let agent = self.clone();
                             runtime
                                 .commit(move |tx, task| {
                                     Box::pin(async move {
+                                        let mut boundary =
+                                            Boundary::read(tx, task.conversation_id).await?;
+                                        boundary.require_run(task.id)?;
                                         let entry = tx
                                             .append_entry(
                                                 task.conversation_id,
@@ -289,6 +227,16 @@ impl Agent {
                                                 ),
                                             )
                                             .await?;
+                                        boundary
+                                            .settle(
+                                                tx,
+                                                SubmissionSettlement::Done { answer: entry.id },
+                                            )
+                                            .await?;
+                                        agent
+                                            .place_boundary(tx, &mut boundary, Position::Final)
+                                            .await?;
+                                        boundary.save(tx).await?;
                                         Ok(Some(TaskUpdate::Complete(
                                             json!({"answerEntryId":entry.id.get()}),
                                         )))
@@ -356,6 +304,8 @@ impl Agent {
                                 return Err(invalid("Tool child not settled or wrong owner"));
                             }
                             let recorded = result_ids(tx, task.conversation_id, assistant).await?;
+                            let mut boundary = Boundary::read(tx, task.conversation_id).await?;
+                            boundary.require_run(task.id)?;
                             if !recorded.contains(&call.id) {
                                 append_result(
                                     tx,
@@ -395,6 +345,13 @@ impl Agent {
                                     policy: JoinPolicy::AllSettled,
                                 }))
                             } else {
+                                let reset = agent
+                                    .place_boundary(tx, &mut boundary, Position::PostTools)
+                                    .await?;
+                                boundary.save(tx).await?;
+                                if reset {
+                                    return Ok(Some(TaskUpdate::Complete(json!({"reset":true}))));
+                                }
                                 Ok(Some(TaskUpdate::Checkpoint(
                                     json!({"phase":"prepare","round":round}),
                                 )))
@@ -429,6 +386,8 @@ impl Agent {
         runtime
             .commit(move |tx, task| {
                 Box::pin(async move {
+                    let mut boundary = Boundary::read(tx, task.conversation_id).await?;
+                    boundary.require_run(task.id)?;
                     let mut data = json!({"message": error.message});
                     // Usage is independent evidence: an invalid partial message must
                     // not discard it. Explicit null is present, not a fallback request.
@@ -476,6 +435,8 @@ impl Agent {
                     let mut draft = EntryDraft::new("agent.diagnostic");
                     draft.data = Some(data);
                     tx.append_entry(task.conversation_id, draft).await?;
+                    boundary.settle(tx, unanswered("model_error")).await?;
+                    boundary.save(tx).await?;
                     Ok(Some(TaskUpdate::Fail(
                         TaskOutcomeError {
                             message: error.message,
@@ -644,6 +605,8 @@ impl Agent {
     ) -> Result<(), SessionError> {
         let cp = checkpoint(&record)?.clone();
         runtime.commit(move |tx,task|Box::pin(async move {
+            let mut boundary = Boundary::read(tx, task.conversation_id).await?;
+            boundary.require_run(task.id)?;
             if cp.get("phase").and_then(Value::as_str)==Some("tools") {
                 let assistant=id(&cp,"assistantEntryId")?; let calls=decode_calls(&cp)?;
                 let recorded=result_ids(tx,task.conversation_id,assistant).await?;
@@ -651,6 +614,8 @@ impl Agent {
                     if !recorded.contains(&call.id) {append_result(tx,task.conversation_id,assistant,&call.id,ToolResult{content:"Turn aborted; tool result unavailable. Started operations may have run.".into(),is_error:true,usage:None},Some("aborted")).await?;}
                 }
             }
+            boundary.settle(tx, unanswered("aborted")).await?;
+            boundary.save(tx).await?;
             Ok(Some(TaskUpdate::Abort{reason:Some("Agent turn aborted".into()),result:None}))
         })).await?;
         Ok(())
@@ -665,7 +630,9 @@ fn validate_config(config: &TurnConfig) -> Result<(), SessionError> {
     }
     Ok(())
 }
-fn decode_input(input: &Value) -> Result<(TurnConfig, Vec<ToolDeclaration>), SessionError> {
+pub(crate) fn decode_input(
+    input: &Value,
+) -> Result<(TurnConfig, Vec<ToolDeclaration>), SessionError> {
     let cfg = input
         .get("config")
         .ok_or_else(|| invalid("Missing config"))?;
@@ -729,7 +696,7 @@ fn response_data(status: &str, usage: Option<Value>) -> Value {
     }
     data
 }
-fn message_draft(kind: &str, message: ModelMessage, data: Option<Value>) -> EntryDraft {
+pub(crate) fn message_draft(kind: &str, message: ModelMessage, data: Option<Value>) -> EntryDraft {
     let mut draft = EntryDraft::new(kind);
     draft.model = Some(vec![encode_message(&message)]);
     draft.data = data;
@@ -900,8 +867,12 @@ async fn finish_tool(
 async fn fail(runtime: &TaskRuntime, message: &str) -> Result<(), SessionError> {
     let message = message.to_owned();
     runtime
-        .commit(move |_, _| {
+        .commit(move |tx, task| {
             Box::pin(async move {
+                let mut boundary = Boundary::read(tx, task.conversation_id).await?;
+                boundary.require_run(task.id)?;
+                boundary.settle(tx, unanswered("model_error")).await?;
+                boundary.save(tx).await?;
                 Ok(Some(TaskUpdate::Fail(
                     TaskOutcomeError {
                         message,
@@ -950,7 +921,7 @@ mod tests {
                 let installation = agent();
                 let result = session
                     .commit(move |tx| {
-                        installation.admit_turn(
+                        installation.admit_input(
                             tx,
                             conversation,
                             "hello",
@@ -959,6 +930,7 @@ mod tests {
                                 instructions: "".into(),
                                 max_model_rounds: 0,
                             },
+                            crate::SubmitOptions::default(),
                         )
                     })
                     .await;

@@ -120,9 +120,9 @@ fn model_failure_preserves_valid_usage_independently_of_partial_payloads() {
                     .unwrap()
                     .value
                     .id;
-                let turn = session
+                let _submission = session
                     .commit(move |tx| {
-                        agent.admit_turn(
+                        agent.admit_input(
                             tx,
                             conversation,
                             "hello",
@@ -131,12 +131,28 @@ fn model_failure_preserves_valid_usage_independently_of_partial_payloads() {
                                 instructions: "".into(),
                                 max_model_rounds: 1,
                             },
+                            crate::SubmitOptions::default(),
                         )
                     })
                     .await
                     .unwrap()
                     .value;
-                let RunResult::Terminal(task) = runner.run(turn.task_id).await.unwrap() else {
+                let task_id = session
+                    .commit(move |tx| {
+                        Box::pin(async move {
+                            Ok(tx
+                                .conversation_state(conversation)
+                                .await?
+                                .unwrap()
+                                .run
+                                .unwrap()
+                                .task_id)
+                        })
+                    })
+                    .await
+                    .unwrap()
+                    .value;
+                let RunResult::Terminal(task) = runner.run(task_id).await.unwrap() else {
                     panic!("turn did not settle");
                 };
                 assert!(matches!(
