@@ -90,6 +90,7 @@ pub(super) struct CommittedChanges {
     pub(super) seq: Seq,
     pub(super) tasks: Vec<TaskRecord>,
     pub(super) conversations: Vec<ConversationRecord>,
+    pub(super) submissions: Vec<SubmissionRecord>,
 }
 type Publication = Rc<dyn Fn(CommittedChanges)>;
 
@@ -373,18 +374,29 @@ impl Session {
                                 _ => None,
                             })
                             .collect::<Vec<_>>();
+                        let submissions = writes
+                            .iter()
+                            .filter_map(|write| match write {
+                                StorageWrite::Submission(record) => Some(record.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
                         let settled = AssertUnwindSafe(async { storage.commit(writes).await })
                             .catch_unwind()
                             .await;
                         match settled {
                             Ok(Ok(seq)) => {
-                                if !tasks.is_empty() || !conversations.is_empty() {
+                                if !tasks.is_empty()
+                                    || !conversations.is_empty()
+                                    || !submissions.is_empty()
+                                {
                                     let observer = owner.borrow().publication.clone();
                                     if let Some(observer) = observer {
                                         observer(CommittedChanges {
                                             seq,
                                             tasks,
                                             conversations,
+                                            submissions,
                                         });
                                     }
                                 }

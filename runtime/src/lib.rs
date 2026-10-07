@@ -14,9 +14,9 @@ pub use session::{
     ConversationWaiter, EntryDraft, Harness, HarnessAbortWaiter, HarnessCloseWaiter, HarnessDriver,
     HarnessError, HarnessInspection, HarnessOpenWaiter, Head, IdleWaiter, InspectionWaiter, Owner,
     PhaseFuture, PhaseHandler, RunError, RunResult, RunWaiter, RunnerCloseWaiter, Session,
-    SessionDriver, SessionError, TaskDefinition, TaskDriver, TaskInspection, TaskOptions,
-    TaskOwnership, TaskRegistry, TaskRunner, TaskRuntime, TaskUpdate, TaskWaiter, Tx, TxFuture,
-    WithdrawalResult,
+    SessionDriver, SessionError, Submission, SubmissionWaiter, TaskDefinition, TaskDriver,
+    TaskInspection, TaskOptions, TaskOwnership, TaskRegistry, TaskRunner, TaskRuntime, TaskUpdate,
+    TaskWaiter, Tx, TxFuture, WithdrawalResult,
 };
 
 mod task;

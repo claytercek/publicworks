@@ -1,7 +1,9 @@
 //! Harness-wide task scheduling above a private Session.
 use super::*;
+mod submissions;
 use futures_util::{StreamExt, future::Shared, stream::FuturesUnordered};
 use std::{collections::BTreeSet, task::Waker};
+pub use submissions::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HarnessError {
@@ -197,6 +199,8 @@ struct HarnessState {
     next_waiter: u64,
     task_waiters: BTreeMap<Id, BTreeMap<u64, oneshot::Sender<Result<TaskRecord, HarnessError>>>>,
     idle_waiters: BTreeMap<Option<Id>, IdleSenders>,
+    submission_waiters:
+        BTreeMap<Id, BTreeMap<u64, oneshot::Sender<Result<SubmissionRecord, HarnessError>>>>,
 }
 struct HarnessControl(RefCell<HarnessState>);
 impl HarnessControl {
@@ -208,7 +212,7 @@ impl HarnessControl {
     }
     fn seal(&self, runner: &RunnerControl) {
         let session_error = runner.0.borrow().session_error.clone();
-        let (task_waiters, idle_waiters, waker) = {
+        let (task_waiters, idle_waiters, submission_waiters, waker) = {
             let mut state = self.0.borrow_mut();
             if let Some(error) = session_error
                 && state.failure.is_none()
@@ -223,6 +227,7 @@ impl HarnessControl {
             (
                 std::mem::take(&mut state.task_waiters),
                 std::mem::take(&mut state.idle_waiters),
+                std::mem::take(&mut state.submission_waiters),
                 state.waker.take(),
             )
         };
@@ -231,6 +236,12 @@ impl HarnessControl {
             let _ = sender.send(Err(HarnessError::Closed));
         }
         for sender in idle_waiters.into_values().flat_map(BTreeMap::into_values) {
+            let _ = sender.send(Err(HarnessError::Closed));
+        }
+        for sender in submission_waiters
+            .into_values()
+            .flat_map(BTreeMap::into_values)
+        {
             let _ = sender.send(Err(HarnessError::Closed));
         }
         if let Some(waker) = waker {
@@ -316,19 +327,26 @@ impl Drop for HarnessDriver {
         for invocation in actives {
             invocation.end();
         }
-        let (task_waiters, idle_waiters) = {
+        let (task_waiters, idle_waiters, submission_waiters) = {
             let mut state = self.control.0.borrow_mut();
             state.stopped = !state.finished;
             state.closing = true;
             (
                 std::mem::take(&mut state.task_waiters),
                 std::mem::take(&mut state.idle_waiters),
+                std::mem::take(&mut state.submission_waiters),
             )
         };
         for sender in task_waiters.into_values().flat_map(BTreeMap::into_values) {
             let _ = sender.send(Err(HarnessError::DriverStopped));
         }
         for sender in idle_waiters.into_values().flat_map(BTreeMap::into_values) {
+            let _ = sender.send(Err(HarnessError::DriverStopped));
+        }
+        for sender in submission_waiters
+            .into_values()
+            .flat_map(BTreeMap::into_values)
+        {
             let _ = sender.send(Err(HarnessError::DriverStopped));
         }
     }
@@ -363,6 +381,7 @@ impl Harness {
             next_waiter: 1,
             task_waiters: BTreeMap::new(),
             idle_waiters: BTreeMap::new(),
+            submission_waiters: BTreeMap::new(),
         })));
 
         let weak_control = Rc::downgrade(&control);
@@ -373,6 +392,7 @@ impl Harness {
             };
             let runner = weak_runner.upgrade();
             let mut completed = Vec::new();
+            let mut settled_submissions = Vec::new();
             let mut signals = Vec::new();
             let waker = {
                 let mut state = control.0.borrow_mut();
@@ -395,11 +415,22 @@ impl Harness {
                         signals.push(invocation);
                     }
                 }
+                for record in changes.submissions {
+                    if submissions::is_terminal(&record)
+                        && let Some(waiters) = state.submission_waiters.remove(&record.id)
+                    {
+                        settled_submissions
+                            .extend(waiters.into_values().map(|sender| (sender, record.clone())));
+                    }
+                }
                 let _ = changes.conversations;
                 state.waker.take()
             };
             for (sender, task) in completed {
                 let _ = sender.send(Ok(task));
+            }
+            for (sender, record) in settled_submissions {
+                let _ = sender.send(Ok(record));
             }
             for invocation in signals {
                 invocation.signal();

@@ -109,7 +109,7 @@ state stores the run marker, ordered inbox, and opaque agent configuration. Stat
 updates and submission changes compose privately in either staging order; final
 assembly validates their references before persistence. Request-ID lookup is
 conversation-scoped and can return an existing receipt without writing. This is
-not yet agent admission or a Harness submission handle API; see the
+not yet agent admission; see the
 implemented Tx reference.
 
 `close()` immediately seals admission, drains admitted transactions, and calls
@@ -136,7 +136,8 @@ of the returned `Harness`. Opening scans the task graph, atomically normalizes
 interrupted `running` records to `pending`, and schedules code-free reconciliation.
 It never invokes a definition or handler.
 
-The scheduler remains paused until `harness.resume()`. Resume is idempotent and
+The scheduler remains paused until `harness.resume()` or a progress-enabling
+wait (`Submission::wait` or `wait_for_idle`). Resume is idempotent and
 permanently enables progress. Each drain reconciles committed records and changes
 **all** currently eligible tasks from `pending` to `running` in one Session
 transaction. Handler futures start only after that batch is acknowledged. They are
@@ -170,6 +171,32 @@ waits enable progress and observe committed liveness, not merely runnable handle
 Set `ConversationAbortOptions { background: true }` only when cancellation should
 cross background boundaries and wait for the reached snapshot. See the
 ownership lifecycle contract.
+
+## Observe and withdraw durable submissions
+
+`harness.submission(id).await?` reacquires an optional, cloneable `Submission`.
+`submission.id()` returns its identity; `status().await?` (or `read().await?`)
+returns a detached committed `SubmissionRecord`. Lookup and reads do not resume
+scheduling. The handle retains its Harness, not a cached receipt.
+
+`submission.wait()` enables progress and observes a terminal (`done` or
+`unanswered`) committed receipt. The state check and waiter registration run on
+one Session line, so settlement cannot fall between them. Multiple waiters are
+independent; dropping one, even before its first poll, cancels only observation.
+Only final assembled submission changes acknowledged by Storage resolve waits.
+Close rejects unresolved observers; dropping the driver reports `DriverStopped`.
+
+`submission.abort().await?` (or `withdraw()`) atomically settles a queued receipt
+as unanswered/aborted and removes its inbox item. It returns `Aborted`,
+`AlreadyPlaced`, `Settled`, or `NotFound`; it neither cancels a placed run nor
+enables scheduler progress. `harness.withdraw_submission(id, conversation_filter)`
+also supports missing IDs and optional conversation filtering. Conversation
+handles provide scoped `submission(id)` and `withdraw_submission(id)` methods.
+
+These are phase 4 slice 3 lifecycle primitives. Create/place/settle records through
+`harness.commit` and Tx methods; agent admission, automatic request deduplication,
+busy modes, and inbox boundary selection remain deferred. See the
+Harness submission reference.
 
 ## Create and execute one task tree explicitly
 
