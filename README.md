@@ -205,10 +205,23 @@ follow-ups. Post-tools places writes and steers; final places writes and follow-
 settles current inputs, and creates a successor atomically. Explicit run abort and
 model failure preserve queued later work. Task-owned conversations are supported.
 
-Phase 4 is still incremental: runtime-only faults, orphans, and cascades can leave
-placed receipts and live markers stranded. Conversation-abort bulk withdrawal is
-also deferred. See the agent submission reference
-for the API and exact cleanup gap.
+Phase 4 is complete. Runtime assembly settles any still-placed inputs and clears
+the matching run marker when the final task candidate becomes terminal, including
+faults, panics, no-progress/malformed checkpoints, and missing-definition aborts.
+Fallback is unanswered/`aborted` for an aborted outcome and `faulted` otherwise;
+a specific settlement already staged by the agent wins. Cleanup does not inspect
+task results or call agent code. Held outcomes retain placed inputs until terminal,
+and a successor marker is never cleared for the old task.
+
+Conversation abort bulk-withdraws queued inputs in its reached owned conversation
+scopes, including queued-only conversations. Task abort/failure cascades withdraw
+queued inputs in owned descendant conversations. Queued writes remain, ordinary
+direct run abort preserves its own later queue, and background boundaries are
+crossed only by an explicitly background-inclusive conversation abort. Reopening
+repairs terminal markers and reapplies withdrawal beneath terminal failed/aborted
+owners without invoking handlers. See the
+submission contract
+for settlement, scope, and persistence rules.
 
 ## Create and execute one task tree explicitly
 
@@ -373,14 +386,16 @@ cancellation contract.
 
 `Session::open_recovered(storage)` returns `(CommitWaiter<Session>, SessionDriver)`.
 Poll the driver concurrently with the opening waiter, then take the usable Session
-from the successful receipt's `value`. Its `seq` is present only when startup
-normalized running tasks to pending. All running pages are read before one atomic
+from the successful receipt's `value`. Its `seq` is present when startup normalizes
+running tasks or repairs terminal submission state. All running pages are read before one atomic
 replacement batch; checkpoints, input, version, owner, flags, and memos survive.
 Plain `Session::new` remains unchanged.
 
 Opening runs no task code. Unknown kinds/versions are preserved, and waiting,
-completing, and terminal states are not reconciled by this lower-level API. After
-opening, explicitly attach a runner and request each desired root run. Prefer
+completing, and terminal task states are not changed by this lower-level API.
+Stale terminal run markers and their placed inputs are repaired, and queued inputs
+under terminal failed/aborted owners are withdrawn atomically with normalization.
+After opening, explicitly attach a runner and request each desired root run. Prefer
 `Harness::open` when the host wants Harness-wide reconciliation, reservation, and
 automatic progress after one resume. Neither path performs definition or schema
 migration. Dropping the Session opening waiter still leaves normalization and

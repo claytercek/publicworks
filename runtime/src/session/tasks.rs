@@ -46,6 +46,7 @@ impl Session {
                             break;
                         }
                     }
+                    tx.reconcile_terminal_runs().await?;
                     // All reads precede writes: changing status cannot disturb pagination.
                     for mut record in records {
                         if let TaskState::Running { checkpoint } = record.state {

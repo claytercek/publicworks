@@ -190,6 +190,56 @@ impl Tree {
         Some(scope)
     }
 
+    /// Conversation nodes themselves matter: a reached scope may have only an
+    /// inbox and no live task. Fork ancestry is deliberately not traversed.
+    fn reaches(&self, start: Up, target: Up, cross_background: bool) -> Option<bool> {
+        let mut seen = BTreeSet::new();
+        let mut current = Some(start);
+        while let Some(node) = current {
+            if !seen.insert(node) {
+                return None;
+            }
+            if node == target {
+                return Some(true);
+            }
+            if let Up::Task(id) = node
+                && !cross_background
+                && self.tasks.get(&id)?.background
+            {
+                return Some(false);
+            }
+            current = self.next(node)?;
+        }
+        Some(false)
+    }
+
+    pub fn conversation_scopes(
+        &self,
+        conversation: Id,
+        cross_background: bool,
+    ) -> Option<BTreeSet<Id>> {
+        self.conversations.get(&conversation)?;
+        let mut reached = BTreeSet::new();
+        for id in self.conversations.keys() {
+            if self.reaches(
+                Up::Conversation(*id),
+                Up::Conversation(conversation),
+                cross_background,
+            )? {
+                reached.insert(*id);
+            }
+        }
+        Some(reached)
+    }
+
+    pub fn owned_conversations(&self, task: Id) -> BTreeSet<Id> {
+        self.conversations
+            .keys()
+            .copied()
+            .filter(|id| self.reaches(Up::Conversation(*id), Up::Task(task), false) == Some(true))
+            .collect()
+    }
+
     pub fn conversation_idle(&self, conversation: Option<Id>) -> bool {
         if conversation.is_some_and(|id| !self.conversations.contains_key(&id)) {
             return false;

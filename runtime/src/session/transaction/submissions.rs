@@ -331,6 +331,95 @@ impl Tx {
         })
     }
 
+    /// Runtime recovery: include stale terminal markers in final assembly even
+    /// when no task transition is needed. Never re-execute application code.
+    pub(crate) fn reconcile_terminal_runs(&self) -> TxFuture<'_, ()> {
+        Box::pin(async move {
+            let tree = self.tree().await?;
+            let mut records = Vec::new();
+            let mut conversations = BTreeSet::new();
+            for task in tree
+                .tasks
+                .values()
+                .filter(|task| task.status() == TaskStatus::Terminal)
+            {
+                if let Some(record) = self.conversation_state(task.conversation_id).await?
+                    && record
+                        .run
+                        .as_ref()
+                        .is_some_and(|run| run.task_id == task.id)
+                {
+                    records.push(record);
+                }
+                if task.abort_requested || execution::tree::Tree::failed(task) {
+                    conversations.extend(tree.owned_conversations(task.id));
+                }
+            }
+            // Recovery reads precede all writes. Re-stage only matching markers;
+            // final assembly applies the same fallback as an ordinary outcome.
+            for record in records {
+                self.set_conversation_state(
+                    record.conversation_id,
+                    ConversationStateDraft {
+                        run: record.run,
+                        inbox: record.inbox,
+                        agent_config: record.agent_config,
+                    },
+                )
+                .await?;
+            }
+            for conversation in conversations {
+                self.withdraw_queued_inputs(conversation).await?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Withdraw only queued inputs in a reached ownership scope. Writes are
+    /// passive and remain queued. Private candidates participate in the batch.
+    pub(crate) fn withdraw_queued_inputs(&self, conversation: Id) -> TxFuture<'_, ()> {
+        self.operation(true, move |storage, state| {
+            Box::pin(async move {
+                let candidates = state
+                    .borrow()
+                    .submissions
+                    .iter()
+                    .map(|(id, candidate)| (*id, candidate.record.clone()))
+                    .collect();
+                let changes =
+                    queued_input_withdrawals(storage, &candidates, conversation, Some(&state))
+                        .await?;
+                state.borrow().open()?;
+                let mut inbox = current_state(storage, &state, conversation).await?;
+                if let Some(inbox) = &mut inbox {
+                    let withdrawn = changes
+                        .iter()
+                        .map(|(_, record)| record.id)
+                        .collect::<BTreeSet<_>>();
+                    inbox
+                        .inbox
+                        .retain(|item| !withdrawn.contains(&item.submission_id));
+                }
+                if changes.is_empty() {
+                    return Ok(());
+                }
+                if let Some(inbox) = &inbox {
+                    inbox.validate_payloads()?;
+                }
+                for (previous, record) in changes {
+                    stage_submission(&state, &previous, record)?;
+                }
+                if let Some(inbox) = inbox {
+                    state
+                        .borrow_mut()
+                        .conversation_states
+                        .insert(conversation, inbox);
+                }
+                Ok(())
+            })
+        })
+    }
+
     /// Atomically abort a queued receipt and remove its inbox member, if any.
     /// The optional conversation filter treats mismatches as NotFound.
     pub fn withdraw_submission(
@@ -383,6 +472,57 @@ impl Tx {
             })
         })
     }
+}
+
+async fn queued_input_withdrawals(
+    storage: &mut dyn Storage,
+    candidates: &BTreeMap<Id, SubmissionRecord>,
+    conversation: Id,
+    state: Option<&Rc<RefCell<State>>>,
+) -> Result<Vec<(SubmissionRecord, SubmissionRecord)>, SessionError> {
+    let mut records = BTreeMap::new();
+    let mut cursor = None;
+    loop {
+        let page = storage
+            .scan_submissions(
+                SubmissionQuery {
+                    conversation_id: Some(conversation),
+                    status: Some(SubmissionStatus::Queued),
+                },
+                128,
+                cursor,
+            )
+            .await?;
+        if let Some(state) = state {
+            state.borrow().open()?;
+        }
+        records.extend(page.items.into_iter().map(|record| (record.id, record)));
+        cursor = page.next;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    for record in candidates
+        .values()
+        .filter(|record| record.conversation_id == conversation)
+    {
+        records.insert(record.id, record.clone());
+    }
+    let mut changes = Vec::new();
+    for previous in records.into_values() {
+        if previous.state != SubmissionState::InputQueued {
+            continue;
+        }
+        let mut record = previous.clone();
+        record.state = SubmissionState::InputUnanswered {
+            entry: None,
+            reason: "aborted".into(),
+            detail: None,
+        };
+        transition(&previous, &record)?;
+        changes.push((previous, record));
+    }
+    Ok(changes)
 }
 
 async fn final_submission(
@@ -456,9 +596,157 @@ async fn require_entry(
 pub(super) async fn assemble(
     storage: &mut dyn Storage,
     mut writes: Vec<StorageWrite>,
-    submissions: BTreeMap<Id, SubmissionCandidate>,
-    states: BTreeMap<Id, ConversationStateRecord>,
+    mut submissions: BTreeMap<Id, SubmissionCandidate>,
+    mut states: BTreeMap<Id, ConversationStateRecord>,
 ) -> Result<Vec<StorageWrite>, SessionError> {
+    // Abort/failure candidates cascade into owned conversation nodes even when
+    // those nodes have no live tasks. The task's own conversation is excluded:
+    // direct run abort preserves its later queue. Background anchors are cuts.
+    let cascades = writes
+        .iter()
+        .filter_map(|write| match write {
+            StorageWrite::Task(task)
+                if task.abort_requested || execution::tree::Tree::failed(task) =>
+            {
+                Some(task.id)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !cascades.is_empty() {
+        let mut tree = execution::tree::Tree::load(storage).await?;
+        for write in &writes {
+            match write {
+                StorageWrite::Task(task) => {
+                    tree.tasks.insert(task.id, task.clone());
+                }
+                StorageWrite::Conversation(record) => {
+                    tree.conversations.insert(record.id, record.clone());
+                }
+                _ => {}
+            }
+        }
+        let conversations = cascades
+            .into_iter()
+            .flat_map(|id| tree.owned_conversations(id))
+            .collect::<BTreeSet<_>>();
+        let candidates = submissions
+            .iter()
+            .map(|(id, candidate)| (*id, candidate.record.clone()))
+            .collect();
+        for conversation in conversations {
+            let changes =
+                queued_input_withdrawals(storage, &candidates, conversation, None).await?;
+            if changes.is_empty() {
+                continue;
+            }
+            let mut record = match states.get(&conversation) {
+                Some(record) => Some(record.clone()),
+                None => storage.conversation_state(conversation).await?,
+            };
+            for (previous, next) in changes {
+                if let Some(record) = &mut record {
+                    record.inbox.retain(|item| item.submission_id != next.id);
+                }
+                let original = submissions
+                    .get(&next.id)
+                    .map(|c| c.original.clone())
+                    .unwrap_or_else(|| Some(previous));
+                submissions.insert(
+                    next.id,
+                    SubmissionCandidate {
+                        original,
+                        record: next,
+                    },
+                );
+            }
+            if let Some(record) = record {
+                states.insert(conversation, record);
+            }
+        }
+    }
+    // Task assembly has already held outcomes with live descendants. Only
+    // FINAL terminal candidates may settle a run. Also inspect staged state
+    // during recovery or when a caller points it at an already-terminal task.
+    let mut conversations = states.keys().copied().collect::<BTreeSet<_>>();
+    conversations.extend(writes.iter().filter_map(|write| match write {
+        StorageWrite::Task(task) if task.status() == TaskStatus::Terminal => {
+            Some(task.conversation_id)
+        }
+        _ => None,
+    }));
+    for conversation in conversations {
+        let Some(mut record) = (match states.get(&conversation) {
+            Some(record) => Some(record.clone()),
+            None => storage.conversation_state(conversation).await?,
+        }) else {
+            continue;
+        };
+        let Some(run) = &record.run else { continue };
+        let task = match writes.iter().find_map(|write| match write {
+            StorageWrite::Task(task) if task.id == run.task_id => Some(task.clone()),
+            _ => None,
+        }) {
+            Some(task) => Some(task),
+            None => storage.task(run.task_id).await?,
+        };
+        let Some(task) = task else { continue };
+        let TaskState::Terminal { outcome } = task.state else {
+            continue;
+        };
+        if task.conversation_id != conversation {
+            return Err(invalid("Run task conversation mismatch"));
+        }
+        let reason = if matches!(outcome, TaskOutcome::Aborted { .. }) {
+            "aborted"
+        } else {
+            "faulted"
+        };
+        let mut ids = BTreeSet::new();
+        for id in &run.input_submission_ids {
+            if !ids.insert(*id) {
+                return Err(invalid("Duplicate run input submission ID"));
+            }
+            let previous = final_submission(storage, &submissions, *id).await?;
+            if previous.conversation_id != conversation {
+                return Err(invalid("Run input conversation mismatch"));
+            }
+            if !matches!(
+                previous.state,
+                SubmissionState::InputPlaced { .. }
+                    | SubmissionState::InputDone { .. }
+                    | SubmissionState::InputUnanswered { entry: Some(_), .. }
+            ) {
+                return Err(invalid(
+                    "Run inputs must be placed inputs in its conversation",
+                ));
+            }
+            // A specific settlement already staged by the agent wins.
+            if let SubmissionState::InputPlaced { entry } = previous.state {
+                let mut next = previous.clone();
+                next.state = SubmissionState::InputUnanswered {
+                    entry: Some(entry),
+                    reason: reason.into(),
+                    detail: None,
+                };
+                transition(&previous, &next)?;
+                let original = submissions
+                    .get(id)
+                    .map(|c| c.original.clone())
+                    .unwrap_or_else(|| Some(previous));
+                submissions.insert(
+                    *id,
+                    SubmissionCandidate {
+                        original,
+                        record: next,
+                    },
+                );
+            }
+        }
+        // We inspected the latest candidate marker, never a superseded run.
+        record.run = None;
+        states.insert(conversation, record);
+    }
     let mut requests = BTreeSet::new();
     let mut affected = BTreeSet::new();
     for (id, candidate) in &submissions {

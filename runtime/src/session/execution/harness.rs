@@ -450,6 +450,7 @@ impl Harness {
                         .into_values()
                         .filter(|record| record.status() == TaskStatus::Running)
                         .collect::<Vec<_>>();
+                    tx.reconcile_terminal_runs().await?;
                     for mut record in running {
                         let TaskState::Running { checkpoint } = record.state else {
                             unreachable!()
@@ -777,24 +778,23 @@ impl Harness {
                     .ok_or_else(|| {
                         SessionError::Invalid("Invalid conversation ownership".into())
                     })?;
+                let conversations = tree
+                    .conversation_scopes(id, options.background)
+                    .ok_or_else(|| {
+                        SessionError::Invalid("Invalid conversation ownership".into())
+                    })?;
+                for conversation in conversations {
+                    tx.withdraw_queued_inputs(conversation).await?;
+                }
                 let before = tree.tasks.clone();
                 for task in &reached {
                     if tree.tasks[task].status() != TaskStatus::Terminal {
                         tree.mark(*task);
                     }
                 }
-                let mut roots = BTreeMap::<Id, BTreeSet<Id>>::new();
-                for task in tree.tasks.values() {
-                    if task.status() != TaskStatus::Terminal
-                        && let Some(root) = tree.root(task.id)
-                        && let Some(scope) = tree.scope(root)
-                    {
-                        roots.entry(root).or_insert(scope);
-                    }
-                }
-                for scope in roots.values() {
-                    tree.reconcile(scope);
-                }
+                // Reconcile only the reached snapshot. Unrelated roots must not
+                // advance merely because this conversation was aborted.
+                tree.reconcile(&reached);
                 tree.stage_changes(tx, &before).await?;
                 Ok(reached)
             })
