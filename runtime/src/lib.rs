@@ -1,8 +1,4 @@
-//! Public Works' Session/storage kernel and host-polled foreground task scheduling.
-//! Hosts poll a HarnessDriver, or lower-level SessionDriver and TaskDriver futures,
-//! through shutdown. No executor or agent-specific policy is included.
-//! Adapters are trusted. Boxed futures permit async hosts, but the built-in
-//! adapters perform synchronous work when polled. See the workspace design doc.
+#![doc = include_str!("../README.md")]
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{fmt, future::Future, pin::Pin};

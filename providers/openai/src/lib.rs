@@ -1,8 +1,4 @@
-//! Opt-in, non-streaming OpenAI Responses provider for a Tokio host.
-//!
-//! Only text and local function calls are supported, not reasoning models.
-//! Credentials and transport configuration stay in host memory. Model inputs,
-//! outputs and usage remain durable application data, not scrubbed secrets.
+#![doc = include_str!("../README.md")]
 use futures_util::future::{Either, select};
 use publicworks_agent::{Cancellation, Model, ModelError, ModelFuture, ModelRequest};
 use reqwest::{
@@ -73,10 +69,15 @@ impl fmt::Debug for OpenAiResponses {
     }
 }
 impl OpenAiResponses {
+    /// Creates a provider with the default OpenAI Responses endpoint and limits.
     pub fn new(api_key: impl Into<String>) -> Result<Self, ConfigError> {
         Self::with_config(api_key, Config::default())
     }
 
+    /// Creates a provider with explicit transport and endpoint configuration.
+    ///
+    /// The endpoint must use HTTPS, except for numeric loopback HTTP addresses.
+    /// Redirects, retries, and ambient proxies are disabled.
     pub fn with_config(api_key: impl Into<String>, config: Config) -> Result<Self, ConfigError> {
         let api_key = api_key.into();
         if api_key.trim().is_empty() {

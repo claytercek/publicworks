@@ -1,5 +1,4 @@
-//! Provider-neutral durable turns on the host-driven Public Works task kernel.
-//! Model and tool callbacks are trusted, local futures; no executor is spawned.
+#![doc = include_str!("../README.md")]
 use publicworks_runtime::{SessionError, TaskRuntime};
 use serde_json::Value;
 use std::{future::Future, pin::Pin, rc::Rc};

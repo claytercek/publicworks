@@ -1,9 +1,4 @@
-//! Blocking SQLite adapter for Public Works runtime records.
-//!
-//! Unpublished typed schema v5. Incompatible schemas (including v4) are rejected,
-//! never migrated or reset. Open performs a streaming full integrity audit in a
-//! transaction; subsequent reads validate selected rows only. Concurrent external
-//! mutation is unsupported and is not guaranteed to be detected until reopening.
+#![doc = include_str!("../README.md")]
 use publicworks_runtime::*;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::{path::Path, time::Duration};
@@ -14,6 +9,7 @@ use query::{Filter, exact, integer, select};
 use record::{Kind, Record};
 use schema::{SCHEMA, metadata};
 
+/// Blocking SQLite implementation of [`Storage`] for one logical owner.
 pub struct SqliteStorage {
     connection: Option<Connection>,
     lease_next: u64,
@@ -45,6 +41,10 @@ fn transaction<T>(
     }
 }
 impl SqliteStorage {
+    /// Opens or creates a database and validates its schema and stored records.
+    ///
+    /// Incompatible or corrupt schemas are rejected rather than migrated,
+    /// repaired, or reset.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let mut connection = Connection::open(path).map_err(other)?;
         connection
