@@ -1,0 +1,13 @@
+[package]
+name = "publicworks-perf"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+publicworks-runtime = { path = "../runtime" }
+publicworks-agent = { path = "../agent" }
+publicworks-storage-sqlite = { path = "../storage/sqlite" }
+futures-lite = "2"
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+serde_json = "1"

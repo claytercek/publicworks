@@ -704,6 +704,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "publicworks-perf"
+version = "0.1.0"
+dependencies = [
+ "futures-lite",
+ "futures-util",
+ "publicworks-agent",
+ "publicworks-runtime",
+ "publicworks-storage-sqlite",
+ "serde_json",
+]
+
+[[package]]
 name = "publicworks-provider-openai"
 version = "0.1.0"
 dependencies = [
