@@ -6,6 +6,8 @@ use std::{future::Future, pin::Pin, rc::Rc};
 
 mod admission;
 pub use admission::{BusyMode, ExpectedHead, QueueConfig, QueueMode, SubmitOptions, WriteOptions};
+mod config;
+pub use config::ExtensionConfig;
 mod context;
 mod engine;
 mod registry;

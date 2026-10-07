@@ -100,12 +100,15 @@ impl Agent {
     ) -> CommitWaiter<()> {
         harness.commit(move |tx| {
             Box::pin(async move {
-                tx.update_conversation_state(conversation, move |state| {
-                    state.agent_config =
-                        Some(json!({"steer":mode(config.steer),"followUp":mode(config.follow_up)}));
-                })
-                .await?;
-                Ok(())
+                crate::config::merge(
+                    tx,
+                    conversation,
+                    [
+                        ("steer", Some(json!(mode(config.steer)))),
+                        ("followUp", Some(json!(mode(config.follow_up)))),
+                    ],
+                )
+                .await
             })
         })
     }
@@ -357,13 +360,6 @@ fn mode(mode: QueueMode) -> &'static str {
         QueueMode::All => "all",
     }
 }
-fn parse_mode(value: &Value) -> Result<QueueMode, SessionError> {
-    match value.as_str() {
-        Some("one") => Ok(QueueMode::One),
-        Some("all") => Ok(QueueMode::All),
-        _ => Err(invalid("Invalid queue mode")),
-    }
-}
 pub(crate) fn unanswered(reason: &str) -> SubmissionSettlement {
     SubmissionSettlement::Unanswered {
         reason: reason.into(),
@@ -392,13 +388,7 @@ impl Boundary {
                 agent_config: s.agent_config,
             })
             .unwrap_or_default();
-        let config = match &state.agent_config {
-            None => QueueConfig::default(),
-            Some(value) => QueueConfig {
-                steer: parse_mode(&value["steer"])?,
-                follow_up: parse_mode(&value["followUp"])?,
-            },
-        };
+        let config = crate::config::queues(state.agent_config.as_ref())?;
         let head = tx
             .find_latest_head_marker(conversation, None)
             .await?

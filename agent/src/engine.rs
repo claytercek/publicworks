@@ -11,33 +11,83 @@ pub const TOOL_KIND: &str = "agent.tool";
 pub struct Agent(Rc<Installation>);
 struct Installation {
     model: Rc<dyn Model>,
-    tools: BTreeMap<String, Tool>,
+    registry: AgentRegistrySnapshot,
+    host_default: Option<Vec<String>>,
 }
 impl Agent {
-    pub fn new(model: impl Model + 'static, tools: Vec<Tool>) -> Result<Self, SessionError> {
-        let mut registry = BTreeMap::new();
-        for tool in tools {
-            decode_declaration(&declaration(&tool.declaration))?;
-            validate_entry(None, Some(declaration(&tool.declaration)))?;
-            if registry
-                .insert(tool.declaration.name.clone(), tool)
-                .is_some()
-            {
-                return Err(invalid("Duplicate tool name"));
-            }
-        }
-        Ok(Self(Rc::new(Installation {
+    /// Compatibility constructor: install tools in a single `default` extension.
+    pub fn new(model: impl Model + 'static, mut tools: Vec<Tool>) -> Result<Self, SessionError> {
+        // Retain the legacy constructor's alphabetical declaration order.
+        tools.sort_by(|a, b| a.declaration().name.cmp(&b.declaration().name));
+        let mut registry = AgentRegistry::new();
+        registry.install(Extension::new("default", tools))?;
+        Ok(Self::with_registry(model, registry.snapshot(), None))
+    }
+
+    /// Capture immutable code and host defaults. Conversation policy is read
+    /// lazily through the invocation fence, at most once in each resolving phase.
+    pub fn with_registry(
+        model: impl Model + 'static,
+        registry: AgentRegistrySnapshot,
+        host_default: Option<Vec<String>>,
+    ) -> Self {
+        Self(Rc::new(Installation {
             model: Rc::new(model),
-            tools: registry,
-        })))
+            registry,
+            host_default,
+        }))
+    }
+
+    pub fn registry_snapshot(&self) -> AgentRegistrySnapshot {
+        self.0.registry.clone()
+    }
+
+    pub fn with_snapshot(&self, registry: AgentRegistrySnapshot) -> Self {
+        Self(Rc::new(Installation {
+            model: self.0.model.clone(),
+            registry,
+            host_default: self.0.host_default.clone(),
+        }))
+    }
+
+    /// Project one captured agent snapshot and all other host definitions into a
+    /// single Harness publication/wakeup. This replaces the whole runtime map;
+    /// callers must include their non-agent definitions. No callbacks run here.
+    /// Old definitions retain the old Agent. Failure leaves Harness unchanged.
+    pub fn publish_snapshot(
+        &self,
+        harness: &Harness,
+        snapshot: AgentRegistrySnapshot,
+        other_definitions: impl IntoIterator<Item = TaskDefinition>,
+    ) -> Result<Self, HarnessError> {
+        let agent = self.with_snapshot(snapshot);
+        let registry = TaskRegistry::new(agent.definitions().into_iter().chain(other_definitions))
+            .map_err(|e| HarnessError::Session(invalid(e.to_string())))?;
+        harness.replace_registry(registry)?;
+        Ok(agent)
+    }
+
+    async fn resolve(&self, runtime: &TaskRuntime) -> Result<ResolvedExtensions, SessionError> {
+        let config = runtime
+            .read(|tx, task| {
+                Box::pin(async move {
+                    let state = tx.conversation_state(task.conversation_id).await?;
+                    ExtensionConfig::decode(state.as_ref().and_then(|s| s.agent_config.as_ref()))
+                })
+            })
+            .await?
+            .value;
+        Ok(self
+            .0
+            .registry
+            .resolve(&config.selection, self.0.host_default.as_deref()))
     }
     pub fn definitions(&self) -> [TaskDefinition; 2] {
         [self.turn_definition(), self.tool_definition()]
     }
     pub(crate) fn turn_input(&self, config: TurnConfig) -> Result<Value, SessionError> {
         validate_config(&config)?;
-        let input = json!({"config":{"model":config.model,"instructions":config.instructions,"maxModelRounds":config.max_model_rounds},
-            "tools":self.0.tools.values().map(|tool|declaration(&tool.declaration)).collect::<Vec<_>>()});
+        let input = json!({"config":{"model":config.model,"instructions":config.instructions,"maxModelRounds":config.max_model_rounds}});
         decode_input(&input)?;
         Ok(input)
     }
@@ -57,7 +107,7 @@ impl Agent {
         let agent = self.clone();
         TaskDefinition::new(
             TURN_KIND,
-            1,
+            2,
             |input| {
                 decode_input(input)?;
                 Ok(json!({"phase":"prepare","round":0}))
@@ -84,7 +134,7 @@ impl Agent {
         }
         TaskDefinition::new(
             TOOL_KIND,
-            1,
+            2,
             |input| {
                 decode_tool_input(input)?;
                 Ok(json!({"phase":"call"}))
@@ -129,7 +179,7 @@ impl Agent {
         if record.owner.is_some() || record.background {
             return fail(&runtime, "Unsupported agent turn scope").await;
         }
-        let (config, offers) = decode_input(&record.input)?;
+        let config = decode_input(&record.input)?;
         let cp = checkpoint(&record)?.clone();
         let round = number(&cp, "round")?;
         match phase {
@@ -137,6 +187,12 @@ impl Agent {
                 if round >= config.max_model_rounds {
                     return fail(&runtime, "Maximum model rounds exhausted").await;
                 }
+                let resolved = self.resolve(&runtime).await?;
+                let offers: Vec<_> = resolved
+                    .tools()
+                    .iter()
+                    .map(|t| t.declaration().clone())
+                    .collect();
                 let projection = runtime
                     .read(|tx, task| {
                         Box::pin(
@@ -167,15 +223,13 @@ impl Agent {
                     .read(|_, task| Box::pin(async move { decode_request(checkpoint(&task)?) }))
                     .await?
                     .value;
-                if request.model != config.model
-                    || request.instructions != config.instructions
-                    || request.tools != offers
-                {
+                if request.model != config.model || request.instructions != config.instructions {
                     return Err(invalid("Request differs from pinned turn configuration"));
                 }
                 if runtime.is_cancelled() {
                     return Ok(());
                 }
+                let offers = request.tools.clone();
                 let future = self
                     .0
                     .model
@@ -267,7 +321,7 @@ impl Agent {
                                             .await?;
                                         Ok(Some(TaskUpdate::Wait {
                                             checkpoint: tools_checkpoint(
-                                                round, entry.id, &calls, 0, child,
+                                                round, entry.id, &calls, 0, child, &offers,
                                             ),
                                             on: vec![child],
                                             policy: JoinPolicy::AllSettled,
@@ -281,6 +335,7 @@ impl Agent {
                 }
             }
             "tools" => {
+                let offers = checkpoint_offers(&cp)?;
                 let assistant = id(&cp, "assistantEntryId")?;
                 let child = id(&cp, "child")?;
                 let index = usize::try_from(number(&cp, "index")?)
@@ -340,6 +395,7 @@ impl Agent {
                                         &calls,
                                         index + 1,
                                         child,
+                                        &offers,
                                     ),
                                     on: vec![child],
                                     policy: JoinPolicy::AllSettled,
@@ -468,15 +524,16 @@ impl Agent {
                         .await?
                         .ok_or_else(|| invalid("Missing turn"))?;
                     if root.kind != TURN_KIND
-                        || root.version != 1
+                        || root.version != 2
                         || root.conversation_id != task.conversation_id
                         || root.owner.is_some()
                         || root.background
                     {
                         return Err(invalid("Invalid tool root"));
                     }
-                    let (_, offers) = decode_input(&root.input)?;
+                    decode_input(&root.input)?;
                     let root_cp = checkpoint(&root)?;
+                    let offers = checkpoint_offers(root_cp)?;
                     let index = usize::try_from(number(root_cp, "index")?)
                         .map_err(|_| invalid("Invalid tool index"))?;
                     let calls = decode_calls(root_cp)?;
@@ -530,7 +587,20 @@ impl Agent {
         if phase == "in_flight" {
             return finish_tool(&runtime,&input,ToolResult{content:"interrupted_effect: the operation may have partially or fully run; its result was not durably recorded. It was not replayed.".into(),is_error:true,usage:None},Some("interrupted_effect"),End::Fail("interrupted_effect".into())).await;
         }
-        let tool = self.0.tools.get(&call.name);
+        // Do not resolve even a validator for a name absent from the pinned request.
+        let resolved = if offered.is_some() {
+            Some(self.resolve(&runtime).await?)
+        } else {
+            None
+        };
+        // Configuration resolution awaited the Session line; abort or close may
+        // have overtaken that read. Do not invoke a validator after cancellation.
+        if runtime.is_cancelled() {
+            return Ok(());
+        }
+        let tool = resolved
+            .as_ref()
+            .and_then(|r| r.tools().iter().find(|t| t.declaration().name == call.name));
         let rejection = match (&offered, tool) {
             (None, _) => Some("Tool was not offered".to_owned()),
             (_, None) => Some("Tool is not installed".to_owned()),
@@ -630,9 +700,7 @@ fn validate_config(config: &TurnConfig) -> Result<(), SessionError> {
     }
     Ok(())
 }
-pub(crate) fn decode_input(
-    input: &Value,
-) -> Result<(TurnConfig, Vec<ToolDeclaration>), SessionError> {
+pub(crate) fn decode_input(input: &Value) -> Result<TurnConfig, SessionError> {
     let cfg = input
         .get("config")
         .ok_or_else(|| invalid("Missing config"))?;
@@ -642,9 +710,8 @@ pub(crate) fn decode_input(
         max_model_rounds: number(cfg, "maxModelRounds")?,
     };
     validate_config(&config)?;
-    let tools = declarations(input.get("tools").ok_or_else(|| invalid("Missing tools"))?)?;
     validate_entry(None, Some(input.clone()))?;
-    Ok((config, tools))
+    Ok(config)
 }
 fn checkpoint(task: &TaskRecord) -> Result<&Value, SessionError> {
     match &task.state {
@@ -708,8 +775,15 @@ fn tools_checkpoint(
     calls: &[ToolCall],
     index: usize,
     child: Id,
+    offers: &[ToolDeclaration],
 ) -> Value {
-    json!({"phase":"tools","round":round,"assistantEntryId":assistant.get(),"calls":calls.iter().map(encode_call).collect::<Vec<_>>(),"index":index,"child":child.get()})
+    json!({"phase":"tools","round":round,"assistantEntryId":assistant.get(),"calls":calls.iter().map(encode_call).collect::<Vec<_>>(),"index":index,"child":child.get(),"tools":offers.iter().map(declaration).collect::<Vec<_>>()})
+}
+fn checkpoint_offers(cp: &Value) -> Result<Vec<ToolDeclaration>, SessionError> {
+    declarations(
+        cp.get("tools")
+            .ok_or_else(|| invalid("Missing pinned request tools"))?,
+    )
 }
 fn decode_calls(cp: &Value) -> Result<Vec<ToolCall>, SessionError> {
     cp.get("calls")

@@ -236,6 +236,22 @@ fn typed_dedup_precedes_validation_busy_and_configuration_without_sequence() {
                 };
                 assert!(message.contains("different submission type"));
                 assert_eq!(h.inspect().await.unwrap().last_commit_seq, seq);
+                // Partial configuration updates reject malformed envelopes rather
+                // than silently discarding potentially unrelated settings.
+                assert!(
+                    a.configure_queues(&h, c, QueueConfig::default())
+                        .await
+                        .is_err()
+                );
+                h.commit(move |tx| {
+                    Box::pin(async move {
+                        tx.update_conversation_state(c, |s| s.agent_config = None)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .await
+                .unwrap();
                 a.configure_queues(&h, c, QueueConfig::default())
                     .await
                     .unwrap();

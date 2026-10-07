@@ -307,6 +307,36 @@ ID, so approvals and external idempotency remain application responsibilities.
 Cancellation does not undo effects. See the
 agent contract for the API and limits.
 
+### Select and publish extensions
+
+For named tool bundles, install `Extension` values in an `AgentRegistry`, then
+construct `Agent::with_registry(model, registry.snapshot(), host_default)`.
+`None` for the host default selects all installed extensions in installation
+order. `Agent::new` remains the single-bundle convenience constructor.
+
+Persist per-conversation policy with
+`agent.configure_extensions(&harness, conversation, ExtensionConfig { selection,
+config }).await?`. Selection supports `Default`, ordered `Exact`, and `AddRemove`.
+The config map holds JSON settings by extension name. Missing names survive
+restart and become effective when installed. This update and `configure_queues`
+preserve each other's fields; neither starts generation or runs callbacks.
+
+After installing, replacing, or uninstalling a bundle, publish its snapshot:
+
+```rust,ignore
+agent = agent.publish_snapshot(&harness, registry.snapshot(), other_definitions)?;
+```
+
+Pass every non-agent task definition in `other_definitions`; this replaces the
+Harness definition map in one publication and wakes scheduling. Old phases keep
+their captured code. Later compatible phase boundaries use the new definitions.
+Request preparation pins selected tool declarations, while each tool call checks
+current selection against its captured phase snapshot. An accepted implementation
+stays pinned through its effect and result. Callbacks are never persisted and
+must be reinstalled on restart. See the
+extension contract
+for the configuration wire format, definition-version change, and remaining scope.
+
 ## Opt in to OpenAI Responses
 
 `publicworks-provider-openai` implements the same `Model` interface with a real

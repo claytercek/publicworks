@@ -352,8 +352,7 @@ fn restart_before_model_commit_replays_the_pinned_request_not_later_context_or_i
 }
 
 #[test]
-fn in_flight_recovery_is_uncertain_without_reexecution_while_pre_intent_version_mismatch_is_known_safe()
- {
+fn in_flight_recovery_never_reexecutes_and_later_requests_resolve_current_offers() {
     block_on(bounded(async {
         let db = Database::new();
         let entered = Gate::default();
@@ -406,7 +405,7 @@ fn in_flight_recovery_is_uncertain_without_reexecution_while_pre_intent_version_
         let resumed_model = FakeModel::new([
             Ok(final_response("continued from uncertainty")),
             Ok(tool_response("new-id", "effect")),
-            Ok(final_response("continued from mismatch")),
+            Ok(final_response("continued from current tools")),
         ]);
         let current_agent = Agent::new(
             resumed_model.clone(),
@@ -416,7 +415,7 @@ fn in_flight_recovery_is_uncertain_without_reexecution_while_pre_intent_version_
                     current_effects.set(current_effects.get() + 1);
                     Box::pin(async {
                         Ok(ToolResult {
-                            content: "unexpected".into(),
+                            content: "current effect".into(),
                             is_error: false,
                             usage: None,
                         })
@@ -443,18 +442,19 @@ fn in_flight_recovery_is_uncertain_without_reexecution_while_pre_intent_version_
                 assert!(content.contains("not replayed"));
                 assert!(resumed_model.requests.borrow()[0].messages.iter().any(|message| matches!(message, ModelMessage::ToolResult { call_id, .. } if call_id == "same-call")));
 
-                // Admission pins version 1, but this runner has version 2 installed. That
-                // mismatch is detected before an in_flight intent, so it is a known no-effect.
-                let mismatch = admit(&session, old_agent, conversation, "version mismatch").await;
-                terminal(runner.run(mismatch.task_id).await.unwrap());
-                assert_eq!(current_effects.get(), 0);
-                let mismatch_result = entries(&session, conversation).await.into_iter()
+                // Admission no longer pins tools. A later preparation uses this
+                // runner's version 2 installation, even when admitted by an old Agent.
+                let next = admit(&session, old_agent, conversation, "new request").await;
+                terminal(runner.run(next.task_id).await.unwrap());
+                assert_eq!(current_effects.get(), 1);
+                let current_result = entries(&session, conversation).await.into_iter()
                     .filter(|entry| entry.kind == "agent.toolResult")
                     .find(|entry| entry.data.as_ref().unwrap()["callId"] == "new-id")
                     .unwrap();
-                assert_eq!(mismatch_result.data.as_ref().unwrap()["code"], "invalid_tool_call");
-                let ModelMessage::ToolResult { content, .. } = decode_message(&mismatch_result.model.as_ref().unwrap()[0]).unwrap() else { panic!("not a result") };
-                assert_eq!(content, "Tool version mismatch");
+                assert!(current_result.data.as_ref().unwrap().get("code").is_none());
+                let ModelMessage::ToolResult { content, .. } = decode_message(&current_result.model.as_ref().unwrap()[0]).unwrap() else { panic!("not a result") };
+                assert_eq!(content, "current effect");
+                assert_eq!(resumed_model.requests.borrow()[1].tools[0].version, 2);
                 runner.close().await.unwrap();
                 session.close().await.unwrap();
             }, td).await;
