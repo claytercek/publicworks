@@ -119,10 +119,21 @@ where
 }
 type Validator = Rc<dyn Fn(&Value) -> Result<(), String>>;
 type Executor = Rc<dyn Fn(ToolCall, Cancellation) -> ToolFuture>;
+/// Tool-author assertion that repeating an interrupted operation with its stored
+/// effective arguments is acceptable. This does not provide exactly-once effects.
+/// Local execution metadata: never included in provider-facing declarations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReplayPolicy {
+    #[default]
+    Unsafe,
+    Safe,
+}
+
 /// Executable code remains in this immutable installation, never in storage.
 #[derive(Clone)]
 pub struct Tool {
     pub(crate) declaration: ToolDeclaration,
+    pub(crate) replay_policy: ReplayPolicy,
     pub(crate) validate: Validator,
     pub(crate) execute: Executor,
 }
@@ -134,9 +145,19 @@ impl Tool {
     ) -> Self {
         Self {
             declaration,
+            replay_policy: ReplayPolicy::default(),
             validate: Rc::new(validate),
             execute: Rc::new(execute),
         }
+    }
+    /// Opt in only when repeating an uncertain effect is acceptable. Recovery
+    /// also requires a currently selected, same-name/version tool to opt in.
+    pub fn with_replay_policy(mut self, policy: ReplayPolicy) -> Self {
+        self.replay_policy = policy;
+        self
+    }
+    pub fn replay_policy(&self) -> ReplayPolicy {
+        self.replay_policy
     }
     pub fn declaration(&self) -> &ToolDeclaration {
         &self.declaration

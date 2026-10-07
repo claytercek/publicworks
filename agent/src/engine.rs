@@ -121,7 +121,7 @@ impl Agent {
     }
     fn tool_definition(&self) -> TaskDefinition {
         let mut phases = BTreeMap::new();
-        for phase in ["call", "in_flight"] {
+        for phase in ["call", "execute"] {
             let agent = self.clone();
             phases.insert(
                 phase.to_owned(),
@@ -134,7 +134,7 @@ impl Agent {
         }
         TaskDefinition::new(
             TOOL_KIND,
-            2,
+            3,
             |input| {
                 decode_tool_input(input)?;
                 Ok(json!({"phase":"call"}))
@@ -144,12 +144,9 @@ impl Agent {
         .with_abort_handler(Rc::new(|record, runtime| {
             Box::pin(async move {
                 let input = decode_tool_input(&record.input).map_err(fault)?;
-                let in_flight = checkpoint(&record)
-                    .ok()
-                    .and_then(|cp| cp.get("phase"))
-                    .and_then(Value::as_str)
-                    == Some("in_flight");
-                let content = if in_flight {
+                let intent = decode_tool_checkpoint(checkpoint(&record).map_err(fault)?, &input)
+                    .map_err(fault)?;
+                let content = if intent.is_some() {
                     "Tool aborted; the operation may have partially or fully run."
                 } else {
                     "Tool aborted before execution."
@@ -544,6 +541,10 @@ impl Agent {
         phase: &str,
     ) -> Result<(), SessionError> {
         let input = decode_tool_input(&record.input)?;
+        let intent = decode_tool_checkpoint(checkpoint(&record)?, &input)?;
+        if (phase == "execute") != intent.is_some() {
+            return Err(invalid("Tool phase differs from checkpoint"));
+        }
         let read_input = input.clone();
         let (call, offered) = runtime
             .read(move |tx, task| {
@@ -616,9 +617,6 @@ impl Agent {
         if runtime.is_cancelled() {
             return Ok(());
         }
-        if phase == "in_flight" {
-            return finish_tool(&runtime,&input,ToolResult{content:"interrupted_effect: the operation may have partially or fully run; its result was not durably recorded. It was not replayed.".into(),is_error:true,usage:None},Some("interrupted_effect"),End::Fail("interrupted_effect".into())).await;
-        }
         // Do not resolve even a validator for a name absent from the pinned request.
         let resolved = if offered.is_some() {
             Some(self.resolve(&runtime).await?)
@@ -633,6 +631,37 @@ impl Agent {
         let tool = resolved
             .as_ref()
             .and_then(|r| r.tools().iter().find(|t| t.declaration().name == call.name));
+        if let Some((call, policy)) = intent {
+            // The execute checkpoint is authoritative. Never prepare, validate
+            // against current code, or rerun beforeTool after durable intent.
+            if let (ReplayPolicy::Safe, Some(offer), Some(tool)) = (policy, &offered, tool)
+                && tool.replay_policy == ReplayPolicy::Safe
+                && tool.declaration.version == offer.version
+            {
+                return execute_tool(
+                    &runtime,
+                    &input,
+                    resolved.as_ref().expect("resolved tool"),
+                    tool,
+                    call,
+                )
+                .await;
+            }
+            return finish_tool(
+                &runtime,
+                &input,
+                ToolResult {
+                    content: format!(
+                        "interrupted_effect: tool '{}' may have partially or fully run; its result was not durably recorded. It was not replayed.",
+                        input.name
+                    ),
+                    is_error: true,
+                    usage: None,
+                },
+                Some("interrupted_effect"),
+                End::Fail("interrupted_effect".into()),
+            ).await;
+        }
         let rejection = match (&offered, tool) {
             (None, _) => Some("Tool was not offered".to_owned()),
             (_, None) => Some("Tool is not installed".to_owned()),
@@ -706,40 +735,11 @@ impl Agent {
         if runtime.is_cancelled() {
             return Ok(());
         }
-        let execute = tool.execute.clone();
+        let intent = execute_checkpoint(&input, &call, tool.replay_policy)?;
         runtime
-            .commit(|_, _| {
-                Box::pin(async { Ok(Some(TaskUpdate::Checkpoint(json!({"phase":"in_flight"})))) })
-            })
+            .commit(move |_, _| Box::pin(async move { Ok(Some(TaskUpdate::Checkpoint(intent))) }))
             .await?;
-        // The checkpoint ACK is not a cancellation barrier: abort/close may overtake it.
-        if runtime.is_cancelled() {
-            return Ok(());
-        }
-        let future = execute(call.clone(), Cancellation(runtime.clone()));
-        let result = match select(future, Box::pin(runtime.cancelled())).await {
-            Either::Left((result, _)) => result,
-            Either::Right(_) => return Ok(()),
-        };
-        if runtime.is_cancelled() {
-            return Ok(());
-        }
-        let (result, code, end) = match result {
-            Ok(result) => (result, None, End::Complete),
-            Err(error) => (
-                ToolResult {
-                    content: error.message.clone(),
-                    is_error: true,
-                    usage: error.usage,
-                },
-                Some("tool_error"),
-                End::Fail(error.message),
-            ),
-        };
-        let result = resolved
-            .after_tool(&runtime, ToolOutcome { call, result })
-            .await?;
-        finish_tool(&runtime, &input, result, code, end).await
+        execute_tool(&runtime, &input, resolved, tool, call).await
     }
     async fn abort_turn(
         &self,
@@ -763,6 +763,45 @@ impl Agent {
         })).await?;
         Ok(())
     }
+}
+
+// No durable partial progress channel exists yet, so reset before replay and
+// retention on interruption are vacuous. Only final results are published.
+async fn execute_tool(
+    runtime: &TaskRuntime,
+    input: &ToolInput,
+    resolved: &ResolvedExtensions,
+    tool: &Tool,
+    call: ToolCall,
+) -> Result<(), SessionError> {
+    // The checkpoint ACK is not a cancellation barrier: abort/close may overtake it.
+    if runtime.is_cancelled() {
+        return Ok(());
+    }
+    let future = (tool.execute)(call.clone(), Cancellation(runtime.clone()));
+    let result = match select(future, Box::pin(runtime.cancelled())).await {
+        Either::Left((result, _)) => result,
+        Either::Right(_) => return Ok(()),
+    };
+    if runtime.is_cancelled() {
+        return Ok(());
+    }
+    let (result, code, end) = match result {
+        Ok(result) => (result, None, End::Complete),
+        Err(error) => (
+            ToolResult {
+                content: error.message.clone(),
+                is_error: true,
+                usage: error.usage,
+            },
+            Some("tool_error"),
+            End::Fail(error.message),
+        ),
+    };
+    let result = resolved
+        .after_tool(runtime, ToolOutcome { call, result })
+        .await?;
+    finish_tool(runtime, input, result, code, end).await
 }
 
 fn validate_config(config: &TurnConfig) -> Result<(), SessionError> {
@@ -906,6 +945,58 @@ fn decode_tool_input(value: &Value) -> Result<ToolInput, SessionError> {
         return Err(invalid("Empty tool input ID or name"));
     }
     Ok(result)
+}
+// Input pins ownership/provenance; execute intent redundantly pins call identity
+// and offered version alongside the final arguments and policy. Reject old or
+// malformed records rather than guessing what an interrupted effect received.
+fn execute_checkpoint(
+    input: &ToolInput,
+    call: &ToolCall,
+    policy: ReplayPolicy,
+) -> Result<Value, SessionError> {
+    let cp = json!({"phase":"execute", "callId":call.id, "name":call.name,
+        "version":input.version, "arguments":call.arguments,
+        "replay":match policy { ReplayPolicy::Unsafe => "unsafe", ReplayPolicy::Safe => "safe" }});
+    decode_tool_checkpoint(&cp, input)?;
+    Ok(cp)
+}
+fn decode_tool_checkpoint(
+    cp: &Value,
+    input: &ToolInput,
+) -> Result<Option<(ToolCall, ReplayPolicy)>, SessionError> {
+    validate_entry(None, Some(cp.clone()))?;
+    let object = cp
+        .as_object()
+        .ok_or_else(|| invalid("Invalid tool checkpoint"))?;
+    match cp.get("phase").and_then(Value::as_str) {
+        Some("call") if object.len() == 1 => Ok(None),
+        Some("execute") => {
+            let fields = ["phase", "callId", "name", "version", "arguments", "replay"];
+            if object.len() != fields.len() || fields.iter().any(|key| !object.contains_key(*key)) {
+                return Err(invalid("Invalid execute intent fields"));
+            }
+            if string(cp, "callId")? != input.call_id
+                || string(cp, "name")? != input.name
+                || Some(number(cp, "version")?) != input.version
+            {
+                return Err(invalid("Execute intent differs from pinned tool input"));
+            }
+            let policy = match cp.get("replay").and_then(Value::as_str) {
+                Some("unsafe") => ReplayPolicy::Unsafe,
+                Some("safe") => ReplayPolicy::Safe,
+                _ => return Err(invalid("Invalid execute replay policy")),
+            };
+            Ok(Some((
+                ToolCall {
+                    id: input.call_id.clone(),
+                    name: input.name.clone(),
+                    arguments: cp["arguments"].clone(),
+                },
+                policy,
+            )))
+        }
+        _ => Err(invalid("Invalid tool checkpoint phase")),
+    }
 }
 // Observe the batch in original call order. Missing child results use the same
 // fallback that the tools phase will durably append; observers cannot write it.
@@ -1125,6 +1216,110 @@ mod tests {
             vec![],
         )
         .unwrap()
+    }
+
+    fn tool_input() -> ToolInput {
+        ToolInput {
+            root: ROOT_CONVERSATION,
+            assistant: ROOT_CONVERSATION,
+            call_id: "call".into(),
+            name: "effect".into(),
+            version: Some(7),
+        }
+    }
+
+    #[test]
+    fn execute_intent_is_strict_and_pins_identity_policy_and_arguments() {
+        let input = tool_input();
+        let call = ToolCall {
+            id: input.call_id.clone(),
+            name: input.name.clone(),
+            arguments: Value::Null,
+        };
+        let cp = execute_checkpoint(&input, &call, ReplayPolicy::Unsafe).unwrap();
+        assert_eq!(
+            decode_tool_checkpoint(&cp, &input).unwrap(),
+            Some((call, ReplayPolicy::Unsafe))
+        );
+        assert_eq!(
+            decode_tool_checkpoint(&json!({"phase":"call"}), &input).unwrap(),
+            None
+        );
+        for key in ["phase", "callId", "name", "version", "arguments", "replay"] {
+            let mut missing = cp.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                decode_tool_checkpoint(&missing, &input).is_err(),
+                "missing {key}"
+            );
+        }
+        for (key, value) in [
+            ("phase", json!("in_flight")),
+            ("callId", json!("other")),
+            ("name", json!("other")),
+            ("version", json!(8)),
+            ("version", Value::Null),
+            ("version", json!(7.5)),
+            ("replay", Value::Null),
+            ("replay", json!(true)),
+            ("replay", json!("Safe")),
+            ("extra", json!(true)),
+        ] {
+            let mut bad = cp.clone();
+            bad[key] = value;
+            assert!(decode_tool_checkpoint(&bad, &input).is_err(), "{bad}");
+        }
+        for bad in [
+            json!({"phase":"in_flight"}),
+            json!({"phase":"call", "replay":"safe"}),
+            json!([]),
+        ] {
+            assert!(decode_tool_checkpoint(&bad, &input).is_err());
+        }
+        let mut unoffered = input.clone();
+        unoffered.version = None;
+        assert!(decode_tool_checkpoint(&cp, &unoffered).is_err());
+        assert_eq!(agent().tool_definition().version(), 3);
+    }
+
+    #[test]
+    fn execute_intent_uses_native_json_and_counts_its_wrapper_depth() {
+        let input = tool_input();
+        let mut call = ToolCall {
+            id: input.call_id.clone(),
+            name: input.name.clone(),
+            arguments: json!({"max":u64::MAX,"min":i64::MIN,"float":1.25,
+                "opaque":{"$serde_json::private::Number":"opaque"}}),
+        };
+        let cp = execute_checkpoint(&input, &call, ReplayPolicy::Safe).unwrap();
+        let decoded = decode_native_json(&serde_json::to_vec(&cp).unwrap()).unwrap();
+        assert_eq!(
+            decode_tool_checkpoint(&decoded, &input).unwrap(),
+            Some((call.clone(), ReplayPolicy::Safe))
+        );
+        call.arguments = (0..MAX_JSON_DEPTH - 1).fold(Value::Null, |v, _| json!([v]));
+        assert!(execute_checkpoint(&input, &call, ReplayPolicy::Safe).is_ok());
+        call.arguments = json!([call.arguments]);
+        assert!(execute_checkpoint(&input, &call, ReplayPolicy::Safe).is_err());
+        // Under arbitrary_precision these remain non-native tokens; baseline
+        // serde_json may normalize them or reject them at parse time instead.
+        for token in [
+            "18446744073709551616",
+            "1e999",
+            "1.00000000000000000001",
+            "1e0",
+        ] {
+            if let Ok(value) = serde_json::from_str::<Value>(token) {
+                let retained_token = value.to_string();
+                if retained_token == token {
+                    call.arguments = value;
+                    assert!(
+                        execute_checkpoint(&input, &call, ReplayPolicy::Safe).is_err(),
+                        "{token}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

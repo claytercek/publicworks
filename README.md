@@ -300,10 +300,15 @@ cargo run -p publicworks-agent --example agent_turn
 
 The example uses a fake provider and tool; no credentials or network are needed.
 Requests pin model identity, instructions, offered tool versions, and projected
-messages. Calls execute one at a time after durable intent. An interrupted tool
-is not replayed: it records an uncertain-effect error, then the turn continues
-under its model-round limit. A model can request a similar action with a new call
-ID, so approvals and external idempotency remain application responsibilities.
+messages. Calls execute one at a time after durable intent. Tools default to
+`ReplayPolicy::Unsafe`: an interrupted tool records an uncertain-effect error,
+then the turn continues under its model-round limit. Opt in locally with
+`tool.with_replay_policy(ReplayPolicy::Safe)`. Recovery re-executes only if the
+stored policy and currently selected same-name/version tool are both safe, using
+stored effective arguments without rerunning `beforeTool`. See the
+replay contract. A model can request a
+similar action with a new call ID, so approvals and external idempotency remain
+application responsibilities.
 Cancellation does not undo effects. See the
 agent contract for the API and limits.
 

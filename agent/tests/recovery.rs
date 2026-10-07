@@ -352,7 +352,7 @@ fn restart_before_model_commit_replays_the_pinned_request_not_later_context_or_i
 }
 
 #[test]
-fn in_flight_recovery_never_reexecutes_and_later_requests_resolve_current_offers() {
+fn default_unsafe_recovery_never_reexecutes_and_later_requests_resolve_current_offers() {
     block_on(bounded(async {
         let db = Database::new();
         let entered = Gate::default();
@@ -389,7 +389,7 @@ fn in_flight_recovery_never_reexecutes_and_later_requests_resolve_current_offers
                 assert_eq!(
                     effects.get(),
                     1,
-                    "effect starts only after the in_flight ACK"
+                    "effect starts only after the execute intent ACK"
                 );
                 runner.close().await.unwrap();
                 assert_eq!(run.await.unwrap(), RunResult::Interrupted);
@@ -605,7 +605,7 @@ fn restart_after_result_commit_before_parent_resume_does_not_repeat_effect_or_re
         let (conversation, root) = or(
             async {
                 let conversation = create_conversation(&session).await;
-                let root = admit(&session, agent, conversation, "exactly once probe").await;
+                let root = admit(&session, agent, conversation, "durable result probe").await;
                 drop(runner.run(root.task_id));
                 committed.wait().await;
                 (conversation, root)
@@ -661,3 +661,6 @@ fn restart_after_result_commit_before_parent_resume_does_not_repeat_effect_or_re
         }, sd).await;
     }));
 }
+
+#[path = "recovery/replay.rs"]
+mod replay;

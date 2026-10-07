@@ -57,8 +57,8 @@ pub struct LifecycleHooks {
     /// subsequent hooks and are revalidated before intent.
     pub before_tool: Option<Hook<ToolCall, BeforeTool>>,
     /// Optionally replaces the result after execution. It does not change task
-    /// status or replay policy, and is not called for unavailable, blocked,
-    /// aborted, or recovered in-flight work.
+    /// status or replay policy. Not called for unavailable, blocked, aborted, or
+    /// interrupted work that cannot replay; safe replay uses this chain.
     pub after_tool: Option<Hook<ToolOutcome, Option<ToolResult>>>,
     /// Observes tool outcomes after the last child settles and before the
     /// post-tools boundary.
