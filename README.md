@@ -140,7 +140,10 @@ blocks. Dropping a task waiter abandons only that observation. Replacing the
 immutable `TaskRegistry` snapshot wakes blocked work; every reservation retains
 one stable snapshot. Missing or non-exact definitions leave normal work pending,
 while abort-marked work without an exact definition becomes orphaned only after
-owned work drains.
+owned work drains. A known no-effect reservation rejection parks until a later
+wakeup or explicit resume rather than busy-spinning. Uncertain persistence or an
+unrecoverable invocation settlement error seals the Harness, rejects observers,
+and is reported by close; handler code is not replayed speculatively.
 
 Close through `harness.close()` while continuing to poll `HarnessDriver`. Close
 seals public admission, signals and joins every active invocation, drains admitted
