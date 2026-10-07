@@ -746,6 +746,7 @@ dependencies = [
  "futures-lite",
  "publicworks-runtime",
  "rusqlite",
+ "serde",
  "serde_json",
 ]
 
