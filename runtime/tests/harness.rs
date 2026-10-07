@@ -923,8 +923,8 @@ fn same_version_replacement_is_adopted_at_the_next_phase_boundary() {
 }
 
 #[test]
-fn missing_or_incompatible_replacement_keeps_the_active_snapshot() {
-    for incompatible in [false, true] {
+fn phase_identity_expires_even_when_definitions_are_retained() {
+    for publication in ["none", "missing", "incompatible"] {
         block_on(async move {
             let (entered_sender, entered_receiver) = oneshot::channel();
             let entered_sender = Rc::new(std::cell::RefCell::new(Some(entered_sender)));
@@ -969,13 +969,20 @@ fn missing_or_incompatible_replacement_keeps_the_active_snapshot() {
                     let first_runtime = first_runtime.borrow().clone().unwrap();
                     let retained_calls = retained_calls.clone();
                     Box::pin(async move {
-                        first_runtime
-                            .read(|_, _| Box::pin(async { Ok(()) }))
-                            .await
-                            .map_err(|error| TaskOutcomeError {
-                                message: error.to_string(),
-                                detail: None,
-                            })?;
+                        assert!(first_runtime.is_cancelled());
+                        assert!(matches!(
+                            first_runtime.read(|_, _| Box::pin(async { Ok(()) })).await,
+                            Err(SessionError::Invalid(_))
+                        ));
+                        assert!(matches!(
+                            first_runtime.memo("winner").await,
+                            Err(SessionError::Invalid(_))
+                        ));
+                        assert!(matches!(
+                            first_runtime.memo_or_insert("late", json!(true)).await,
+                            Err(SessionError::Invalid(_))
+                        ));
+                        assert_eq!(runtime.memo("late").await.unwrap().value, None);
                         retained_calls.set(retained_calls.get() + 1);
                         runtime
                             .commit(|_, _| {
@@ -1025,7 +1032,7 @@ fn missing_or_incompatible_replacement_keeps_the_active_snapshot() {
                     .value;
                 harness.resume().unwrap();
                 entered_receiver.await.unwrap();
-                let replacement = if incompatible {
+                let replacement = if publication == "incompatible" {
                     TaskRegistry::new([TaskDefinition::new(
                         "retained",
                         2,
@@ -1036,7 +1043,9 @@ fn missing_or_incompatible_replacement_keeps_the_active_snapshot() {
                 } else {
                     TaskRegistry::default()
                 };
-                harness.replace_registry(replacement).unwrap();
+                if publication != "none" {
+                    harness.replace_registry(replacement).unwrap();
+                }
                 release_sender.send(()).unwrap();
 
                 let terminal = harness.wait_task(task.id).await.unwrap();

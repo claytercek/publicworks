@@ -67,8 +67,8 @@ pub struct LifecycleHooks {
 
 /// Provides cancellation and durable first-writer-wins memo access for one
 /// hook invocation. Memo keys are scoped to the extension name within the task,
-/// so a same-name replacement shares winners. Retaining this context cannot
-/// extend the invocation's write lifetime.
+/// so a same-name replacement shares winners. Terminal tasks discard memos.
+/// Retaining this context cannot extend the phase invocation's access lifetime.
 #[derive(Clone)]
 pub struct HookContext {
     runtime: TaskRuntime,

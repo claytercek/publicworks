@@ -959,3 +959,11 @@ fn task_driver_drop_fences_unstarted_memo_writes_but_not_started_storage_commits
         });
     }
 }
+
+#[path = "support/phase_lifetime.rs"]
+mod phase_lifetime;
+
+#[test]
+fn phase_handoff_joins_dropped_mutations_and_fences_retained_runtime() {
+    block_on(phase_lifetime::phase_handoff(MemoryStorage::new()));
+}

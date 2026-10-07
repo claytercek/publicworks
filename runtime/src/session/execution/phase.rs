@@ -157,12 +157,16 @@ async fn execute_inner(
                                 .get(&record.kind)
                                 .is_some_and(|definition| definition.version == record.version)
                         });
-                    let (inv, definitions, generation) =
+                    let (definitions, generation) =
                         if let Some((generation, replacement)) = replacement {
-                            (handoff(tx, &inv), replacement, Some(generation))
+                            (replacement, Some(generation))
                         } else {
-                            (inv, definitions, generation)
+                            (definitions, generation)
                         };
+                    // Definition retention must not extend a phase's access
+                    // lifetime. This Session-line join precedes every dispatch,
+                    // including boundaries with no compatible publication.
+                    let inv = if at_boundary { handoff(tx, &inv) } else { inv };
                     let definition = definitions
                         .0
                         .get(&record.kind)

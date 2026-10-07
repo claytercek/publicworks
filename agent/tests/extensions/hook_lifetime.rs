@@ -470,3 +470,96 @@ fn sqlite_reopen_reuses_hook_memo_after_unsettled_request() {
         .await;
     }));
 }
+
+async fn retained_context_next_phase(storage: impl Storage + 'static) {
+    let retained = Rc::new(RefCell::new(None::<HookContext>));
+    let next_phase = Gate::default();
+    let release = Gate::default();
+    let mut registry = AgentRegistry::new();
+    registry
+        .install(
+            Extension::new(
+                "local",
+                vec![Tool::new(
+                    declaration("effect", 1),
+                    |_| Ok(()),
+                    |_, _| Box::pin(async { Ok(output("effect")) }),
+                )],
+            )
+            .with_hooks(LifecycleHooks {
+                after_tools: Some(Rc::new({
+                    let retained = retained.clone();
+                    move |_, ctx| {
+                        *retained.borrow_mut() = Some(ctx.clone());
+                        Box::pin(async move {
+                            ctx.memo_or_insert("winner", json!(42)).await.unwrap();
+                            Ok(())
+                        })
+                    }
+                })),
+                before_request: Some(Rc::new({
+                    let retained = retained.clone();
+                    let next_phase = next_phase.clone();
+                    let release = release.clone();
+                    move |_, ctx| {
+                        let second = retained.borrow().is_some();
+                        let next_phase = next_phase.clone();
+                        let release = release.clone();
+                        Box::pin(async move {
+                            if second {
+                                assert_eq!(ctx.memo("winner").await.unwrap(), Some(json!(42)));
+                                next_phase.release();
+                                release.wait().await;
+                                assert_eq!(ctx.memo("late").await.unwrap(), None);
+                            }
+                            Ok(None)
+                        })
+                    }
+                })),
+                ..LifecycleHooks::default()
+            }),
+        )
+        .unwrap();
+    let a = Agent::with_registry(model(), registry.snapshot(), None);
+    let (open, driver) = Harness::open(storage, TaskRegistry::new(a.definitions()).unwrap());
+    zip(
+        async {
+            let h = open.await.unwrap();
+            let c = conversation(&h).await;
+            let receipt = a
+                .submit(&h, c, "test", turn_config(), SubmitOptions::default())
+                .await
+                .unwrap();
+            // No publication, wait, or terminal transition separates the tools,
+            // prepare, and request phases on this turn task.
+            next_phase.wait().await;
+            let old = retained.borrow().clone().unwrap();
+            assert!(old.cancellation().is_cancelled());
+            assert!(matches!(
+                old.memo("winner").await,
+                Err(SessionError::Invalid(_))
+            ));
+            assert!(matches!(
+                old.memo_or_insert("late", json!(true)).await,
+                Err(SessionError::Invalid(_))
+            ));
+            release.release();
+            receipt.wait().await.unwrap();
+            h.wait_for_idle().await.unwrap();
+            h.close().await.unwrap();
+        },
+        driver,
+    )
+    .await;
+}
+
+#[test]
+fn memory_retained_hook_context_is_fenced_during_next_phase() {
+    block_on(bounded(retained_context_next_phase(MemoryStorage::new())));
+}
+
+#[test]
+fn sqlite_retained_hook_context_is_fenced_during_next_phase() {
+    let db = Database::new();
+    block_on(bounded(retained_context_next_phase(db.open())));
+}

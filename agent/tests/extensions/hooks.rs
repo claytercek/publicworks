@@ -470,3 +470,125 @@ fn sqlite_rewritten_offers_and_batch_error_results() {
         block_on(bounded(batch_and_offers(db.open(), remove)));
     }
 }
+
+async fn invalid_request_replacement(storage: impl Storage + 'static, invalid: &'static str) {
+    let constructed = Rc::new(Cell::new(0));
+    let mut registry = AgentRegistry::new();
+    registry
+        .install(
+            Extension::new("invalid", vec![]).with_hooks(LifecycleHooks {
+                before_request: Some(Rc::new(move |mut request, _| {
+                    let call = ToolCall {
+                        id: "call".into(),
+                        name: "effect".into(),
+                        arguments: json!({}),
+                    };
+                    match invalid {
+                        "model" => request.model.clear(),
+                        "tool-name" => request.tools = vec![declaration("", 1)],
+                        "duplicate-tools" => request.tools = vec![declaration("effect", 1); 2],
+                        "call-id" | "call-name" | "duplicate-calls" | "deep-message" => {
+                            let mut call = call;
+                            match invalid {
+                                "call-id" => call.id.clear(),
+                                "call-name" => call.name.clear(),
+                                "deep-message" => {
+                                    call.arguments =
+                                        (0..MAX_JSON_DEPTH).fold(Value::Null, |v, _| json!([v]))
+                                }
+                                _ => {}
+                            }
+                            request.messages.push(ModelMessage::Assistant {
+                                text: String::new(),
+                                tool_calls: vec![
+                                    call;
+                                    if invalid == "duplicate-calls" { 2 } else { 1 }
+                                ],
+                            });
+                        }
+                        "result-id" => request.messages.push(ModelMessage::ToolResult {
+                            call_id: String::new(),
+                            content: String::new(),
+                            is_error: false,
+                        }),
+                        "deep-tools" => {
+                            let mut tool = declaration("effect", 1);
+                            tool.parameters =
+                                (0..MAX_JSON_DEPTH).fold(Value::Null, |v, _| json!([v]));
+                            request.tools = vec![tool];
+                        }
+                        _ => unreachable!(),
+                    }
+                    Box::pin(async move { Ok(Some(request)) })
+                })),
+                ..LifecycleHooks::default()
+            }),
+        )
+        .unwrap();
+    let a = Agent::with_registry(
+        {
+            let constructed = constructed.clone();
+            move |_: ModelRequest, _: Cancellation| -> ModelFuture {
+                // Count construction, not polling; a caught panic alone could mask this bug.
+                constructed.set(constructed.get() + 1);
+                Box::pin(async { Ok(response(&[])) })
+            }
+        },
+        registry.snapshot(),
+        None,
+    );
+    let (open, driver) = Harness::open(storage, TaskRegistry::new(a.definitions()).unwrap());
+    zip(
+        async {
+            let h = open.await.unwrap();
+            let c = conversation(&h).await;
+            a.submit(&h, c, "test", turn_config(), SubmitOptions::default())
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .unwrap();
+            h.wait_for_idle().await.unwrap();
+            assert_eq!(constructed.get(), 0, "invalid replacement: {invalid}");
+            assert!(
+                !entries(&h, c)
+                    .await
+                    .iter()
+                    .any(|entry| entry.kind == "agent.assistant")
+            );
+            h.close().await.unwrap();
+        },
+        driver,
+    )
+    .await;
+}
+
+const INVALID_REQUESTS: &[&str] = &[
+    "model",
+    "tool-name",
+    "duplicate-tools",
+    "call-id",
+    "call-name",
+    "duplicate-calls",
+    "result-id",
+    "deep-tools",
+    "deep-message",
+];
+
+#[test]
+fn memory_invalid_before_request_never_constructs_model() {
+    for invalid in INVALID_REQUESTS {
+        block_on(bounded(invalid_request_replacement(
+            MemoryStorage::new(),
+            invalid,
+        )));
+    }
+}
+
+#[test]
+fn sqlite_invalid_before_request_never_constructs_model() {
+    for invalid in INVALID_REQUESTS {
+        let db = Database::new();
+        block_on(bounded(invalid_request_replacement(db.open(), invalid)));
+    }
+}

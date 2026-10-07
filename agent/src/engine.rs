@@ -834,6 +834,9 @@ fn checkpoint(task: &TaskRecord) -> Result<&Value, SessionError> {
     }
 }
 fn validate_request(request: &ModelRequest) -> Result<(), SessionError> {
+    if request.model.is_empty() {
+        return Err(invalid("Model identity required"));
+    }
     let tools = Value::Array(request.tools.iter().map(declaration).collect());
     declarations(&tools)?;
     for message in &request.messages {

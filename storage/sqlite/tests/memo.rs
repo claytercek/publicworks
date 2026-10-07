@@ -416,3 +416,12 @@ fn abort_checkpoint_restart_can_read_the_normal_phase_memo() {
         assert!(stored(&db, id).await.memos.is_none());
     });
 }
+
+#[path = "../../../runtime/tests/support/phase_lifetime.rs"]
+mod phase_lifetime;
+
+#[test]
+fn phase_handoff_joins_dropped_mutations_and_fences_retained_runtime() {
+    let db = Database::new("phase-lifetime");
+    block_on(phase_lifetime::phase_handoff(db.open()));
+}
