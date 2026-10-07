@@ -47,11 +47,12 @@ fn create_append_show_across_processes() {
     assert_eq!(created["conversationId"], 2);
     assert_eq!(created["commitSeq"], 1);
     let appended = success(&["append", db, "2", "hello durable world"]);
-    assert_eq!(appended["entryId"], 3);
+    let entry_id = appended["entryId"].as_u64().unwrap();
+    assert!(entry_id > 2); // Reopening may abandon the prior process's ID lease.
     assert_eq!(appended["commitSeq"], 2);
     let shown = success(&["show", db, "2"]);
     assert_eq!(shown["entries"][0]["data"]["text"], "hello durable world");
-    assert_eq!(shown["entries"][0]["id"], 3);
+    assert_eq!(shown["entries"][0]["id"], entry_id);
     for args in [
         ["append", db, "99", "no"].as_slice(),
         ["show", db, "99"].as_slice(),
@@ -61,7 +62,7 @@ fn create_append_show_across_processes() {
         assert!(failed.stdout.is_empty());
         assert!(String::from_utf8_lossy(&failed.stderr).contains("Unknown conversation"));
     }
-    assert_eq!(success(&["create", db])["conversationId"], 4);
+    assert!(success(&["create", db])["conversationId"].as_u64().unwrap() > entry_id);
     let missing = dir.0.join("missing.db");
     assert!(
         !invoke(&["show", missing.to_str().unwrap(), "1"])
