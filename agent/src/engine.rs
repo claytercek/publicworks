@@ -351,10 +351,11 @@ impl Agent {
                     .get(index)
                     .ok_or_else(|| invalid("Invalid tool index"))?
                     .clone();
+                let mut known_current_result = false;
                 if index + 1 == calls.len() {
                     let resolved = self.resolve(&runtime).await?;
                     let observed_calls = calls.clone();
-                    let outcomes = runtime
+                    let (outcomes, recorded) = runtime
                         .read(move |tx, task| {
                             Box::pin(async move {
                                 let settled = tx
@@ -372,6 +373,7 @@ impl Agent {
                         })
                         .await?
                         .value;
+                    known_current_result = recorded.contains(&call.id);
                     resolved.after_tools(&runtime, outcomes).await?;
                 }
                 let agent = self.clone();
@@ -387,10 +389,17 @@ impl Agent {
                             {
                                 return Err(invalid("Tool child not settled or wrong owner"));
                             }
-                            let recorded = result_ids(tx, task.conversation_id, assistant).await?;
+                            let recorded = if known_current_result {
+                                None
+                            } else {
+                                Some(result_ids(tx, task.conversation_id, assistant).await?)
+                            };
                             let mut boundary = Boundary::read(tx, task.conversation_id).await?;
                             boundary.require_run(task.id)?;
-                            if !recorded.contains(&call.id) {
+                            if recorded
+                                .as_ref()
+                                .is_some_and(|recorded| !recorded.contains(&call.id))
+                            {
                                 append_result(
                                     tx,
                                     task.conversation_id,
@@ -1006,7 +1015,7 @@ async fn tool_outcomes(
     conversation: Id,
     assistant: Id,
     calls: Vec<ToolCall>,
-) -> Result<Vec<ToolOutcome>, SessionError> {
+) -> Result<(Vec<ToolOutcome>, BTreeSet<String>), SessionError> {
     let mut results = BTreeMap::new();
     let mut cursor = None;
     loop {
@@ -1049,7 +1058,8 @@ async fn tool_outcomes(
             break;
         }
     }
-    Ok(calls
+    let recorded = results.keys().cloned().collect();
+    let outcomes = calls
         .into_iter()
         .map(|call| {
             let result = results.remove(&call.id).unwrap_or_else(|| ToolResult {
@@ -1059,7 +1069,8 @@ async fn tool_outcomes(
             });
             ToolOutcome { call, result }
         })
-        .collect())
+        .collect();
+    Ok((outcomes, recorded))
 }
 async fn result_ids(
     tx: &Tx,
