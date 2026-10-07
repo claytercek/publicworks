@@ -58,7 +58,7 @@ The in-memory and SQLite storage adapters return boxed futures but **block while
 polled**. The opt-in HTTP provider uses asynchronous network I/O. SQLite uses WAL,
 NORMAL synchronization, and one transaction per batch. This is an embedded,
 single-logical-owner foundation, not a multiwriter runtime or a power-loss
-persistence guarantee. The current schema is Public Works' own v3. There are no
+persistence guarantee. The current schema is Public Works' own v4. There are no
 existing users or schema migrations: incompatible databases reject without being
 deleted or rewritten. Use a new path or manually recreate a disposable development
 database when the format changes. Backward compatibility is not promised during
@@ -337,10 +337,20 @@ Harness definition map in one publication and wakes scheduling. Old phases keep
 their captured code. Later compatible phase boundaries use the new definitions.
 Request preparation pins selected tool declarations, while each tool call checks
 current selection against its captured phase snapshot. An accepted implementation
-stays pinned through its effect and result. Callbacks are never persisted and
-must be reinstalled on restart. See the
+stays pinned through its effect and result. Add provider-neutral callbacks with
+`Extension::with_hooks(LifecycleHooks { .. })`: the implemented sites are
+`before_request`, `after_response`, `before_tool`, `after_tool`, and `after_tools`.
+Hooks run in selected-extension order outside storage transactions. `HookContext`
+provides cooperative cancellation and invocation-fenced, first-writer-wins memos;
+it does not expose raw transaction or task-transition access. Ordinary hook errors
+are recorded, and `before_tool` errors additionally fail closed as a blocked call.
+
+Callbacks are never persisted and must be reinstalled on restart. Prompt sections,
+wrappers, filters, yield hooks, and compaction hooks remain deferred until the agent
+has corresponding provider-neutral request or lifecycle models. See the
 extension contract
-for the configuration wire format, definition-version change, and remaining scope.
+for the configuration wire format, definition-version change, hook composition,
+and remaining scope.
 
 ## Opt in to OpenAI Responses
 
