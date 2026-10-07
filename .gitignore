@@ -21,3 +21,8 @@
 *.sqlite3-journal
 *.sqlite3-shm
 *.sqlite3-wal
+
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
