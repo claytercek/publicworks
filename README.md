@@ -2,12 +2,13 @@
 
 Public Works is our own Rust runtime project, modeled on Pi Durable. The working
 slice is a **Session transaction layer for conversations, immutable entries, and
-durable tasks**, with in-memory and SQLite storage. Hosts can explicitly run
-foreground task trees as checkpointed phase handlers, with durable waits, held
-outcomes, subtree cancellation, and bottom-up abort cleanup. Startup normalization
-changes interrupted running tasks back to pending. A provider-neutral agent layer
-adds durable model/tool turns using host-supplied callbacks. There is no automatic
-scheduler. An opt-in OpenAI Responses package provides asynchronous networking
+durable tasks**, with in-memory and SQLite storage. A host-polled `Harness` opens and reconciles
+all supported foreground task trees, then atomically reserves every eligible task
+and polls their local handler futures concurrently after explicit `resume`.
+Durable waits, held outcomes, cancellation cascades, task observation, and orderly
+join-before-storage-close are included. The lower-level explicit-root `TaskRunner`
+remains available. A provider-neutral agent layer adds durable model/tool turns
+using host-supplied callbacks. An opt-in OpenAI Responses package provides asynchronous networking
 without adding a provider or executor dependency to the core libraries.
 
 ## Try the persistence demo
@@ -39,7 +40,8 @@ from allocation but is not automatically created; ordinary IDs start at 2.
 - `runtime/` — `publicworks-runtime`: records, object-safe async-compatible
   `Storage`, `Session`/`Tx`, host-polled `SessionDriver`, fork-aware reads, and
   task creation/ownership validation, startup normalization, a host-polled
-  `TaskRunner`/`TaskDriver`, and public `MemoryStorage`. Uses serde/serde_json and small futures primitives;
+  `Harness`/`HarnessDriver`, the lower-level `TaskRunner`/`TaskDriver`, and public
+  `MemoryStorage`. Uses serde/serde_json and small futures primitives;
   no SQL, Tokio, or executor dependency.
 - `agent/` — `publicworks-agent`: immutable model/tool installation, atomic turn
   admission, pinned requests, fork-aware context projection, ordered tool children,
@@ -117,7 +119,41 @@ public commit stream or view subscription yet, so no subscriber queue to grow.
 See the design contract for the boundary
 between inherited Pi behavior and Rust driver/cancellation mapping.
 
-## Create and execute a task tree
+## Schedule all ready task trees with a Harness
+
+`Harness::open(storage, registry)` returns an opening waiter and one
+`HarnessDriver`. Poll the driver while awaiting opening and for the full lifetime
+of the returned `Harness`. Opening scans the task graph, atomically normalizes
+interrupted `running` records to `pending`, and schedules code-free reconciliation.
+It never invokes a definition or handler.
+
+The scheduler remains paused until `harness.resume()`. Resume is idempotent and
+permanently enables progress. Each drain reconciles committed records and changes
+**all** currently eligible tasks from `pending` to `running` in one Session
+transaction. Handler futures start only after that batch is acknowledged. They are
+then polled concurrently by the same local driver; the runtime spawns no executor
+work and requires neither `Send` nor Tokio.
+
+Use `harness.commit` for application transactions, `wait_task` for a committed
+terminal record, and `inspect` for a detached view of live tasks and scheduler
+blocks. Dropping a task waiter abandons only that observation. Replacing the
+immutable `TaskRegistry` snapshot wakes blocked work; every reservation retains
+one stable snapshot. Missing or non-exact definitions leave normal work pending,
+while abort-marked work without an exact definition becomes orphaned only after
+owned work drains.
+
+Close through `harness.close()` while continuing to poll `HarnessDriver`. Close
+seals public admission, signals and joins every active invocation, drains admitted
+Session work, and only then closes Storage. A noncooperative handler can keep close
+pending. Dropping the driver is forfeiture: late runtime access is fenced, but an
+in-flight persistence operation or external effect may have an uncertain outcome.
+
+The current Harness intentionally schedules only the foreground ownership topology
+already supported by `TaskRunner`. Task-owned conversations, background traversal,
+conversation handles, and scoped idle waits remain the next ownership-lifecycle
+phase in the implementation plan.
+
+## Create and execute one task tree explicitly
 
 `TaskDefinition::new(kind, version, initial, phases)` combines a reusable
 synchronous initial-checkpoint function with a `BTreeMap<String, PhaseHandler>`.
@@ -147,8 +183,9 @@ require `Session::open_recovered` first. Terminal roots return `Blocked(NotPendi
 Normal execution requires an exact definition version. A blocked root does not
 prevent eligible children from running. `RunResult::Terminal` is a durable root
 receipt; `Suspended(TaskRecord)` is the durable root at quiescence, when no
-supported work can execute. There is no global scheduler, timer, or automatic
-retry: explicitly run the root again when an observed external dependency changes.
+supported work can execute. `TaskRunner` itself has no global scheduler, timer,
+or automatic retry: explicitly run the root again when an observed external
+dependency changes, or use a Harness for Harness-wide progress.
 
 A handler receives its detached task and a `TaskRuntime`. It calls
 `runtime.commit(|tx, current| ...)` to atomically write entries and return an
@@ -258,8 +295,9 @@ handler. It must commit `Abort`, `Complete`, or `Fail`. Returning without an out
 faults, even after checkpoint or entry writes. Abort dispatch does not validate
 the normal checkpoint's phase.
 
-An **inactive** marked task needs an explicit `runner.run(root)` to execute
-cleanup. There is no automatic scan or cleanup queue. Never await your own
+With the lower-level `TaskRunner`, an **inactive** marked task needs an explicit
+`runner.run(root)` to execute cleanup. A resumed Harness instead notices the
+committed mark and schedules eligible cleanup automatically. Never await your own
 `runner.abort(id)` from its current normal handler: it joins that invocation and
 would deadlock. Enqueuing without awaiting is allowed.
 
@@ -281,12 +319,12 @@ replacement batch; checkpoints, input, version, owner, flags, and memos survive.
 Plain `Session::new` remains unchanged.
 
 Opening runs no task code. Unknown kinds/versions are preserved, and waiting,
-completing, and terminal states are not reconciled. After opening, explicitly
-attach a runner and request each desired root run. Waits, completing outcomes,
-and cascades are reconciled lazily by those explicit runs, not on opening as in
-Pi's full scheduler. There is no definition migration or
-schema migration framework. Dropping the opening waiter still leaves normalization
-and close owned by the driver. See the task persistence contract.
+completing, and terminal states are not reconciled by this lower-level API. After
+opening, explicitly attach a runner and request each desired root run. Prefer
+`Harness::open` when the host wants Harness-wide reconciliation, reservation, and
+automatic progress after one resume. Neither path performs definition or schema
+migration. Dropping the Session opening waiter still leaves normalization and
+close owned by the driver. See the task persistence contract.
 
 ## Development
 
