@@ -4,7 +4,7 @@ use crate::error;
 use publicworks_agent::{
     FinishReason, ModelError, ModelMessage, ModelRequest, ModelResponse, ToolCall,
 };
-use publicworks_runtime::{EntryRecord, ROOT_CONVERSATION, decode_native_json};
+use publicworks_runtime::{decode_native_json, validate_native_json_value};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -102,9 +102,7 @@ pub(super) fn encode_request(request: &ModelRequest) -> Result<Vec<u8>, ModelErr
 }
 
 fn validate_payload(value: &Value) -> Result<(), publicworks_runtime::StorageError> {
-    let mut entry = EntryRecord::new(ROOT_CONVERSATION, ROOT_CONVERSATION, "validation");
-    entry.data = Some(value.clone());
-    entry.validate_payloads()
+    validate_native_json_value(value, 0)
 }
 
 #[allow(

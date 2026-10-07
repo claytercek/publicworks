@@ -146,7 +146,7 @@ impl Agent {
                 ModelMessage::User { text: text.clone() },
                 None,
             );
-            validate_entry(draft.model, None)?;
+            validate_entry(draft.model.as_deref(), None)?;
             let submission = tx
                 .create_submission(conversation, SubmissionType::Input, options.request_id)
                 .await?;
@@ -205,7 +205,7 @@ impl Agent {
                 return Ok(id);
             }
             let mut boundary = Boundary::read(tx, conversation).await?;
-            validate_entry(draft.model.clone(), draft.data.clone())?;
+            validate_entry(draft.model.as_deref(), draft.data.as_ref())?;
             let payload = encode_write(&draft, options.expected_head)?;
             let submission = tx
                 .create_submission(conversation, SubmissionType::Write, options.request_id)
@@ -447,7 +447,7 @@ fn encode_write(draft: &EntryDraft, expected: ExpectedHead) -> Result<Value, Ses
     if let ExpectedHead::Exact(head) = expected {
         value["expectedHead"] = json!(head);
     }
-    validate_entry(None, Some(value.clone()))?;
+    validate_entry(None, Some(&value))?;
     Ok(value)
 }
 fn decode_write(value: &Value) -> Result<(EntryDraft, ExpectedHead), SessionError> {

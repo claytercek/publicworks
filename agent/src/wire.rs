@@ -65,7 +65,7 @@ pub fn encode_message(message: &ModelMessage) -> Value {
     }
 }
 pub fn decode_message(value: &Value) -> Result<ModelMessage, SessionError> {
-    validate_entry(Some(vec![value.clone()]), None)?;
+    validate_entry(Some(std::slice::from_ref(value)), None)?;
     match string(value, "role")?.as_str() {
         "user" => {
             keys(value, &["role", "text"])?;
@@ -143,16 +143,14 @@ pub(crate) fn declarations(value: &Value) -> Result<Vec<ToolDeclaration>, Sessio
 }
 /// Use the kernel's native JSON domain checks, including wrapper depth.
 pub(crate) fn validate_entry(
-    model: Option<Vec<Value>>,
-    data: Option<Value>,
+    model: Option<&[Value]>,
+    data: Option<&Value>,
 ) -> Result<(), SessionError> {
-    let mut entry = publicworks_runtime::EntryRecord::new(
-        publicworks_runtime::ROOT_CONVERSATION,
-        publicworks_runtime::ROOT_CONVERSATION,
-        "validation",
-    );
-    entry.model = model;
-    entry.data = data;
-    entry.validate_payloads()?;
+    for message in model.into_iter().flatten() {
+        publicworks_runtime::validate_native_json_value(message, 1)?;
+    }
+    if let Some(data) = data {
+        publicworks_runtime::validate_native_json_value(data, 0)?;
+    }
     Ok(())
 }

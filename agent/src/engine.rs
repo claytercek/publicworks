@@ -484,7 +484,7 @@ impl Agent {
                     });
                     if let Some(usage) = usage {
                         data["usage"] = usage;
-                        if validate_entry(None, Some(data.clone())).is_err() {
+                        if validate_entry(None, Some(&data)).is_err() {
                             data.as_object_mut()
                                 .expect("diagnostic object")
                                 .remove("usage");
@@ -499,7 +499,7 @@ impl Agent {
                                 FinishReason::ToolCalls => "toolCalls",
                             }
                         });
-                        if validate_entry(None, Some(data.clone())).is_err() {
+                        if validate_entry(None, Some(&data)).is_err() {
                             data.as_object_mut()
                                 .expect("diagnostic object")
                                 .remove("partialResponse");
@@ -507,7 +507,7 @@ impl Agent {
                         } else if let Some(usage) = partial.usage {
                             data["partialResponse"]["usage"] = usage;
                             // Validate in the actual, deeper partial-response envelope.
-                            if validate_entry(None, Some(data.clone())).is_err() {
+                            if validate_entry(None, Some(&data)).is_err() {
                                 data["partialResponse"]
                                     .as_object_mut()
                                     .expect("partial object")
@@ -669,13 +669,11 @@ impl Agent {
                 Some("Tool version mismatch".to_owned())
             }
             (_, Some(tool)) => {
-                validate_entry(
-                    Some(vec![encode_message(&ModelMessage::Assistant {
-                        text: String::new(),
-                        tool_calls: vec![call.clone()],
-                    })]),
-                    None,
-                )?;
+                let validation = [encode_message(&ModelMessage::Assistant {
+                    text: String::new(),
+                    tool_calls: vec![call.clone()],
+                })];
+                validate_entry(Some(&validation), None)?;
                 (tool.validate)(&call.arguments).err()
             }
         };
@@ -706,17 +704,15 @@ impl Agent {
             {
                 return None;
             }
-            validate_entry(
-                Some(vec![encode_message(&ModelMessage::Assistant {
-                    text: String::new(),
-                    tool_calls: vec![call.clone()],
-                })]),
-                None,
-            )
-            .map_err(|e| e.to_string())
-            .and_then(|()| (tool.validate)(&call.arguments))
-            .err()
-            .map(|message| (message, "invalid_tool_call"))
+            let validation = [encode_message(&ModelMessage::Assistant {
+                text: String::new(),
+                tool_calls: vec![call.clone()],
+            })];
+            validate_entry(Some(&validation), None)
+                .map_err(|e| e.to_string())
+                .and_then(|()| (tool.validate)(&call.arguments))
+                .err()
+                .map(|message| (message, "invalid_tool_call"))
         });
         if let Some((message, code)) = rejection {
             return finish_tool(
@@ -822,7 +818,7 @@ pub(crate) fn decode_input(input: &Value) -> Result<TurnConfig, SessionError> {
         max_model_rounds: number(cfg, "maxModelRounds")?,
     };
     validate_config(&config)?;
-    validate_entry(None, Some(input.clone()))?;
+    validate_entry(None, Some(input))?;
     Ok(config)
 }
 fn checkpoint(task: &TaskRecord) -> Result<&Value, SessionError> {
@@ -839,13 +835,16 @@ fn validate_request(request: &ModelRequest) -> Result<(), SessionError> {
     }
     let tools = Value::Array(request.tools.iter().map(declaration).collect());
     declarations(&tools)?;
-    for message in &request.messages {
-        decode_message(&encode_message(message))?;
+    let messages = request
+        .messages
+        .iter()
+        .map(encode_message)
+        .collect::<Vec<_>>();
+    for message in &messages {
+        decode_message(message)?;
     }
-    validate_entry(
-        Some(request.messages.iter().map(encode_message).collect()),
-        Some(json!({"model":request.model,"instructions":request.instructions,"tools":tools})),
-    )
+    let data = json!({"model":request.model,"instructions":request.instructions,"tools":tools});
+    validate_entry(Some(&messages), Some(&data))
 }
 fn decode_request(cp: &Value) -> Result<ModelRequest, SessionError> {
     id(cp, "cutoff")?;
@@ -877,10 +876,9 @@ fn validate_response(response: &ModelResponse) -> Result<(), SessionError> {
     {
         return Err(invalid("Finish reason inconsistent with tool calls"));
     }
-    validate_entry(
-        Some(vec![encoded]),
-        Some(response_data("completed", response.usage.clone())),
-    )
+    let messages = [encoded];
+    let data = response_data("completed", response.usage.clone());
+    validate_entry(Some(&messages), Some(&data))
 }
 fn response_data(status: &str, usage: Option<Value>) -> Value {
     let mut data = json!({"status":status});
@@ -967,7 +965,7 @@ fn decode_tool_checkpoint(
     cp: &Value,
     input: &ToolInput,
 ) -> Result<Option<(ToolCall, ReplayPolicy)>, SessionError> {
-    validate_entry(None, Some(cp.clone()))?;
+    validate_entry(None, Some(cp))?;
     let object = cp
         .as_object()
         .ok_or_else(|| invalid("Invalid tool checkpoint"))?;

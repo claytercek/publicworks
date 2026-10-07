@@ -38,7 +38,7 @@ impl Extension {
         for tool in &self.tools {
             let declaration = wire::declaration(tool.declaration());
             wire::decode_declaration(&declaration)?;
-            wire::validate_entry(None, Some(declaration))?;
+            wire::validate_entry(None, Some(&declaration))?;
             if !names.insert(&tool.declaration().name) {
                 return Err(invalid(format!(
                     "Duplicate tool name in extension {}: {}",

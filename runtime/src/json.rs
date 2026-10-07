@@ -155,6 +155,15 @@ impl TryFrom<WriteFields> for crate::StorageWrite {
     }
 }
 
+/// Validate a borrowed value with an existing wrapper depth.
+///
+/// This is exposed for sibling packages that must enforce the storage payload
+/// domain without first cloning a potentially large JSON graph.
+#[doc(hidden)]
+pub fn validate_native_json_value(value: &Value, wrapper_depth: usize) -> Result<(), StorageError> {
+    validate(vec![(value, wrapper_depth)])
+}
+
 pub(crate) fn validate(mut pending: Vec<(&Value, usize)>) -> Result<(), StorageError> {
     while let Some((value, parents)) = pending.pop() {
         let depth = parents + usize::from(value.is_array() || value.is_object());

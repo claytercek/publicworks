@@ -64,7 +64,7 @@ fn names(value: &Value) -> Result<Vec<String>, SessionError> {
 impl ExtensionConfig {
     /// Decode only extension fields from ConversationStateRecord.agent_config.
     pub fn decode(value: Option<&Value>) -> Result<Self, SessionError> {
-        validate_entry(None, value.cloned())?;
+        validate_entry(None, value)?;
         let object = object(value)?;
         let config = match object.get("extensionConfig") {
             None => BTreeMap::new(),

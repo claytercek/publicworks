@@ -30,6 +30,8 @@ pub use submission::{
 };
 mod json;
 pub use json::decode_native_json;
+#[doc(hidden)]
+pub use json::validate_native_json_value;
 mod memory;
 pub use memory::MemoryStorage;
 #[doc(hidden)]
@@ -220,6 +222,18 @@ pub struct StoredEntry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursor {
     after: Id,
+}
+impl Cursor {
+    /// Adapter continuation boundary. Callers should only round-trip cursors.
+    #[doc(hidden)]
+    pub fn after(&self) -> Id {
+        self.after
+    }
+    /// Construct an adapter continuation boundary.
+    #[doc(hidden)]
+    pub fn from_after(after: Id) -> Self {
+        Self { after }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Page<T> {
