@@ -92,10 +92,12 @@ fn reopen_preserves_records_allocators_and_rollback() {
                 .await
                 .is_err()
         );
-        assert_eq!(store.mint_id().await.unwrap(), id(4));
+        // The uncertain-classified failed commit abandons the remaining local
+        // lease. Reopen also abandons unused IDs; allocator gaps are intentional.
+        assert_eq!(store.mint_id().await.unwrap(), id(66));
         store.close().await.unwrap();
         let mut reopened = SqliteStorage::open(&db.path).unwrap();
-        assert_eq!(reopened.mint_id().await.unwrap(), id(5));
+        assert_eq!(reopened.mint_id().await.unwrap(), id(130));
         assert_eq!(
             reopened.conversation(id(1)).await.unwrap(),
             Some(conversation(1))
@@ -113,7 +115,33 @@ fn reopen_preserves_records_allocators_and_rollback() {
         drop(reopened); // Also exercise ordinary connection drop rather than explicit close.
         let mut again = SqliteStorage::open(&db.path).unwrap();
         assert_eq!(again.commit(vec![]).await.unwrap(), Seq::new(3).unwrap());
-        assert_eq!(again.mint_id().await.unwrap(), id(6));
+        assert_eq!(again.mint_id().await.unwrap(), id(194));
+    });
+}
+
+#[test]
+fn id_leases_are_consecutive_locally_and_skip_explicit_or_abandoned_ids() {
+    let db = Database::new();
+    futures_lite::future::block_on(async {
+        let mut store = SqliteStorage::open(&db.path).unwrap();
+        assert_eq!(store.mint_id().await.unwrap(), id(2));
+        assert_eq!(store.mint_id().await.unwrap(), id(3));
+        // A raw explicit write may claim an unminted ID inside the active lease.
+        store
+            .commit(vec![StorageWrite::Conversation(conversation(4))])
+            .await
+            .unwrap();
+        assert_eq!(store.mint_id().await.unwrap(), id(5));
+        // A write beyond the lease advances durable metadata and discards it.
+        store
+            .commit(vec![StorageWrite::Conversation(conversation(100))])
+            .await
+            .unwrap();
+        assert_eq!(store.mint_id().await.unwrap(), id(101));
+        store.close().await.unwrap();
+
+        let mut reopened = SqliteStorage::open(&db.path).unwrap();
+        assert_eq!(reopened.mint_id().await.unwrap(), id(165));
     });
 }
 
@@ -664,7 +692,7 @@ fn task_full_replacements_and_cross_kind_failures_are_atomic() {
             );
         }
         assert!(store.task(id(60)).await.unwrap().is_none());
-        assert_eq!(store.mint_id().await.unwrap(), id(5));
+        assert_eq!(store.mint_id().await.unwrap(), id(68));
         assert_eq!(store.commit(vec![]).await.unwrap(), Seq::new(4).unwrap());
     });
 }

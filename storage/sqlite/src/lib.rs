@@ -16,7 +16,10 @@ use schema::{SCHEMA, metadata};
 
 pub struct SqliteStorage {
     connection: Option<Connection>,
+    lease_next: u64,
+    lease_end: u64,
 }
+const ID_LEASE_SIZE: u64 = 64;
 fn other(error: impl std::fmt::Display) -> StorageError {
     StorageError::Other(error.to_string())
 }
@@ -80,6 +83,8 @@ impl SqliteStorage {
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint=1000;").map_err(other)?;
         Ok(Self {
             connection: Some(connection),
+            lease_next: 0,
+            lease_end: 0,
         })
     }
     fn connection(&mut self) -> Result<&mut Connection, StorageError> {
@@ -95,7 +100,8 @@ impl Storage for SqliteStorage {
             for write in &writes {
                 record::validate(write)?;
             }
-            transaction(self.connection()?, TransactionBehavior::Immediate, |tx| {
+            let highest = writes.iter().map(|write| write.id().get()).max();
+            let committed = transaction(self.connection()?, TransactionBehavior::Immediate, |tx| {
                 let (mut next_id, next_seq) = metadata(tx)?;
                 let seq = Seq::new(next_seq)?;
                 for write in &writes {
@@ -109,22 +115,63 @@ impl Storage for SqliteStorage {
                 )
                 .map_err(other)?;
                 Ok(seq)
-            })
+            });
+            match committed {
+                Ok(seq) => {
+                    if let Some(highest) = highest
+                        && highest >= self.lease_next
+                    {
+                        if highest < self.lease_end {
+                            self.lease_next = highest + 1;
+                        } else {
+                            self.lease_next = 0;
+                            self.lease_end = 0;
+                        }
+                    }
+                    Ok(seq)
+                }
+                Err(error) => {
+                    // An Other result does not guarantee rollback. Abandon the
+                    // local range so a later mint starts beyond its durable end.
+                    self.lease_next = 0;
+                    self.lease_end = 0;
+                    Err(error)
+                }
+            }
         })
     }
     fn mint_id(&mut self) -> StorageFuture<'_, Id> {
         Box::pin(async move {
-            transaction(self.connection()?, TransactionBehavior::Immediate, |tx| {
+            self.connection()?;
+            if self.lease_next < self.lease_end {
+                let id = Id::new(self.lease_next)?;
+                self.lease_next += 1;
+                return Ok(id);
+            }
+            let reserved = transaction(self.connection()?, TransactionBehavior::Immediate, |tx| {
                 let (next_id, _) = metadata(tx)?;
                 let id = Id::new(next_id)?;
+                let end = next_id.saturating_add(ID_LEASE_SIZE).min(MAX_NUMBER + 1);
                 record::execute(
                     tx,
                     "UPDATE publicworks_metadata SET next_id=?1 WHERE singleton=1",
-                    [next_id + 1],
+                    [end],
                 )
                 .map_err(other)?;
-                Ok(id)
-            })
+                Ok((id, end))
+            });
+            match reserved {
+                Ok((id, end)) => {
+                    self.lease_next = id.get() + 1;
+                    self.lease_end = end;
+                    Ok(id)
+                }
+                Err(error) => {
+                    self.lease_next = 0;
+                    self.lease_end = 0;
+                    Err(error)
+                }
+            }
         })
     }
     fn conversation(&mut self, id: Id) -> StorageFuture<'_, Option<ConversationRecord>> {
