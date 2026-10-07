@@ -500,6 +500,44 @@ impl TaskRuntime {
         })
     }
 
+    /// Read the task's durable memo named `name` from a fresh task record.
+    pub fn memo(&self, name: impl Into<String>) -> CommitWaiter<Option<Value>> {
+        let name = name.into();
+        self.read(move |_, record| {
+            Box::pin(async move {
+                Ok(record
+                    .memos
+                    .as_ref()
+                    .and_then(|memos| memos.get(&name))
+                    .cloned())
+            })
+        })
+    }
+
+    /// Atomically store `candidate` when `name` is absent and return the winner.
+    pub fn memo_or_insert(&self, name: impl Into<String>, candidate: Value) -> CommitWaiter<Value> {
+        let name = name.into();
+        self.access(false, move |tx, mut record| {
+            Box::pin(async move {
+                if let Some(winner) = record
+                    .memos
+                    .as_ref()
+                    .and_then(|memos| memos.get(&name))
+                    .cloned()
+                {
+                    return Ok((winner, None));
+                }
+                let winner = candidate.clone();
+                record
+                    .memos
+                    .get_or_insert_with(BTreeMap::new)
+                    .insert(name, candidate);
+                tx.set_task(record).await?;
+                Ok((winner, None))
+            })
+        })
+    }
+
     fn access<F, T>(&self, read_only: bool, callback: F) -> CommitWaiter<T>
     where
         T: 'static,

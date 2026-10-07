@@ -216,6 +216,78 @@ fn private_update_uses_candidates_and_preserves_read_latch_and_attribution() {
 }
 
 #[test]
+fn durable_memos_use_fresh_fifo_first_writer_wins() {
+    block_on(async {
+        let definition = definition(Rc::new(|_, runtime| {
+            Box::pin(async move {
+                let missing = runtime.memo("missing").await.unwrap();
+                assert_eq!(missing.value, None);
+                assert_eq!(missing.seq, None);
+
+                // Admission is eager and FIFO even when the first observer is dropped.
+                let first = runtime.memo_or_insert("winner", json!({"source":"first"}));
+                let mut invalid = Value::Null;
+                for _ in 0..=crate::MAX_JSON_DEPTH {
+                    invalid = Value::Array(vec![invalid]);
+                }
+                let second = runtime.memo_or_insert("winner", invalid.clone());
+                drop(first);
+                let second = second.await.unwrap();
+                assert_eq!(second.value, json!({"source":"first"}));
+                assert_eq!(second.seq, None);
+
+                let winner = runtime.memo("winner").await.unwrap();
+                assert_eq!(winner.value, Some(json!({"source":"first"})));
+                assert_eq!(winner.seq, None);
+
+                // Null is a stored value, including under an empty opaque name.
+                let null = runtime.memo_or_insert("", Value::Null).await.unwrap();
+                assert_eq!(null.value, Value::Null);
+                assert!(null.seq.is_some());
+                assert_eq!(runtime.memo("").await.unwrap().value, Some(Value::Null));
+
+                // A losing candidate is never validated, while a winning one is
+                // validated as part of the complete task-record envelope.
+                assert!(runtime.memo_or_insert("invalid", invalid).await.is_err());
+                assert_eq!(runtime.memo("invalid").await.unwrap().value, None);
+
+                runtime
+                    .commit(|_, _| {
+                        Box::pin(async { Ok(Some(TaskUpdate::Complete(json!("done")))) })
+                    })
+                    .await
+                    .map_err(|error| fault(error.to_string()))?;
+                Ok(())
+            })
+        }));
+        let (session, driver) = Session::new(MemoryStorage::new());
+        let (runner, task_driver) =
+            TaskRunner::attach(&session, TaskRegistry::new([definition.clone()]).unwrap()).unwrap();
+        zip(
+            async {
+                let task = seed(&session, definition).await;
+                let RunResult::Terminal(terminal) = runner.run(task.id).await.unwrap() else {
+                    panic!()
+                };
+                assert_eq!(
+                    terminal.state,
+                    TaskState::Terminal {
+                        outcome: TaskOutcome::Completed {
+                            result: json!("done")
+                        }
+                    }
+                );
+                assert!(terminal.memos.is_none());
+                runner.close().await.unwrap();
+                session.close().await.unwrap();
+            },
+            zip(driver, task_driver),
+        )
+        .await;
+    });
+}
+
+#[test]
 fn propagated_callback_panics_fault_and_discard_associated_writes() {
     for construction in [false, true] {
         block_on(async {
@@ -866,13 +938,7 @@ fn memo_only_commits_are_not_checkpoint_progress() {
         let definition = definition(Rc::new(|_, runtime| {
             Box::pin(async move {
                 runtime
-                    .commit(|tx, mut task| {
-                        Box::pin(async move {
-                            task.memos = Some(BTreeMap::from([("memo".into(), json!("changed"))]));
-                            tx.set_task(task).await?;
-                            Ok(None)
-                        })
-                    })
+                    .memo_or_insert("memo", json!("changed"))
                     .await
                     .unwrap();
                 Ok(())
