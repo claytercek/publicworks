@@ -1,6 +1,6 @@
-//! Blocking SQLite adapter for Public Works conversations, entries, and tasks.
+//! Blocking SQLite adapter for Public Works runtime records.
 //!
-//! Unpublished owned schema v3, not compatible with Pi's JavaScript database format.
+//! Unpublished owned schema v4, not compatible with Pi's JavaScript database format.
 //! Incompatible schemas are rejected, not migrated or silently reset. Recreate
 //! disposable databases manually when the format changes.
 use publicworks_runtime::{snapshot::RecordSnapshot, *};
@@ -12,13 +12,13 @@ pub struct SqliteStorage {
 }
 const SCHEMA: &str = "
 CREATE TABLE publicworks_schema (singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL);
-INSERT INTO publicworks_schema VALUES (1, 3);
+INSERT INTO publicworks_schema VALUES (1, 4);
 CREATE TABLE publicworks_metadata (
     singleton INTEGER PRIMARY KEY CHECK(singleton=1), next_id INTEGER NOT NULL, next_seq INTEGER NOT NULL
 );
 INSERT INTO publicworks_metadata VALUES (1, 2, 1);
 CREATE TABLE publicworks_records (
-    id INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('conversation','entry','task')),
+    id INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('conversation','entry','task','submission','conversation_state')),
     record TEXT NOT NULL, commit_seq INTEGER NOT NULL
 );";
 
@@ -68,7 +68,7 @@ impl SqliteStorage {
                 .map_err(other)?
                 .collect::<rusqlite::Result<_>>()
                 .map_err(other)?;
-            if versions != [(1, 3)] {
+            if versions != [(1, 4)] {
                 return Err(other(format!(
                     "Unsupported Public Works schema: {versions:?}"
                 )));
@@ -112,6 +112,8 @@ impl SqliteStorage {
                 if snapshot.conversations.contains_key(&id)
                     || snapshot.entries.contains_key(&id)
                     || snapshot.tasks.contains_key(&id)
+                    || snapshot.submissions.contains_key(&id)
+                    || snapshot.conversation_states.contains_key(&id)
                 {
                     return Err(other(format!("Duplicate stored ID: {id}")));
                 }
@@ -148,6 +150,24 @@ impl SqliteStorage {
                             return Err(other("Task record ID mismatch"));
                         }
                         snapshot.tasks.insert(id, task);
+                    }
+                    "submission" => {
+                        let submission: SubmissionRecord =
+                            serde_json::from_str(&json).map_err(other)?;
+                        submission.validate_payloads()?;
+                        if submission.id != id {
+                            return Err(other("Submission record ID mismatch"));
+                        }
+                        snapshot.submissions.insert(id, submission);
+                    }
+                    "conversation_state" => {
+                        let state: ConversationStateRecord =
+                            serde_json::from_str(&json).map_err(other)?;
+                        state.validate_payloads()?;
+                        if state.id != id {
+                            return Err(other("Conversation state record ID mismatch"));
+                        }
+                        snapshot.conversation_states.insert(id, state);
                     }
                     _ => return Err(other(format!("Unsupported record kind: {kind}"))),
                 }
@@ -202,6 +222,8 @@ impl Storage for SqliteStorage {
                 match write {
                     StorageWrite::Entry(entry) => entry.validate_payloads()?,
                     StorageWrite::Task(task) => task.validate_payloads()?,
+                    StorageWrite::Submission(submission) => submission.validate_payloads()?,
+                    StorageWrite::ConversationState(state) => state.validate_payloads()?,
                     StorageWrite::Conversation(_) => {}
                 }
             }
@@ -216,11 +238,17 @@ impl Storage for SqliteStorage {
                         }
                         StorageWrite::Entry(record) => ("entry", serde_json::to_string(&record)),
                         StorageWrite::Task(record) => ("task", serde_json::to_string(&record)),
+                        StorageWrite::Submission(record) => {
+                            ("submission", serde_json::to_string(&record))
+                        }
+                        StorageWrite::ConversationState(record) => {
+                            ("conversation_state", serde_json::to_string(&record))
+                        }
                     };
-                    let sql = if kind == "task" {
+                    let sql = if matches!(kind, "task" | "submission" | "conversation_state") {
                         "INSERT INTO publicworks_records(id,kind,record,commit_seq) VALUES (?1,?2,?3,?4)
                          ON CONFLICT(id) DO UPDATE SET record=excluded.record, commit_seq=excluded.commit_seq
-                         WHERE publicworks_records.kind='task'"
+                         WHERE publicworks_records.kind=?2"
                     } else {
                         "INSERT INTO publicworks_records(id,kind,record,commit_seq) VALUES (?1,?2,?3,?4)"
                     };
@@ -274,6 +302,35 @@ impl Storage for SqliteStorage {
         cursor: Option<Cursor>,
     ) -> StorageFuture<'_, Page<TaskRecord>> {
         Box::pin(async move { self.snapshot()?.scan_tasks(query, limit, cursor) })
+    }
+    fn submission(&mut self, id: Id) -> StorageFuture<'_, Option<SubmissionRecord>> {
+        Box::pin(async move { Ok(self.snapshot()?.submissions.remove(&id)) })
+    }
+    fn scan_submissions(
+        &mut self,
+        query: SubmissionQuery,
+        limit: usize,
+        cursor: Option<Cursor>,
+    ) -> StorageFuture<'_, Page<SubmissionRecord>> {
+        Box::pin(async move { self.snapshot()?.scan_submissions(query, limit, cursor) })
+    }
+    fn submission_by_request(
+        &mut self,
+        conversation_id: Id,
+        request_id: &str,
+    ) -> StorageFuture<'_, Option<SubmissionRecord>> {
+        let request_id = request_id.to_owned();
+        Box::pin(async move {
+            Ok(self
+                .snapshot()?
+                .submission_by_request(conversation_id, &request_id))
+        })
+    }
+    fn conversation_state(
+        &mut self,
+        conversation_id: Id,
+    ) -> StorageFuture<'_, Option<ConversationStateRecord>> {
+        Box::pin(async move { Ok(self.snapshot()?.conversation_state(conversation_id)) })
     }
     fn scan_conversations(
         &mut self,

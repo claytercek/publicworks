@@ -37,7 +37,9 @@ impl Storage for MemoryStorage {
                 match write {
                     StorageWrite::Entry(entry) => entry.validate_payloads()?,
                     StorageWrite::Task(task) => task.validate_payloads()?,
-                    _ => {}
+                    StorageWrite::Submission(submission) => submission.validate_payloads()?,
+                    StorageWrite::ConversationState(state) => state.validate_payloads()?,
+                    StorageWrite::Conversation(_) => {}
                 }
             }
             let seq = Seq::new(self.next_seq)?;
@@ -45,17 +47,32 @@ impl Storage for MemoryStorage {
             let mut next_id = self.next_id;
             for write in writes {
                 let id = write.id();
-                if candidate.conversations.contains_key(&id)
+                let claimed = candidate.conversations.contains_key(&id)
                     || candidate.entries.contains_key(&id)
-                    || (candidate.tasks.contains_key(&id)
-                        && !matches!(write, StorageWrite::Task(_)))
-                {
+                    || candidate.tasks.contains_key(&id)
+                    || candidate.submissions.contains_key(&id)
+                    || candidate.conversation_states.contains_key(&id);
+                let replaceable = match &write {
+                    StorageWrite::Task(_) => candidate.tasks.contains_key(&id),
+                    StorageWrite::Submission(_) => candidate.submissions.contains_key(&id),
+                    StorageWrite::ConversationState(_) => {
+                        candidate.conversation_states.contains_key(&id)
+                    }
+                    StorageWrite::Conversation(_) | StorageWrite::Entry(_) => false,
+                };
+                if claimed && !replaceable {
                     return Err(StorageError::Other(format!("ID {id} is already claimed")));
                 }
                 next_id = next_id.max(id.get() + 1);
                 match write {
                     StorageWrite::Task(record) => {
                         candidate.tasks.insert(id, record);
+                    }
+                    StorageWrite::Submission(record) => {
+                        candidate.submissions.insert(id, record);
+                    }
+                    StorageWrite::ConversationState(record) => {
+                        candidate.conversation_states.insert(id, record);
                     }
                     StorageWrite::Conversation(record) => {
                         candidate.conversations.insert(id, record);
@@ -106,6 +123,45 @@ impl Storage for MemoryStorage {
         Box::pin(async move {
             self.open()?;
             self.records.scan_tasks(query, limit, cursor)
+        })
+    }
+    fn submission(&mut self, id: Id) -> StorageFuture<'_, Option<SubmissionRecord>> {
+        Box::pin(async move {
+            self.open()?;
+            Ok(self.records.submission(id))
+        })
+    }
+    fn scan_submissions(
+        &mut self,
+        query: SubmissionQuery,
+        limit: usize,
+        cursor: Option<Cursor>,
+    ) -> StorageFuture<'_, Page<SubmissionRecord>> {
+        Box::pin(async move {
+            self.open()?;
+            self.records.scan_submissions(query, limit, cursor)
+        })
+    }
+    fn submission_by_request(
+        &mut self,
+        conversation_id: Id,
+        request_id: &str,
+    ) -> StorageFuture<'_, Option<SubmissionRecord>> {
+        let request_id = request_id.to_owned();
+        Box::pin(async move {
+            self.open()?;
+            Ok(self
+                .records
+                .submission_by_request(conversation_id, &request_id))
+        })
+    }
+    fn conversation_state(
+        &mut self,
+        conversation_id: Id,
+    ) -> StorageFuture<'_, Option<ConversationStateRecord>> {
+        Box::pin(async move {
+            self.open()?;
+            Ok(self.records.conversation_state(conversation_id))
         })
     }
     fn entry(&mut self, id: Id) -> StorageFuture<'_, Option<StoredEntry>> {

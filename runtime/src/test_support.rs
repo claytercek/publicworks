@@ -359,6 +359,15 @@ pub async fn closed(store: &mut dyn Storage) {
         Err(StorageError::Rejected(_))
     ));
     assert!(store.conversation(id(1)).await.is_err());
+    assert!(store.submission(id(2)).await.is_err());
+    assert!(
+        store
+            .scan_submissions(SubmissionQuery::default(), 1, None)
+            .await
+            .is_err()
+    );
+    assert!(store.submission_by_request(id(1), "request").await.is_err());
+    assert!(store.conversation_state(id(1)).await.is_err());
     assert!(store.entry(id(2)).await.is_err());
     assert!(store.visible_entry(id(1), id(2)).await.is_err());
     assert!(
@@ -647,3 +656,8 @@ mod write_json_tests {
 
 mod tasks;
 pub use tasks::{task, task_json, task_payload_limits, task_storage};
+mod submissions;
+pub use submissions::{
+    conversation_state_storage, submission, submission_json, submission_payload_limits,
+    submission_storage,
+};

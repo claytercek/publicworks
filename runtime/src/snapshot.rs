@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct RecordSnapshot {
     pub conversations: BTreeMap<Id, ConversationRecord>,
     pub tasks: BTreeMap<Id, TaskRecord>,
+    pub submissions: BTreeMap<Id, SubmissionRecord>,
+    pub conversation_states: BTreeMap<Id, ConversationStateRecord>,
     pub entries: BTreeMap<Id, StoredEntry>,
 }
 impl RecordSnapshot {
@@ -26,6 +28,47 @@ impl RecordSnapshot {
             limit,
             |r| r.id,
         )
+    }
+
+    pub fn submission(&self, id: Id) -> Option<SubmissionRecord> {
+        self.submissions.get(&id).cloned()
+    }
+    pub fn scan_submissions(
+        &self,
+        query: SubmissionQuery,
+        limit: usize,
+        cursor: Option<Cursor>,
+    ) -> Result<Page<SubmissionRecord>, StorageError> {
+        page(
+            self.submissions
+                .values()
+                .filter(|record| {
+                    cursor.as_ref().is_none_or(|value| record.id > value.after)
+                        && query.matches(record)
+                })
+                .cloned(),
+            limit,
+            |record| record.id,
+        )
+    }
+    pub fn submission_by_request(
+        &self,
+        conversation_id: Id,
+        request_id: &str,
+    ) -> Option<SubmissionRecord> {
+        self.submissions
+            .values()
+            .find(|record| {
+                record.conversation_id == conversation_id
+                    && record.request_id.as_deref() == Some(request_id)
+            })
+            .cloned()
+    }
+    pub fn conversation_state(&self, conversation_id: Id) -> Option<ConversationStateRecord> {
+        self.conversation_states
+            .values()
+            .find(|record| record.conversation_id == conversation_id)
+            .cloned()
     }
 
     pub fn scan_conversations(

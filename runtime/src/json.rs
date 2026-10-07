@@ -84,10 +84,12 @@ pub(crate) fn decode(raw: &RawValue, parents: usize) -> Result<Value, StorageErr
 }
 
 // default handles absence; a present null remains Some(Null).
+pub(crate) fn value<'de, D: Deserializer<'de>>(d: D) -> Result<Value, D::Error> {
+    decode(&Box::<RawValue>::deserialize(d)?, 0).map_err(D::Error::custom)
+}
+
 pub(crate) fn data<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
-    decode(&Box::<RawValue>::deserialize(d)?, 0)
-        .map(Some)
-        .map_err(D::Error::custom)
+    value(d).map(Some)
 }
 pub(crate) fn model<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<Value>>, D::Error> {
     Option::<Box<RawValue>>::deserialize(d)?
@@ -143,6 +145,10 @@ impl TryFrom<WriteFields> for crate::StorageWrite {
             "conversation" => serde_json::from_str(fields.value.get()).map(Self::Conversation),
             "task" => serde_json::from_str(fields.value.get()).map(Self::Task),
             "entry" => serde_json::from_str(fields.value.get()).map(Self::Entry),
+            "submission" => serde_json::from_str(fields.value.get()).map(Self::Submission),
+            "conversationState" => {
+                serde_json::from_str(fields.value.get()).map(Self::ConversationState)
+            }
             _ => return Err(invalid("Unknown storage write type")),
         };
         result.map_err(|error| invalid(&error.to_string()))

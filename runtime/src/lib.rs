@@ -22,6 +22,11 @@ mod task;
 pub use task::{
     JoinPolicy, TaskOutcome, TaskOutcomeError, TaskQuery, TaskRecord, TaskState, TaskStatus,
 };
+mod submission;
+pub use submission::{
+    ConversationRun, ConversationStateRecord, InboxItem, SubmissionQuery, SubmissionRecord,
+    SubmissionSettlement, SubmissionState, SubmissionStatus, SubmissionType,
+};
 mod json;
 pub use json::decode_native_json;
 mod memory;
@@ -189,6 +194,8 @@ pub enum StorageWrite {
     Conversation(ConversationRecord),
     Entry(EntryRecord),
     Task(TaskRecord),
+    Submission(SubmissionRecord),
+    ConversationState(ConversationStateRecord),
 }
 impl StorageWrite {
     pub fn id(&self) -> Id {
@@ -196,6 +203,8 @@ impl StorageWrite {
             Self::Conversation(r) => r.id,
             Self::Entry(r) => r.id,
             Self::Task(r) => r.id,
+            Self::Submission(r) => r.id,
+            Self::ConversationState(r) => r.id,
         }
     }
 }
@@ -280,6 +289,23 @@ pub trait Storage {
         limit: usize,
         cursor: Option<Cursor>,
     ) -> StorageFuture<'_, Page<TaskRecord>>;
+    fn submission(&mut self, id: Id) -> StorageFuture<'_, Option<SubmissionRecord>>;
+    fn scan_submissions(
+        &mut self,
+        query: SubmissionQuery,
+        limit: usize,
+        cursor: Option<Cursor>,
+    ) -> StorageFuture<'_, Page<SubmissionRecord>>;
+    fn submission_by_request(
+        &mut self,
+        conversation_id: Id,
+        request_id: &str,
+    ) -> StorageFuture<'_, Option<SubmissionRecord>>;
+    /// Return the dedicated admission state for a conversation, when present.
+    fn conversation_state(
+        &mut self,
+        conversation_id: Id,
+    ) -> StorageFuture<'_, Option<ConversationStateRecord>>;
     fn entry(&mut self, id: Id) -> StorageFuture<'_, Option<StoredEntry>>;
     fn visible_entry(&mut self, conversation: Id, id: Id)
     -> StorageFuture<'_, Option<StoredEntry>>;

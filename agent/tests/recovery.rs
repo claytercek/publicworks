@@ -484,6 +484,31 @@ impl Storage for ResultCommitGate {
     ) -> StorageFuture<'_, Page<TaskRecord>> {
         self.inner.scan_tasks(query, limit, cursor)
     }
+    fn submission(&mut self, id: Id) -> StorageFuture<'_, Option<SubmissionRecord>> {
+        self.inner.submission(id)
+    }
+    fn scan_submissions(
+        &mut self,
+        query: SubmissionQuery,
+        limit: usize,
+        cursor: Option<Cursor>,
+    ) -> StorageFuture<'_, Page<SubmissionRecord>> {
+        self.inner.scan_submissions(query, limit, cursor)
+    }
+    fn submission_by_request(
+        &mut self,
+        conversation_id: Id,
+        request_id: &str,
+    ) -> StorageFuture<'_, Option<SubmissionRecord>> {
+        self.inner
+            .submission_by_request(conversation_id, request_id)
+    }
+    fn conversation_state(
+        &mut self,
+        conversation_id: Id,
+    ) -> StorageFuture<'_, Option<ConversationStateRecord>> {
+        self.inner.conversation_state(conversation_id)
+    }
     fn entry(&mut self, id: Id) -> StorageFuture<'_, Option<StoredEntry>> {
         self.inner.entry(id)
     }

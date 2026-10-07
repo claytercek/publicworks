@@ -26,9 +26,13 @@ check!(nesting_limits);
 check!(task_storage);
 check!(task_json);
 check!(task_payload_limits);
+check!(submission_storage);
+check!(submission_json);
+check!(conversation_state_storage);
+check!(submission_payload_limits);
 
 use publicworks_runtime::{
-    test_support::{conversation, entry, id},
+    test_support::{conversation, entry, id, submission},
     *,
 };
 use std::{
@@ -110,6 +114,87 @@ fn reopen_preserves_records_allocators_and_rollback() {
         let mut again = SqliteStorage::open(&db.path).unwrap();
         assert_eq!(again.commit(vec![]).await.unwrap(), Seq::new(3).unwrap());
         assert_eq!(again.mint_id().await.unwrap(), id(6));
+    });
+}
+
+#[test]
+fn reopen_preserves_submissions_request_lookup_and_conversation_state() {
+    let db = Database::new();
+    futures_lite::future::block_on(async {
+        let mut input = submission(
+            2,
+            1,
+            SubmissionState::InputUnanswered {
+                entry: Some(id(8)),
+                reason: "model_error".into(),
+                detail: Some(serde_json::Value::Null),
+            },
+        );
+        input.request_id = Some("retry-key".into());
+        let write = submission(3, 1, SubmissionState::WriteQueued);
+        let state = ConversationStateRecord {
+            id: id(4),
+            conversation_id: id(1),
+            run: Some(ConversationRun {
+                task_id: id(9),
+                input_submission_ids: vec![id(2)],
+            }),
+            inbox: vec![InboxItem {
+                submission_id: id(3),
+                payload: serde_json::json!({"mode":"write", "draft":null}),
+            }],
+            agent_config: Some(serde_json::json!({"followUp":"all"})),
+        };
+        let mut store = SqliteStorage::open(&db.path).unwrap();
+        store
+            .commit(vec![
+                StorageWrite::Submission(input.clone()),
+                StorageWrite::Submission(write.clone()),
+                StorageWrite::ConversationState(state.clone()),
+            ])
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+
+        let mut reopened = SqliteStorage::open(&db.path).unwrap();
+        assert_eq!(
+            reopened.submission(id(2)).await.unwrap(),
+            Some(input.clone())
+        );
+        assert_eq!(
+            reopened
+                .submission_by_request(id(1), "retry-key")
+                .await
+                .unwrap(),
+            Some(input.clone())
+        );
+        assert_eq!(
+            reopened
+                .scan_submissions(
+                    SubmissionQuery {
+                        conversation_id: Some(id(1)),
+                        status: Some(SubmissionStatus::Queued),
+                    },
+                    10,
+                    None,
+                )
+                .await
+                .unwrap()
+                .items,
+            vec![write]
+        );
+        assert_eq!(
+            reopened.conversation_state(id(1)).await.unwrap(),
+            Some(state)
+        );
+        assert!(matches!(
+            input.state,
+            SubmissionState::InputUnanswered {
+                detail: Some(serde_json::Value::Null),
+                ..
+            }
+        ));
+        reopened.close().await.unwrap();
     });
 }
 
@@ -218,7 +303,7 @@ fn excessive_external_nesting_fails_reads_safely() {
 
 #[test]
 fn old_and_future_complete_schemas_are_not_reinterpreted() {
-    for version in [1, 2, 4] {
+    for version in [1, 2, 3, 5] {
         let db = Database::new();
         drop(SqliteStorage::open(&db.path).unwrap());
         let setup = rusqlite::Connection::open(&db.path).unwrap();
