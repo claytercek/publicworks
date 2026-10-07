@@ -32,11 +32,41 @@ impl Future for HarnessOpenWaiter {
         self.0.as_mut().poll(cx)
     }
 }
-pub struct TaskWaiter(LocalFuture<'static, Result<TaskRecord, HarnessError>>);
+struct TaskRegistration {
+    control: Weak<HarnessControl>,
+    task: Id,
+    key: u64,
+    cancelled: Rc<Cell<bool>>,
+}
+pub struct TaskWaiter {
+    future: LocalFuture<'static, Result<TaskRecord, HarnessError>>,
+    registration: Option<TaskRegistration>,
+}
 impl Future for TaskWaiter {
     type Output = Result<TaskRecord, HarnessError>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.0.as_mut().poll(cx)
+        let result = self.future.as_mut().poll(cx);
+        if result.is_ready() {
+            self.registration = None;
+        }
+        result
+    }
+}
+impl Drop for TaskWaiter {
+    fn drop(&mut self) {
+        let Some(registration) = self.registration.take() else {
+            return;
+        };
+        registration.cancelled.set(true);
+        if let Some(control) = registration.control.upgrade() {
+            let mut state = control.0.borrow_mut();
+            if let Some(waiters) = state.task_waiters.get_mut(&registration.task) {
+                waiters.remove(&registration.key);
+                if waiters.is_empty() {
+                    state.task_waiters.remove(&registration.task);
+                }
+            }
+        }
     }
 }
 pub struct HarnessAbortWaiter(LocalFuture<'static, Result<AbortResult, HarnessError>>);
@@ -82,7 +112,8 @@ struct HarnessState {
     registry_generation: u64,
     last_commit_seq: Option<Seq>,
     waker: Option<Waker>,
-    task_waiters: BTreeMap<Id, Vec<oneshot::Sender<Result<TaskRecord, HarnessError>>>>,
+    next_waiter: u64,
+    task_waiters: BTreeMap<Id, BTreeMap<u64, oneshot::Sender<Result<TaskRecord, HarnessError>>>>,
 }
 struct HarnessControl(RefCell<HarnessState>);
 impl HarnessControl {
@@ -102,7 +133,7 @@ impl HarnessControl {
             (std::mem::take(&mut state.task_waiters), state.waker.take())
         };
         runner.seal();
-        for sender in waiters.into_values().flatten() {
+        for sender in waiters.into_values().flat_map(BTreeMap::into_values) {
             let _ = sender.send(Err(HarnessError::Closed));
         }
         if let Some(waker) = waker {
@@ -176,7 +207,7 @@ impl Drop for HarnessDriver {
             state.closing = true;
             std::mem::take(&mut state.task_waiters)
         };
-        for sender in waiters.into_values().flatten() {
+        for sender in waiters.into_values().flat_map(BTreeMap::into_values) {
             let _ = sender.send(Err(HarnessError::DriverStopped));
         }
     }
@@ -207,6 +238,7 @@ impl Harness {
             registry_generation: 1,
             last_commit_seq: None,
             waker: None,
+            next_waiter: 1,
             task_waiters: BTreeMap::new(),
         })));
 
@@ -227,7 +259,8 @@ impl Harness {
                     if task.status() == TaskStatus::Terminal
                         && let Some(waiters) = state.task_waiters.remove(&task.id)
                     {
-                        completed.extend(waiters.into_iter().map(|sender| (sender, task.clone())));
+                        completed
+                            .extend(waiters.into_values().map(|sender| (sender, task.clone())));
                     }
                     if (task.abort_requested || task.status() == TaskStatus::Terminal)
                         && let Some(invocation) = runner
@@ -455,10 +488,28 @@ impl Harness {
     }
 
     pub fn wait_task(&self, id: Id) -> TaskWaiter {
+        let (key, cancelled) = {
+            let mut state = self.control.0.borrow_mut();
+            if state.stopped || state.closing {
+                let error = if state.stopped {
+                    HarnessError::DriverStopped
+                } else {
+                    HarnessError::Closed
+                };
+                return TaskWaiter {
+                    future: Box::pin(async move { Err(error) }),
+                    registration: None,
+                };
+            }
+            let key = state.next_waiter;
+            state.next_waiter += 1;
+            (key, Rc::new(Cell::new(false)))
+        };
         let (sender, receiver) = oneshot::channel();
         let sender = Rc::new(RefCell::new(Some(sender)));
         let control = self.control.clone();
         let callback_sender = sender.clone();
+        let callback_cancelled = cancelled.clone();
         let waiter = self.session.commit(move |tx| {
             Box::pin(async move {
                 let record = tx
@@ -468,6 +519,9 @@ impl Harness {
                 if record.status() == TaskStatus::Terminal {
                     return Ok(Some(record));
                 }
+                if callback_cancelled.get() {
+                    return Ok(None);
+                }
                 let mut state = control.0.borrow_mut();
                 if state.closing {
                     return Err(SessionError::Closed);
@@ -476,16 +530,24 @@ impl Harness {
                     .task_waiters
                     .entry(id)
                     .or_default()
-                    .push(callback_sender.borrow_mut().take().unwrap());
+                    .insert(key, callback_sender.borrow_mut().take().unwrap());
                 Ok(None)
             })
         });
-        TaskWaiter(Box::pin(async move {
-            match waiter.await.map_err(HarnessError::Session)?.value {
-                Some(record) => Ok(record),
-                None => receiver.await.unwrap_or(Err(HarnessError::DriverStopped)),
-            }
-        }))
+        TaskWaiter {
+            future: Box::pin(async move {
+                match waiter.await.map_err(HarnessError::Session)?.value {
+                    Some(record) => Ok(record),
+                    None => receiver.await.unwrap_or(Err(HarnessError::DriverStopped)),
+                }
+            }),
+            registration: Some(TaskRegistration {
+                control: Rc::downgrade(&self.control),
+                task: id,
+                key,
+                cancelled,
+            }),
+        }
     }
 
     pub fn abort(&self, id: Id) -> HarnessAbortWaiter {
