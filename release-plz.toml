@@ -1,0 +1,35 @@
+[workspace]
+# Only explicitly listed library packages participate in release PRs or releases.
+release = false
+# Publishing is only eligible after a release-plz PR is merged.
+release_always = false
+changelog_update = true
+git_tag_enable = true
+git_release_enable = true
+git_tag_name = "{{ package }}-v{{ version }}"
+publish = false
+publish_timeout = "30m"
+
+[[package]]
+name = "publicworks-runtime"
+release = true
+publish = true
+version_group = "publicworks"
+
+[[package]]
+name = "publicworks-storage-sqlite"
+release = true
+publish = true
+version_group = "publicworks"
+
+[[package]]
+name = "publicworks-agent"
+release = true
+publish = true
+version_group = "publicworks"
+
+[[package]]
+name = "publicworks-provider-openai"
+release = true
+publish = true
+version_group = "publicworks"
