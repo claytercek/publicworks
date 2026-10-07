@@ -22,18 +22,25 @@ cargo run -p publicworks-cli -- create /tmp/publicworks-demo.db
 cargo run -p publicworks-cli -- append /tmp/publicworks-demo.db 2 "hello"
 # {"commitSeq":2,"conversationId":2,"entryId":3}
 cargo run -p publicworks-cli -- show /tmp/publicworks-demo.db 2
+# Inspect or withdraw a receipt created by an embedding agent host:
+cargo run -p publicworks-cli -- submission /tmp/publicworks-demo.db SUBMISSION_ID
+cargo run -p publicworks-cli -- abort-submission /tmp/publicworks-demo.db SUBMISSION_ID 2
 ```
 
 Each command opens and closes the database. `create` adds a conversation;
 `append` stores a `publicworks.text` entry with `data: {"text":"hello"}`;
-`show` prints visible entries newest-first. Successful commands print JSON.
-Errors go to stderr with a nonzero exit status. Append/show require an existing
-file and conversation; they do not create a missing conversation.
+`show` prints visible entries newest-first. `submission` prints one committed
+receipt. `abort-submission` withdraws a queued receipt and optionally verifies
+its conversation; it cannot cancel placed work. Successful commands print JSON.
+Errors go to stderr with a nonzero exit status. Commands other than `create`
+require an existing database and do not create one accidentally.
 
-The CLI runs create, append, and read-only show through Session transactions.
-It is a transcript demo, not a chat agent. Text is one
-application payload, not the core entry model. Root conversation ID 1 is reserved
-from allocation but is not automatically created; ordinary IDs start at 2.
+The CLI uses Session transactions and always polls orderly shutdown. It is a
+transcript and maintenance utility, not a chat agent. Text is one application
+payload, not the core entry model. It cannot generically submit or resume agent
+work because that requires the host's exact model, extension/tool installation,
+task registry, and credential policy. Root conversation ID 1 is reserved from
+allocation but is not automatically created; ordinary IDs start at 2.
 
 ## Libraries
 
@@ -46,6 +53,9 @@ from allocation but is not automatically created; ordinary IDs start at 2.
 - `agent/` — `publicworks-agent`: immutable model/tool installation, atomic turn
   admission, pinned requests, fork-aware context projection, ordered tool children,
   and conservative interrupted-effect recovery. No provider or executor dependency.
+- `extensions/permissions/` — `publicworks-extension-permissions`: optional,
+  selected `before_tool` guard that maps local allow/deny policy to immediate
+  blocked results. It is not an approval service or authorization boundary.
 - `providers/openai/` — `publicworks-provider-openai`: opt-in, non-streaming
   OpenAI Responses text/function-call adapter using reqwest/rustls. Requires a
   Tokio host; excluded from the workspace's default members.
@@ -351,10 +361,30 @@ provides cooperative cancellation and invocation-fenced, first-writer-wins memos
 it does not expose raw transaction or task-transition access. Ordinary hook errors
 are recorded, and `before_tool` errors additionally fail closed as a blocked call.
 
-Callbacks are never persisted and must be reinstalled on restart. Prompt sections,
-wrappers, filters, yield hooks, and compaction hooks remain deferred until the agent
-has corresponding provider-neutral request or lifecycle models. See the
-extension contract
+Callbacks are never persisted and must be reinstalled on restart. The optional
+permissions package is a concrete selected hook:
+
+```rust,ignore
+use publicworks_extension_permissions::{PermissionDecision, permission_extension};
+
+registry.install(permission_extension(|call| {
+    if call.name == "dangerous" {
+        PermissionDecision::Deny("Needs approval".into())
+    } else {
+        PermissionDecision::Allow
+    }
+}))?;
+```
+
+A denial becomes an immediate `tool_blocked` result before durable effect intent.
+The guard only applies when the `permissions` extension is installed and selected;
+an exact selection that omits it runs without it. This is not a manual approval
+queue, authorization boundary, or sandbox. See the
+optional integration contract.
+
+Prompt sections, wrappers, filters, yield hooks, and compaction hooks remain
+deferred until the agent has corresponding provider-neutral request or lifecycle
+models. See the extension contract
 for the configuration wire format, definition-version change, hook composition,
 and remaining scope.
 

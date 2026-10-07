@@ -704,6 +704,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "publicworks-extension-permissions"
+version = "0.1.0"
+dependencies = [
+ "futures-lite",
+ "publicworks-agent",
+ "publicworks-runtime",
+ "publicworks-storage-sqlite",
+ "serde_json",
+]
+
+[[package]]
 name = "publicworks-perf"
 version = "0.1.0"
 dependencies = [

@@ -1,6 +1,14 @@
 [workspace]
-members = ["runtime", "storage/sqlite", "cli", "agent", "providers/openai", "perf"]
-default-members = ["runtime", "storage/sqlite", "cli", "agent"]
+members = [
+    "runtime",
+    "storage/sqlite",
+    "cli",
+    "agent",
+    "extensions/permissions",
+    "providers/openai",
+    "perf",
+]
+default-members = ["runtime", "storage/sqlite", "cli", "agent", "extensions/permissions"]
 resolver = "3"
 
 [workspace.package]
