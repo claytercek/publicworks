@@ -1113,7 +1113,7 @@ fn record(id: Id, owner: Option<Id>, state: TaskState) -> TaskRecord {
 }
 
 #[test]
-fn scope_rejections_are_write_free_and_active_tree_guard_checks_staged_descendants() {
+fn expanded_scopes_drive_owned_conversations_and_background_anchors() {
     block_on(bounded(async {
         let active = Gate::default();
         let release = Gate::default();
@@ -1149,7 +1149,7 @@ fn scope_rejections_are_write_free_and_active_tree_guard_checks_staged_descendan
                 let root = create(&session, parent.clone(), Value::Null, None).await;
                 let waiter = runner.run(root.id);
                 active.wait().await;
-                let rejected = session
+                session
                     .commit({
                         let child = child.clone();
                         move |tx| {
@@ -1157,7 +1157,7 @@ fn scope_rejections_are_write_free_and_active_tree_guard_checks_staged_descendan
                                 let child = tx
                                     .create_task(
                                         child,
-                                        json!("rolled back"),
+                                        json!("owned-conversation"),
                                         options(Some(root.id)),
                                     )
                                     .await?;
@@ -1166,8 +1166,7 @@ fn scope_rejections_are_write_free_and_active_tree_guard_checks_staged_descendan
                         }
                     })
                     .await
-                    .unwrap_err();
-                assert!(matches!(rejected, SessionError::Invalid(_)));
+                    .unwrap();
                 let tasks = session
                     .commit(|tx| {
                         Box::pin(async { tx.scan_tasks(TaskQuery::default(), 20, None).await })
@@ -1175,7 +1174,7 @@ fn scope_rejections_are_write_free_and_active_tree_guard_checks_staged_descendan
                     .await
                     .unwrap()
                     .value;
-                assert_eq!(tasks.items.len(), 1);
+                assert_eq!(tasks.items.len(), 2);
                 let added = create(&session, child.clone(), json!("allowed"), Some(root.id)).await;
                 release.release();
                 terminal(waiter.await.unwrap());
@@ -1231,46 +1230,22 @@ fn scope_rejections_are_write_free_and_active_tree_guard_checks_staged_descendan
                     .unwrap()
                     .value;
                 let internal = create(&session, child, Value::Null, Some(owner.id)).await;
-                let before = session
-                    .commit(|tx| {
-                        Box::pin(async {
-                            tx.append_entry(
-                                ROOT_CONVERSATION,
-                                EntryDraft::new("before unsupported runs"),
-                            )
-                            .await
-                        })
-                    })
-                    .await
-                    .unwrap()
-                    .seq
-                    .unwrap();
-                for task in [&owned, &background, &owner, &internal] {
-                    assert_eq!(
-                        runner.run(task.id).await.unwrap(),
-                        RunResult::Blocked(BlockReason::UnsupportedScope)
-                    );
-                    assert_eq!(read(&session, task.id).await, *task);
-                }
-                let after = session
-                    .commit(|tx| {
-                        Box::pin(async {
-                            tx.append_entry(
-                                ROOT_CONVERSATION,
-                                EntryDraft::new("after unsupported runs"),
-                            )
-                            .await
-                        })
-                    })
-                    .await
-                    .unwrap()
-                    .seq
-                    .unwrap();
                 assert_eq!(
-                    after.get(),
-                    before.get() + 1,
-                    "unsupported admission must be write-free"
+                    runner.run(owned.id).await.unwrap(),
+                    RunResult::Blocked(BlockReason::UnsupportedScope)
                 );
+                terminal(runner.run(background.id).await.unwrap());
+                terminal(runner.run(owner.id).await.unwrap());
+                for task in [owned.id, internal.id] {
+                    assert!(matches!(
+                        read(&session, task).await.state,
+                        TaskState::Terminal { .. }
+                    ));
+                    assert_eq!(
+                        runner.run(task).await.unwrap(),
+                        RunResult::Blocked(BlockReason::NotPending)
+                    );
+                }
                 runner.close().await.unwrap();
                 session.close().await.unwrap();
             },

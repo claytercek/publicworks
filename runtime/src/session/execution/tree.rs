@@ -199,7 +199,10 @@ impl Tree {
                 return true;
             }
             match conversation {
-                None => false,
+                None => self
+                    .root(record.id)
+                    .and_then(|root| self.tasks.get(&root))
+                    .is_some_and(|root| root.background),
                 Some(id) => matches!(self.in_conversation(record, id, false), Some(false)),
             }
         })

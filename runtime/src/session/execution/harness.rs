@@ -178,6 +178,8 @@ pub struct HarnessInspection {
     pub tasks: Vec<TaskInspection>,
 }
 
+type IdleSenders = BTreeMap<u64, oneshot::Sender<Result<(), HarnessError>>>;
+
 struct HarnessState {
     opened: bool,
     enabled: bool,
@@ -194,7 +196,7 @@ struct HarnessState {
     waker: Option<Waker>,
     next_waiter: u64,
     task_waiters: BTreeMap<Id, BTreeMap<u64, oneshot::Sender<Result<TaskRecord, HarnessError>>>>,
-    idle_waiters: BTreeMap<Option<Id>, BTreeMap<u64, oneshot::Sender<Result<(), HarnessError>>>>,
+    idle_waiters: BTreeMap<Option<Id>, IdleSenders>,
 }
 struct HarnessControl(RefCell<HarnessState>);
 impl HarnessControl {

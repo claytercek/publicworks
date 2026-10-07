@@ -731,6 +731,7 @@ fn conversation_handles_observe_idle_and_respect_background_abort_boundaries() {
                     && !task.task.abort_requested
             }));
             conversation.wait_for_idle().await.unwrap();
+            harness.wait_for_idle().await.unwrap();
 
             conversation
                 .abort(ConversationAbortOptions { background: true })
