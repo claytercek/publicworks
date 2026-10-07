@@ -91,7 +91,7 @@ impl Tree {
     pub fn root(&self, id: Id) -> Option<Id> {
         let record = self.tasks.get(&id)?;
         if record.background {
-            return Some(id);
+            return record.owner.is_none().then_some(id);
         }
         let mut root = id;
         let mut seen = BTreeSet::new();
@@ -146,6 +146,63 @@ impl Tree {
             .filter(|record| self.ordinary_descendant(record, id))
             .map(|record| record.id)
             .collect()
+    }
+
+    fn in_conversation(
+        &self,
+        record: &TaskRecord,
+        conversation: Id,
+        cross_background: bool,
+    ) -> Option<bool> {
+        if record.background && !cross_background {
+            return Some(false);
+        }
+        let mut seen = BTreeSet::new();
+        let mut current = Some(self.parent(record)?);
+        while let Some(node) = current {
+            if !seen.insert(node) {
+                return None;
+            }
+            match node {
+                Up::Conversation(id) if id == conversation => return Some(true),
+                Up::Task(id) if !cross_background && self.tasks.get(&id)?.background => {
+                    return Some(false);
+                }
+                _ => {}
+            }
+            current = self.next(node)?;
+        }
+        Some(false)
+    }
+
+    pub fn conversation_scope(
+        &self,
+        conversation: Id,
+        cross_background: bool,
+    ) -> Option<BTreeSet<Id>> {
+        self.conversations.get(&conversation)?;
+        let mut scope = BTreeSet::new();
+        for record in self.tasks.values() {
+            if self.in_conversation(record, conversation, cross_background)? {
+                scope.insert(record.id);
+            }
+        }
+        Some(scope)
+    }
+
+    pub fn conversation_idle(&self, conversation: Option<Id>) -> bool {
+        if conversation.is_some_and(|id| !self.conversations.contains_key(&id)) {
+            return false;
+        }
+        self.tasks.values().all(|record| {
+            if record.status() == TaskStatus::Terminal || record.background {
+                return true;
+            }
+            match conversation {
+                None => false,
+                Some(id) => matches!(self.in_conversation(record, id, false), Some(false)),
+            }
+        })
     }
 
     pub fn scope(&self, root: Id) -> Option<BTreeSet<Id>> {

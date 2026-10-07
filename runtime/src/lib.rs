@@ -9,12 +9,13 @@ use std::{fmt, future::Future, pin::Pin};
 
 mod session;
 pub use session::{
-    AbortResult, AbortWaiter, BlockReason, CloseWaiter, CommitReceipt, CommitWaiter, EntryDraft,
-    Harness, HarnessAbortWaiter, HarnessCloseWaiter, HarnessDriver, HarnessError,
-    HarnessInspection, HarnessOpenWaiter, Head, InspectionWaiter, Owner, PhaseFuture, PhaseHandler,
-    RunError, RunResult, RunWaiter, RunnerCloseWaiter, Session, SessionDriver, SessionError,
-    TaskDefinition, TaskDriver, TaskInspection, TaskOptions, TaskOwnership, TaskRegistry,
-    TaskRunner, TaskRuntime, TaskUpdate, TaskWaiter, Tx, TxFuture,
+    AbortResult, AbortWaiter, BlockReason, CloseWaiter, CommitReceipt, CommitWaiter,
+    ConversationAbortOptions, ConversationAbortWaiter, ConversationHandle, ConversationWaiter,
+    EntryDraft, Harness, HarnessAbortWaiter, HarnessCloseWaiter, HarnessDriver, HarnessError,
+    HarnessInspection, HarnessOpenWaiter, Head, IdleWaiter, InspectionWaiter, Owner, PhaseFuture,
+    PhaseHandler, RunError, RunResult, RunWaiter, RunnerCloseWaiter, Session, SessionDriver,
+    SessionError, TaskDefinition, TaskDriver, TaskInspection, TaskOptions, TaskOwnership,
+    TaskRegistry, TaskRunner, TaskRuntime, TaskUpdate, TaskWaiter, Tx, TxFuture,
 };
 
 mod task;

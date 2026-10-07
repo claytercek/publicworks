@@ -85,6 +85,76 @@ impl Future for HarnessAbortWaiter {
         self.0.as_mut().poll(cx)
     }
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConversationAbortOptions {
+    pub background: bool,
+}
+
+pub struct ConversationWaiter(
+    LocalFuture<'static, Result<Option<ConversationHandle>, HarnessError>>,
+);
+impl Future for ConversationWaiter {
+    type Output = Result<Option<ConversationHandle>, HarnessError>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.as_mut().poll(cx)
+    }
+}
+
+struct IdleRegistration {
+    control: Weak<HarnessControl>,
+    scope: Option<Id>,
+    key: u64,
+    cancelled: Rc<Cell<bool>>,
+}
+pub struct IdleWaiter {
+    future: LocalFuture<'static, Result<(), HarnessError>>,
+    registration: Option<IdleRegistration>,
+}
+impl Future for IdleWaiter {
+    type Output = Result<(), HarnessError>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let result = self.future.as_mut().poll(cx);
+        if result.is_ready() {
+            self.registration = None;
+        }
+        result
+    }
+}
+impl Drop for IdleWaiter {
+    fn drop(&mut self) {
+        let Some(registration) = self.registration.take() else {
+            return;
+        };
+        registration.cancelled.set(true);
+        if let Some(control) = registration.control.upgrade() {
+            let removed = {
+                let mut state = control.0.borrow_mut();
+                let (removed, empty) = state
+                    .idle_waiters
+                    .get_mut(&registration.scope)
+                    .map(|waiters| {
+                        let removed = waiters.remove(&registration.key);
+                        (removed, waiters.is_empty())
+                    })
+                    .unwrap_or((None, false));
+                if empty {
+                    state.idle_waiters.remove(&registration.scope);
+                }
+                removed
+            };
+            drop(removed);
+        }
+    }
+}
+
+pub struct ConversationAbortWaiter(LocalFuture<'static, Result<(), HarnessError>>);
+impl Future for ConversationAbortWaiter {
+    type Output = Result<(), HarnessError>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.as_mut().poll(cx)
+    }
+}
 pub struct InspectionWaiter(LocalFuture<'static, Result<HarnessInspection, HarnessError>>);
 impl Future for InspectionWaiter {
     type Output = Result<HarnessInspection, HarnessError>;
@@ -124,6 +194,7 @@ struct HarnessState {
     waker: Option<Waker>,
     next_waiter: u64,
     task_waiters: BTreeMap<Id, BTreeMap<u64, oneshot::Sender<Result<TaskRecord, HarnessError>>>>,
+    idle_waiters: BTreeMap<Option<Id>, BTreeMap<u64, oneshot::Sender<Result<(), HarnessError>>>>,
 }
 struct HarnessControl(RefCell<HarnessState>);
 impl HarnessControl {
@@ -135,7 +206,7 @@ impl HarnessControl {
     }
     fn seal(&self, runner: &RunnerControl) {
         let session_error = runner.0.borrow().session_error.clone();
-        let (waiters, waker) = {
+        let (task_waiters, idle_waiters, waker) = {
             let mut state = self.0.borrow_mut();
             if let Some(error) = session_error
                 && state.failure.is_none()
@@ -147,10 +218,17 @@ impl HarnessControl {
             }
             state.closing = true;
             state.dirty = false;
-            (std::mem::take(&mut state.task_waiters), state.waker.take())
+            (
+                std::mem::take(&mut state.task_waiters),
+                std::mem::take(&mut state.idle_waiters),
+                state.waker.take(),
+            )
         };
         runner.seal();
-        for sender in waiters.into_values().flat_map(BTreeMap::into_values) {
+        for sender in task_waiters.into_values().flat_map(BTreeMap::into_values) {
+            let _ = sender.send(Err(HarnessError::Closed));
+        }
+        for sender in idle_waiters.into_values().flat_map(BTreeMap::into_values) {
             let _ = sender.send(Err(HarnessError::Closed));
         }
         if let Some(waker) = waker {
@@ -190,6 +268,24 @@ impl Drop for Harness {
     }
 }
 
+/// Stateless orchestration view over one committed conversation.
+#[derive(Clone)]
+pub struct ConversationHandle {
+    id: Id,
+    harness: Harness,
+}
+impl ConversationHandle {
+    pub fn id(&self) -> Id {
+        self.id
+    }
+    pub fn wait_for_idle(&self) -> IdleWaiter {
+        self.harness.wait_for_idle_scope(Some(self.id))
+    }
+    pub fn abort(&self, options: ConversationAbortOptions) -> ConversationAbortWaiter {
+        self.harness.abort_conversation(self.id, options)
+    }
+}
+
 /// One host-polled owner for Session persistence, scheduling, and local handlers.
 pub struct HarnessDriver {
     work: LocalFuture<'static, ()>,
@@ -218,13 +314,19 @@ impl Drop for HarnessDriver {
         for invocation in actives {
             invocation.end();
         }
-        let waiters = {
+        let (task_waiters, idle_waiters) = {
             let mut state = self.control.0.borrow_mut();
             state.stopped = !state.finished;
             state.closing = true;
-            std::mem::take(&mut state.task_waiters)
+            (
+                std::mem::take(&mut state.task_waiters),
+                std::mem::take(&mut state.idle_waiters),
+            )
         };
-        for sender in waiters.into_values().flat_map(BTreeMap::into_values) {
+        for sender in task_waiters.into_values().flat_map(BTreeMap::into_values) {
+            let _ = sender.send(Err(HarnessError::DriverStopped));
+        }
+        for sender in idle_waiters.into_values().flat_map(BTreeMap::into_values) {
             let _ = sender.send(Err(HarnessError::DriverStopped));
         }
     }
@@ -258,6 +360,7 @@ impl Harness {
             waker: None,
             next_waiter: 1,
             task_waiters: BTreeMap::new(),
+            idle_waiters: BTreeMap::new(),
         })));
 
         let weak_control = Rc::downgrade(&control);
@@ -538,6 +641,146 @@ impl Harness {
         }))
     }
 
+    pub fn conversation(&self, id: Id) -> ConversationWaiter {
+        {
+            let state = self.control.0.borrow();
+            if state.stopped || state.closing {
+                let error = if state.stopped {
+                    HarnessError::DriverStopped
+                } else {
+                    HarnessError::Closed
+                };
+                return ConversationWaiter(Box::pin(async move { Err(error) }));
+            }
+        }
+        let harness = self.clone();
+        let waiter = self
+            .session
+            .commit(move |tx| Box::pin(async move { Ok(tx.conversation(id).await?.is_some()) }));
+        ConversationWaiter(Box::pin(async move {
+            if waiter.await.map_err(HarnessError::Session)?.value {
+                Ok(Some(ConversationHandle { id, harness }))
+            } else {
+                Ok(None)
+            }
+        }))
+    }
+
+    pub fn wait_for_idle(&self) -> IdleWaiter {
+        self.wait_for_idle_scope(None)
+    }
+
+    fn wait_for_idle_scope(&self, scope: Option<Id>) -> IdleWaiter {
+        if let Err(error) = self.resume() {
+            return IdleWaiter {
+                future: Box::pin(async move { Err(error) }),
+                registration: None,
+            };
+        }
+        let (key, cancelled) = {
+            let mut state = self.control.0.borrow_mut();
+            let key = state.next_waiter;
+            state.next_waiter += 1;
+            (key, Rc::new(Cell::new(false)))
+        };
+        let (sender, receiver) = oneshot::channel();
+        let sender = Rc::new(RefCell::new(Some(sender)));
+        let control = self.control.clone();
+        let callback_sender = sender.clone();
+        let callback_cancelled = cancelled.clone();
+        let waiter = self.session.commit(move |tx| {
+            Box::pin(async move {
+                let tree = tx.tree().await?;
+                if let Some(id) = scope
+                    && !tree.conversations.contains_key(&id)
+                {
+                    return Err(SessionError::Invalid("Conversation does not exist".into()));
+                }
+                if tree.conversation_idle(scope) || callback_cancelled.get() {
+                    return Ok(true);
+                }
+                let mut state = control.0.borrow_mut();
+                if state.closing {
+                    return Err(SessionError::Closed);
+                }
+                state
+                    .idle_waiters
+                    .entry(scope)
+                    .or_default()
+                    .insert(key, callback_sender.borrow_mut().take().unwrap());
+                Ok(false)
+            })
+        });
+        IdleWaiter {
+            future: Box::pin(async move {
+                if waiter.await.map_err(HarnessError::Session)?.value {
+                    Ok(())
+                } else {
+                    receiver.await.unwrap_or(Err(HarnessError::DriverStopped))
+                }
+            }),
+            registration: Some(IdleRegistration {
+                control: Rc::downgrade(&self.control),
+                scope,
+                key,
+                cancelled,
+            }),
+        }
+    }
+
+    fn abort_conversation(
+        &self,
+        id: Id,
+        options: ConversationAbortOptions,
+    ) -> ConversationAbortWaiter {
+        if let Err(error) = self.resume() {
+            return ConversationAbortWaiter(Box::pin(async move { Err(error) }));
+        }
+        let waiter = self.session.commit(move |tx| {
+            Box::pin(async move {
+                let mut tree = tx.tree().await?;
+                let reached = tree
+                    .conversation_scope(id, options.background)
+                    .ok_or_else(|| {
+                        SessionError::Invalid("Invalid conversation ownership".into())
+                    })?;
+                let before = tree.tasks.clone();
+                for task in &reached {
+                    if tree.tasks[task].status() != TaskStatus::Terminal {
+                        tree.mark(*task);
+                    }
+                }
+                let mut roots = BTreeMap::<Id, BTreeSet<Id>>::new();
+                for task in tree.tasks.values() {
+                    if task.status() != TaskStatus::Terminal
+                        && let Some(root) = tree.root(task.id)
+                        && let Some(scope) = tree.scope(root)
+                    {
+                        roots.entry(root).or_insert(scope);
+                    }
+                }
+                for scope in roots.values() {
+                    tree.reconcile(scope);
+                }
+                tree.stage_changes(tx, &before).await?;
+                Ok(reached)
+            })
+        });
+        let harness = self.clone();
+        ConversationAbortWaiter(Box::pin(async move {
+            let reached = waiter.await.map_err(HarnessError::Session)?.value;
+            if options.background {
+                for task in reached {
+                    harness.wait_task(task).await?;
+                }
+            }
+            let conversation = harness.conversation(id).await?.ok_or_else(|| {
+                HarnessError::Session(SessionError::Invalid("Conversation does not exist".into()))
+            })?;
+            conversation.wait_for_idle().await
+        }))
+    }
+
     pub fn wait_task(&self, id: Id) -> TaskWaiter {
         let (key, cancelled) = {
             let mut state = self.control.0.borrow_mut();
@@ -653,6 +896,25 @@ impl Harness {
     pub fn close(&self) -> HarnessCloseWaiter {
         self.control.seal(&self.runner);
         self.close.clone()
+    }
+}
+
+fn resolve_idle_waiters(control: &HarnessControl, tree: &tree::Tree) {
+    let settled = {
+        let mut state = control.0.borrow_mut();
+        let scopes = state.idle_waiters.keys().copied().collect::<Vec<_>>();
+        let mut settled = Vec::new();
+        for scope in scopes {
+            if tree.conversation_idle(scope)
+                && let Some(waiters) = state.idle_waiters.remove(&scope)
+            {
+                settled.extend(waiters.into_values());
+            }
+        }
+        settled
+    };
+    for sender in settled {
+        let _ = sender.send(Ok(()));
     }
 }
 
@@ -839,12 +1101,13 @@ async fn reserve_all(
                     return Ok(Vec::new());
                 }
                 let mut tree = tx.tree().await?;
-                if callback_control
-                    .upgrade()
-                    .is_none_or(|control| control.0.borrow().closing)
-                {
+                let Some(control) = callback_control.upgrade() else {
+                    return Ok(Vec::new());
+                };
+                if control.0.borrow().closing {
                     return Ok(Vec::new());
                 }
+                resolve_idle_waiters(&control, &tree);
                 let before = tree.tasks.clone();
                 let mut scopes = BTreeMap::<Id, BTreeSet<Id>>::new();
                 for task in tree.tasks.values() {

@@ -621,6 +621,135 @@ fn uncertain_public_commit_wakes_scheduler_and_fails_close() {
 }
 
 #[test]
+fn conversation_handles_observe_idle_and_respect_background_abort_boundaries() {
+    block_on(async {
+        let missing = TaskDefinition::new(
+            "missing",
+            1,
+            |_| Ok(json!({"phase":"run"})),
+            BTreeMap::new(),
+        );
+        let (opening, driver) = Harness::open(MemoryStorage::new(), TaskRegistry::default());
+        let command = async move {
+            let harness = opening.await.unwrap();
+            let (root_conversation, foreground, nested, background, background_child) = harness
+                .commit(move |tx| {
+                    Box::pin(async move {
+                        let root_conversation = tx.create_conversation().await?;
+                        let foreground = tx
+                            .create_task(
+                                missing.clone(),
+                                json!("foreground"),
+                                TaskOptions {
+                                    ownership: TaskOwnership::Conversation,
+                                    conversation_id: Some(root_conversation.id),
+                                    background: false,
+                                },
+                            )
+                            .await?;
+                        let owned = tx
+                            .create_conversation_owned(Owner::Task(foreground.id))
+                            .await?;
+                        let nested = tx
+                            .create_task(
+                                missing.clone(),
+                                json!("nested"),
+                                TaskOptions {
+                                    ownership: TaskOwnership::Conversation,
+                                    conversation_id: Some(owned.id),
+                                    background: false,
+                                },
+                            )
+                            .await?;
+                        let background = tx
+                            .create_task(
+                                missing.clone(),
+                                json!("background"),
+                                TaskOptions {
+                                    ownership: TaskOwnership::Conversation,
+                                    conversation_id: Some(owned.id),
+                                    background: true,
+                                },
+                            )
+                            .await?;
+                        let background_owned = tx
+                            .create_conversation_owned(Owner::Task(background.id))
+                            .await?;
+                        let background_child = tx
+                            .create_task(
+                                missing,
+                                json!("background-child"),
+                                TaskOptions {
+                                    ownership: TaskOwnership::Conversation,
+                                    conversation_id: Some(background_owned.id),
+                                    background: false,
+                                },
+                            )
+                            .await?;
+                        Ok((
+                            root_conversation,
+                            foreground,
+                            nested,
+                            background,
+                            background_child,
+                        ))
+                    })
+                })
+                .await
+                .unwrap()
+                .value;
+
+            assert!(
+                harness
+                    .conversation(Id::new(9_999).unwrap())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let conversation = harness
+                .conversation(root_conversation.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(conversation.id(), root_conversation.id);
+            drop(harness.wait_for_idle());
+
+            conversation
+                .abort(ConversationAbortOptions::default())
+                .await
+                .unwrap();
+            for task in [foreground.id, nested.id] {
+                assert_eq!(
+                    harness.wait_task(task).await.unwrap().status(),
+                    TaskStatus::Terminal
+                );
+            }
+            let inspection = harness.inspect().await.unwrap();
+            assert_eq!(inspection.tasks.len(), 2);
+            assert!(inspection.tasks.iter().all(|task| {
+                [background.id, background_child.id].contains(&task.task.id)
+                    && !task.task.abort_requested
+            }));
+            conversation.wait_for_idle().await.unwrap();
+
+            conversation
+                .abort(ConversationAbortOptions { background: true })
+                .await
+                .unwrap();
+            harness.wait_for_idle().await.unwrap();
+            assert!(harness.inspect().await.unwrap().tasks.is_empty());
+
+            harness.close().await.unwrap();
+            assert!(matches!(
+                conversation.wait_for_idle().await,
+                Err(HarnessError::Closed)
+            ));
+        };
+        let ((), ()) = zip(command, driver).await;
+    });
+}
+
+#[test]
 fn registry_replacement_wakes_blocked_work_after_resume() {
     block_on(async {
         let calls = Rc::new(Cell::new(0));

@@ -235,6 +235,7 @@ fn late_page_background_and_owned_conversations_are_supported_boundaries() {
             for n in 20..170 {
                 let mut child = record(n, Some(10));
                 if n == 169 && !owned_conversation {
+                    child.owner = None;
                     child.background = true;
                 }
                 records.push(child);
