@@ -1,4 +1,5 @@
 use crate::{snapshot::RecordSnapshot, *};
+use std::collections::BTreeMap;
 
 /// Built-in reference adapter. Detached values and atomic batches, no persistence.
 pub struct MemoryStorage {
@@ -29,6 +30,48 @@ impl MemoryStorage {
         }
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordKind {
+    Conversation,
+    Entry,
+    Task,
+    Submission,
+    ConversationState,
+}
+impl RecordKind {
+    fn of(write: &StorageWrite) -> Self {
+        match write {
+            StorageWrite::Conversation(_) => Self::Conversation,
+            StorageWrite::Entry(_) => Self::Entry,
+            StorageWrite::Task(_) => Self::Task,
+            StorageWrite::Submission(_) => Self::Submission,
+            StorageWrite::ConversationState(_) => Self::ConversationState,
+        }
+    }
+    fn replaceable(self) -> bool {
+        matches!(
+            self,
+            Self::Task | Self::Submission | Self::ConversationState
+        )
+    }
+}
+impl MemoryStorage {
+    fn kind(&self, id: Id) -> Option<RecordKind> {
+        if self.records.conversations.contains_key(&id) {
+            Some(RecordKind::Conversation)
+        } else if self.records.entries.contains_key(&id) {
+            Some(RecordKind::Entry)
+        } else if self.records.tasks.contains_key(&id) {
+            Some(RecordKind::Task)
+        } else if self.records.submissions.contains_key(&id) {
+            Some(RecordKind::Submission)
+        } else if self.records.conversation_states.contains_key(&id) {
+            Some(RecordKind::ConversationState)
+        } else {
+            None
+        }
+    }
+}
 impl Storage for MemoryStorage {
     fn commit(&mut self, writes: Vec<StorageWrite>) -> StorageFuture<'_, Seq> {
         Box::pin(async move {
@@ -43,42 +86,39 @@ impl Storage for MemoryStorage {
                 }
             }
             let seq = Seq::new(self.next_seq)?;
-            let mut candidate = self.records.clone();
+            // Preflight only the IDs in this batch. Cloning the complete store made
+            // every small commit proportional to retained history and payload size.
+            // No operation below this pass is fallible, so direct adoption remains
+            // atomic while replacements retain their ordered last-write-wins rule.
+            let mut staged = BTreeMap::new();
             let mut next_id = self.next_id;
-            for write in writes {
+            for write in &writes {
                 let id = write.id();
-                let claimed = candidate.conversations.contains_key(&id)
-                    || candidate.entries.contains_key(&id)
-                    || candidate.tasks.contains_key(&id)
-                    || candidate.submissions.contains_key(&id)
-                    || candidate.conversation_states.contains_key(&id);
-                let replaceable = match &write {
-                    StorageWrite::Task(_) => candidate.tasks.contains_key(&id),
-                    StorageWrite::Submission(_) => candidate.submissions.contains_key(&id),
-                    StorageWrite::ConversationState(_) => {
-                        candidate.conversation_states.contains_key(&id)
-                    }
-                    StorageWrite::Conversation(_) | StorageWrite::Entry(_) => false,
-                };
-                if claimed && !replaceable {
+                let incoming = RecordKind::of(write);
+                let current = staged.get(&id).copied().or_else(|| self.kind(id));
+                if current.is_some_and(|kind| kind != incoming || !incoming.replaceable()) {
                     return Err(StorageError::Other(format!("ID {id} is already claimed")));
                 }
+                staged.insert(id, incoming);
                 next_id = next_id.max(id.get() + 1);
+            }
+            for write in writes {
+                let id = write.id();
                 match write {
                     StorageWrite::Task(record) => {
-                        candidate.tasks.insert(id, record);
+                        self.records.tasks.insert(id, record);
                     }
                     StorageWrite::Submission(record) => {
-                        candidate.submissions.insert(id, record);
+                        self.records.submissions.insert(id, record);
                     }
                     StorageWrite::ConversationState(record) => {
-                        candidate.conversation_states.insert(id, record);
+                        self.records.conversation_states.insert(id, record);
                     }
                     StorageWrite::Conversation(record) => {
-                        candidate.conversations.insert(id, record);
+                        self.records.conversations.insert(id, record);
                     }
                     StorageWrite::Entry(entry) => {
-                        candidate.entries.insert(
+                        self.records.entries.insert(
                             id,
                             StoredEntry {
                                 entry,
@@ -88,7 +128,6 @@ impl Storage for MemoryStorage {
                     }
                 }
             }
-            self.records = candidate;
             self.next_id = next_id;
             self.next_seq += 1;
             Ok(seq)
