@@ -151,10 +151,16 @@ Session work, and only then closes Storage. A noncooperative handler can keep cl
 pending. Dropping the driver is forfeiture: late runtime access is fenced, but an
 in-flight persistence operation or external effect may have an uncertain outcome.
 
-The current Harness intentionally schedules only the foreground ownership topology
-already supported by `TaskRunner`. Task-owned conversations, background traversal,
-conversation handles, and scoped idle waits remain the next ownership-lifecycle
-phase in the implementation plan.
+Ownership traversal follows both task-owner and conversation-owner edges; fork
+ancestry remains independent. Background tasks are independently scheduled anchors:
+ordinary parent cancellation, held outcomes, and idle observation stop at their
+boundary. `harness.conversation(id)` reacquires a stateless orchestration handle.
+Use its `wait_for_idle()` and `abort(options)` methods for scoped observation and
+cancellation, or `harness.wait_for_idle()` across ownerless conversations. Idle
+waits enable progress and observe committed liveness, not merely runnable handlers.
+Set `ConversationAbortOptions { background: true }` only when cancellation should
+cross background boundaries and wait for the reached snapshot. See the
+ownership lifecycle contract.
 
 ## Create and execute one task tree explicitly
 
@@ -166,8 +172,9 @@ duplicate kinds. Neither creating a definition nor registering it runs code.
 Inside a Session callback, `tx.create_task(definition, input, options)` persists a
 pending task and returns a detached `TaskRecord`. `TaskOptions` requires explicit
 conversation or task ownership. Task-owned children inherit their owner's
-conversation and cannot be background. Use `tx.task` and `tx.scan_tasks` for
-committed reads before mutations.
+conversation and cannot be background. Conversation-owned tasks may be background,
+and task-owned conversations extend the owner's ordinary scope. Use `tx.task` and
+`tx.scan_tasks` for committed reads before mutations.
 
 For execution, attach one runner with
 `TaskRunner::attach(&session, registry)`, then call `runner.run(task.id)`.
@@ -176,12 +183,13 @@ admitted run requests and handler futures; SessionDriver remains the only Storag
 owner. A handler awaiting external work does not occupy the Session queue.
 Dropping a run waiter does not cancel its request.
 
-`run(root)` drives a foreground root and its task-owned descendants in one
-ownerless conversation, with only one handler active at a time. Background work
-and task-owned conversations anywhere below the root are unsupported. The root
-must be conversation-owned; `run(child)` is not a second hosting mode. Pending,
-waiting, and completing roots can be driven, but unrecovered running records
-require `Session::open_recovered` first. Terminal roots return `Blocked(NotPending)`.
+`run(root)` drives one ordinary ownership scope with only one handler active at a
+time. The scope follows task ownership and task-owned conversations. A background
+conversation-owned task is an independent root and is not driven as part of its
+former foreground scope. The requested root must be a scheduling anchor;
+`run(child)` is not a second hosting mode. Pending, waiting, and completing roots
+can be driven, but unrecovered running records require `Session::open_recovered`
+first. Terminal roots return `Blocked(NotPending)`.
 
 Normal execution requires an exact definition version. A blocked root does not
 prevent eligible children from running. `RunResult::Terminal` is a durable root
