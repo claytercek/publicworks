@@ -2,30 +2,51 @@
 use super::*;
 
 enum Decision {
-    Ready(TaskRecord, TaskDefinition),
+    Ready(
+        TaskRecord,
+        TaskDefinition,
+        Rc<Invocation>,
+        TaskRegistry,
+        Option<u64>,
+    ),
     Done(RunResult),
 }
+
+type RegistryRefresh = Rc<dyn Fn() -> Option<(u64, TaskRegistry)>>;
+
 pub(super) async fn execute(
     session: &Session,
     registry: &TaskRegistry,
     invocation: Rc<Invocation>,
 ) -> Result<RunResult, RunError> {
-    execute_inner(session, registry, invocation, false).await
+    execute_inner(session, registry.clone(), invocation, false, None, None).await
 }
 
 pub(super) async fn execute_reserved(
     session: &Session,
-    registry: &TaskRegistry,
+    registry: TaskRegistry,
     invocation: Rc<Invocation>,
+    registry_generation: u64,
+    refresh: RegistryRefresh,
 ) -> Result<RunResult, RunError> {
-    execute_inner(session, registry, invocation, true).await
+    execute_inner(
+        session,
+        registry,
+        invocation,
+        true,
+        Some(registry_generation),
+        Some(refresh),
+    )
+    .await
 }
 
 async fn execute_inner(
     session: &Session,
-    registry: &TaskRegistry,
+    mut registry: TaskRegistry,
     mut invocation: Rc<Invocation>,
     already_reserved: bool,
+    mut registry_generation: Option<u64>,
+    refresh: Option<RegistryRefresh>,
 ) -> Result<RunResult, RunError> {
     if !already_reserved {
         let definitions = registry.clone();
@@ -92,11 +113,14 @@ async fn execute_inner(
             return Ok(result);
         }
     }
+    let mut at_boundary = false;
     loop {
         // A fresh Session-line decision is essential: abort can be queued behind
         // reservation while its storage acknowledgement is still pending.
         let inv = invocation.clone();
         let definitions = registry.clone();
+        let generation = registry_generation;
+        let refresh = at_boundary.then(|| refresh.clone()).flatten();
         let dispatch = session
             .commit_join(invocation.clone(), move |tx| {
                 Box::pin(async move {
@@ -121,6 +145,24 @@ async fn execute_inner(
                         inv.end();
                         return Ok(Decision::Done(RunResult::Suspended(record)));
                     }
+                    // Only an exact newer publication can take over. Missing or
+                    // incompatible current definitions leave this invocation on
+                    // its retained snapshot.
+                    let replacement = refresh
+                        .and_then(|refresh| refresh())
+                        .filter(|(latest, _)| Some(*latest) != generation)
+                        .filter(|(_, latest)| {
+                            latest
+                                .0
+                                .get(&record.kind)
+                                .is_some_and(|definition| definition.version == record.version)
+                        });
+                    let (inv, definitions, generation) =
+                        if let Some((generation, replacement)) = replacement {
+                            (handoff(tx, &inv), replacement, Some(generation))
+                        } else {
+                            (inv, definitions, generation)
+                        };
                     let definition = definitions
                         .0
                         .get(&record.kind)
@@ -129,18 +171,35 @@ async fn execute_inner(
                         .ok_or_else(|| {
                             SessionError::Invalid("Running task definition changed".into())
                         })?;
-                    Ok(Decision::Ready(record, definition))
+                    Ok(Decision::Ready(
+                        record,
+                        definition,
+                        inv,
+                        definitions,
+                        generation,
+                    ))
                 })
             })
             .await;
-        let (current, definition) = match dispatch {
+        let (
+            current,
+            definition,
+            dispatched_invocation,
+            dispatched_registry,
+            dispatched_generation,
+        ) = match dispatch {
             Ok(receipt) => match receipt.value {
                 Decision::Done(result) => return Ok(result),
-                Decision::Ready(record, definition) => (record, definition),
+                Decision::Ready(record, definition, invocation, registry, generation) => {
+                    (record, definition, invocation, registry, generation)
+                }
             },
             Err(SessionError::Closed) => return Ok(RunResult::Interrupted),
             Err(error) => return Err(error.into()),
         };
+        invocation = dispatched_invocation;
+        registry = dispatched_registry;
+        registry_generation = dispatched_generation;
         if invocation.check().is_err() {
             return Ok(RunResult::Interrupted);
         }
@@ -254,8 +313,48 @@ async fn execute_inner(
             Err(SessionError::Closed) => return Ok(RunResult::Interrupted),
             Err(error) => return Err(error.into()),
         }
+        at_boundary = true;
     }
 }
+
+/// Replace the phase identity only after its prior runtime mutations have joined.
+/// Publishing the new active identity before ending the old one fences reentrant
+/// work awakened by cancellation against the committed boundary.
+fn handoff(tx: &Tx, previous: &Rc<Invocation>) -> Rc<Invocation> {
+    let replacement = Rc::new(Invocation {
+        id: previous.id,
+        abort_mode: previous.abort_mode,
+        joined: RefCell::new(Vec::new()),
+        ended: Cell::new(false),
+        cancelled: Cell::new(false),
+        waiters: RefCell::new(Vec::new()),
+        runner: previous.runner.clone(),
+    });
+    if let Some(runner) = previous.runner.upgrade() {
+        let mut state = runner.0.borrow_mut();
+        if state
+            .active
+            .upgrade()
+            .is_some_and(|active| Rc::ptr_eq(&active, previous))
+        {
+            state.active = Rc::downgrade(&replacement);
+        }
+        if state
+            .actives
+            .get(&previous.id)
+            .and_then(Weak::upgrade)
+            .is_some_and(|active| Rc::ptr_eq(&active, previous))
+        {
+            state
+                .actives
+                .insert(previous.id, Rc::downgrade(&replacement));
+        }
+    }
+    tx.fence(replacement.clone(), true);
+    previous.end();
+    replacement
+}
+
 pub(super) async fn supported(tx: &Tx, record: &TaskRecord) -> Result<bool, SessionError> {
     let tree = tx.tree().await?;
     Ok(tree

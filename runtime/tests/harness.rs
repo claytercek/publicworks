@@ -776,6 +776,379 @@ fn conversation_handles_observe_idle_and_respect_background_abort_boundaries() {
 }
 
 #[test]
+fn same_version_replacement_is_adopted_at_the_next_phase_boundary() {
+    block_on(async {
+        let (entered_sender, entered_receiver) = oneshot::channel();
+        let entered_sender = Rc::new(std::cell::RefCell::new(Some(entered_sender)));
+        let (release_sender, release_receiver) = oneshot::channel();
+        let release_receiver = Rc::new(std::cell::RefCell::new(Some(release_receiver)));
+        let old_runtime = Rc::new(std::cell::RefCell::new(None::<TaskRuntime>));
+        let old_first: PhaseHandler = Rc::new({
+            let old_runtime = old_runtime.clone();
+            move |_, runtime| {
+                let entered_sender = entered_sender.clone();
+                let release_receiver = release_receiver.clone();
+                *old_runtime.borrow_mut() = Some(runtime.clone());
+                Box::pin(async move {
+                    entered_sender
+                        .borrow_mut()
+                        .take()
+                        .unwrap()
+                        .send(())
+                        .unwrap();
+                    let release = release_receiver.borrow_mut().take().unwrap();
+                    release.await.unwrap();
+                    runtime
+                        .commit(|_, _| {
+                            Box::pin(async {
+                                Ok(Some(TaskUpdate::Checkpoint(json!({"phase":"second"}))))
+                            })
+                        })
+                        .await
+                        .map_err(|error| TaskOutcomeError {
+                            message: error.to_string(),
+                            detail: None,
+                        })?;
+                    Ok(())
+                })
+            }
+        });
+        let old_second: PhaseHandler =
+            Rc::new(|_, _| Box::pin(async { panic!("old second phase dispatched") }));
+        let old_definition = TaskDefinition::new(
+            "refresh",
+            1,
+            |_| Ok(json!({"phase":"first"})),
+            BTreeMap::from([("first".into(), old_first), ("second".into(), old_second)]),
+        );
+        let old_resource = Rc::new(());
+        let old_resource_weak = Rc::downgrade(&old_resource);
+        let sentinel_handler: PhaseHandler = Rc::new({
+            let old_resource = old_resource.clone();
+            move |_, _| {
+                let _old_resource = old_resource.clone();
+                Box::pin(async { panic!("unrelated old definition dispatched") })
+            }
+        });
+        let sentinel = TaskDefinition::new(
+            "old-snapshot-sentinel",
+            1,
+            |_| Ok(json!({"phase":"sentinel"})),
+            BTreeMap::from([("sentinel".into(), sentinel_handler)]),
+        );
+        drop(old_resource);
+
+        let replacement_calls = Rc::new(Cell::new(0));
+        let new_second: PhaseHandler = Rc::new({
+            let old_runtime = old_runtime.clone();
+            let replacement_calls = replacement_calls.clone();
+            let old_resource_weak = old_resource_weak.clone();
+            move |_, runtime| {
+                let old_runtime = old_runtime.borrow().clone().unwrap();
+                let replacement_calls = replacement_calls.clone();
+                let old_resource_weak = old_resource_weak.clone();
+                Box::pin(async move {
+                    assert!(old_resource_weak.upgrade().is_none());
+                    assert!(matches!(
+                        old_runtime.read(|_, _| Box::pin(async { Ok(()) })).await,
+                        Err(SessionError::Invalid(_))
+                    ));
+                    replacement_calls.set(replacement_calls.get() + 1);
+                    runtime
+                        .commit(|_, _| {
+                            Box::pin(async { Ok(Some(TaskUpdate::Complete(json!("replacement")))) })
+                        })
+                        .await
+                        .map_err(|error| TaskOutcomeError {
+                            message: error.to_string(),
+                            detail: None,
+                        })?;
+                    Ok(())
+                })
+            }
+        });
+        let replacement = TaskDefinition::new(
+            "refresh",
+            1,
+            |_| panic!("replacement must not initialize an existing task"),
+            BTreeMap::from([("second".into(), new_second)]),
+        );
+        let (opening, driver) = Harness::open(
+            MemoryStorage::new(),
+            TaskRegistry::new([old_definition.clone(), sentinel]).unwrap(),
+        );
+        let command = async move {
+            let harness = opening.await.unwrap();
+            let task = harness
+                .commit(move |tx| {
+                    Box::pin(async move {
+                        let conversation = tx.create_conversation().await?;
+                        tx.create_task(
+                            old_definition,
+                            json!(null),
+                            TaskOptions {
+                                ownership: TaskOwnership::Conversation,
+                                conversation_id: Some(conversation.id),
+                                background: false,
+                            },
+                        )
+                        .await
+                    })
+                })
+                .await
+                .unwrap()
+                .value;
+            harness.resume().unwrap();
+            entered_receiver.await.unwrap();
+            harness
+                .replace_registry(TaskRegistry::new([replacement]).unwrap())
+                .unwrap();
+            assert!(old_resource_weak.upgrade().is_some());
+            release_sender.send(()).unwrap();
+
+            let terminal = harness.wait_task(task.id).await.unwrap();
+            assert!(matches!(
+                terminal.state,
+                TaskState::Terminal {
+                    outcome: TaskOutcome::Completed {
+                        result: serde_json::Value::String(ref result)
+                    }
+                } if result == "replacement"
+            ));
+            assert_eq!(replacement_calls.get(), 1);
+            harness.close().await.unwrap();
+        };
+        let ((), ()) = zip(command, driver).await;
+    });
+}
+
+#[test]
+fn missing_or_incompatible_replacement_keeps_the_active_snapshot() {
+    for incompatible in [false, true] {
+        block_on(async move {
+            let (entered_sender, entered_receiver) = oneshot::channel();
+            let entered_sender = Rc::new(std::cell::RefCell::new(Some(entered_sender)));
+            let (release_sender, release_receiver) = oneshot::channel();
+            let release_receiver = Rc::new(std::cell::RefCell::new(Some(release_receiver)));
+            let first_runtime = Rc::new(std::cell::RefCell::new(None::<TaskRuntime>));
+            let first: PhaseHandler = Rc::new({
+                let first_runtime = first_runtime.clone();
+                move |_, runtime| {
+                    let entered_sender = entered_sender.clone();
+                    let release_receiver = release_receiver.clone();
+                    *first_runtime.borrow_mut() = Some(runtime.clone());
+                    Box::pin(async move {
+                        entered_sender
+                            .borrow_mut()
+                            .take()
+                            .unwrap()
+                            .send(())
+                            .unwrap();
+                        let release = release_receiver.borrow_mut().take().unwrap();
+                        release.await.unwrap();
+                        runtime
+                            .commit(|_, _| {
+                                Box::pin(async {
+                                    Ok(Some(TaskUpdate::Checkpoint(json!({"phase":"second"}))))
+                                })
+                            })
+                            .await
+                            .map_err(|error| TaskOutcomeError {
+                                message: error.to_string(),
+                                detail: None,
+                            })?;
+                        Ok(())
+                    })
+                }
+            });
+            let retained_calls = Rc::new(Cell::new(0));
+            let second: PhaseHandler = Rc::new({
+                let first_runtime = first_runtime.clone();
+                let retained_calls = retained_calls.clone();
+                move |_, runtime| {
+                    let first_runtime = first_runtime.borrow().clone().unwrap();
+                    let retained_calls = retained_calls.clone();
+                    Box::pin(async move {
+                        first_runtime
+                            .read(|_, _| Box::pin(async { Ok(()) }))
+                            .await
+                            .map_err(|error| TaskOutcomeError {
+                                message: error.to_string(),
+                                detail: None,
+                            })?;
+                        retained_calls.set(retained_calls.get() + 1);
+                        runtime
+                            .commit(|_, _| {
+                                Box::pin(async {
+                                    Ok(Some(TaskUpdate::Complete(json!("retained"))))
+                                })
+                            })
+                            .await
+                            .map_err(|error| TaskOutcomeError {
+                                message: error.to_string(),
+                                detail: None,
+                            })?;
+                        Ok(())
+                    })
+                }
+            });
+            let definition = TaskDefinition::new(
+                "retained",
+                1,
+                |_| Ok(json!({"phase":"first"})),
+                BTreeMap::from([("first".into(), first), ("second".into(), second)]),
+            );
+            let (opening, driver) = Harness::open(
+                MemoryStorage::new(),
+                TaskRegistry::new([definition.clone()]).unwrap(),
+            );
+            let command = async move {
+                let harness = opening.await.unwrap();
+                let task = harness
+                    .commit(move |tx| {
+                        Box::pin(async move {
+                            let conversation = tx.create_conversation().await?;
+                            tx.create_task(
+                                definition,
+                                json!(null),
+                                TaskOptions {
+                                    ownership: TaskOwnership::Conversation,
+                                    conversation_id: Some(conversation.id),
+                                    background: false,
+                                },
+                            )
+                            .await
+                        })
+                    })
+                    .await
+                    .unwrap()
+                    .value;
+                harness.resume().unwrap();
+                entered_receiver.await.unwrap();
+                let replacement = if incompatible {
+                    TaskRegistry::new([TaskDefinition::new(
+                        "retained",
+                        2,
+                        |_| panic!("replacement must not initialize an existing task"),
+                        BTreeMap::new(),
+                    )])
+                    .unwrap()
+                } else {
+                    TaskRegistry::default()
+                };
+                harness.replace_registry(replacement).unwrap();
+                release_sender.send(()).unwrap();
+
+                let terminal = harness.wait_task(task.id).await.unwrap();
+                assert!(matches!(
+                    terminal.state,
+                    TaskState::Terminal {
+                        outcome: TaskOutcome::Completed {
+                            result: serde_json::Value::String(ref result)
+                        }
+                    } if result == "retained"
+                ));
+                assert_eq!(retained_calls.get(), 1);
+                harness.close().await.unwrap();
+            };
+            let ((), ()) = zip(command, driver).await;
+        });
+    }
+}
+
+#[test]
+fn close_joins_active_code_and_releases_its_old_snapshot() {
+    block_on(async {
+        let resource = Rc::new(());
+        let resource_weak = Rc::downgrade(&resource);
+        let sentinel_handler: PhaseHandler = Rc::new({
+            let resource = resource.clone();
+            move |_, _| {
+                let _resource = resource.clone();
+                Box::pin(async { panic!("unrelated snapshot definition dispatched") })
+            }
+        });
+        let sentinel = TaskDefinition::new(
+            "snapshot-sentinel",
+            1,
+            |_| Ok(json!({"phase":"sentinel"})),
+            BTreeMap::from([("sentinel".into(), sentinel_handler)]),
+        );
+        drop(resource);
+
+        let (entered_sender, entered_receiver) = oneshot::channel();
+        let entered_sender = Rc::new(std::cell::RefCell::new(Some(entered_sender)));
+        let (cancelled_sender, cancelled_receiver) = oneshot::channel();
+        let cancelled_sender = Rc::new(std::cell::RefCell::new(Some(cancelled_sender)));
+        let first: PhaseHandler = Rc::new({
+            let resource_weak = resource_weak.clone();
+            move |_, runtime| {
+                let entered_sender = entered_sender.clone();
+                let cancelled_sender = cancelled_sender.clone();
+                let resource_weak = resource_weak.clone();
+                Box::pin(async move {
+                    entered_sender
+                        .borrow_mut()
+                        .take()
+                        .unwrap()
+                        .send(())
+                        .unwrap();
+                    runtime.cancelled().await;
+                    assert!(resource_weak.upgrade().is_some());
+                    cancelled_sender
+                        .borrow_mut()
+                        .take()
+                        .unwrap()
+                        .send(())
+                        .unwrap();
+                    Ok(())
+                })
+            }
+        });
+        let definition = TaskDefinition::new(
+            "old-snapshot-close",
+            1,
+            |_| Ok(json!({"phase":"first"})),
+            BTreeMap::from([("first".into(), first)]),
+        );
+        let (opening, driver) = Harness::open(
+            MemoryStorage::new(),
+            TaskRegistry::new([definition.clone(), sentinel]).unwrap(),
+        );
+        let command = async move {
+            let harness = opening.await.unwrap();
+            harness
+                .commit(move |tx| {
+                    Box::pin(async move {
+                        let conversation = tx.create_conversation().await?;
+                        tx.create_task(
+                            definition,
+                            json!(null),
+                            TaskOptions {
+                                ownership: TaskOwnership::Conversation,
+                                conversation_id: Some(conversation.id),
+                                background: false,
+                            },
+                        )
+                        .await
+                    })
+                })
+                .await
+                .unwrap();
+            harness.resume().unwrap();
+            entered_receiver.await.unwrap();
+            harness.replace_registry(TaskRegistry::default()).unwrap();
+            assert!(resource_weak.upgrade().is_some());
+
+            harness.close().await.unwrap();
+            cancelled_receiver.await.unwrap();
+            assert!(resource_weak.upgrade().is_none());
+        };
+        let ((), ()) = zip(command, driver).await;
+    });
+}
+
+#[test]
 fn registry_replacement_wakes_blocked_work_after_resume() {
     block_on(async {
         let calls = Rc::new(Cell::new(0));

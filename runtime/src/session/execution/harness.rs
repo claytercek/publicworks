@@ -952,11 +952,11 @@ fn resolve_idle_waiters(control: &HarnessControl, tree: &tree::Tree) {
 }
 
 enum SchedulerEvent {
-    Drain(Result<Vec<(Rc<Invocation>, TaskRegistry)>, SessionError>),
+    Drain(Result<Vec<(Rc<Invocation>, TaskRegistry, u64)>, SessionError>),
     Invocation(Id, Rc<Invocation>, Box<Result<RunResult, RunError>>),
 }
 enum SchedulerAction {
-    Drain(TaskRegistry),
+    Drain(TaskRegistry, u64),
     Event(SchedulerEvent),
     Failure(SessionError),
     Close,
@@ -993,21 +993,32 @@ async fn schedule(
             if state.opened && state.dirty && !state.draining && !state.closing {
                 state.dirty = false;
                 state.draining = true;
-                return Poll::Ready(SchedulerAction::Drain(state.registry.clone()));
+                return Poll::Ready(SchedulerAction::Drain(
+                    state.registry.clone(),
+                    state.registry_generation,
+                ));
             }
             state.waker = Some(cx.waker().clone());
             Poll::Pending
         })
         .await;
         match action {
-            SchedulerAction::Drain(registry) => {
+            SchedulerAction::Drain(registry, registry_generation) => {
                 let session = session.clone();
                 let runner = runner.clone();
                 let weak_control = Rc::downgrade(&control);
                 let enabled = control.0.borrow().enabled;
                 events.push(Box::pin(async move {
                     SchedulerEvent::Drain(
-                        reserve_all(&session, &runner, weak_control, registry, enabled).await,
+                        reserve_all(
+                            &session,
+                            &runner,
+                            weak_control,
+                            registry,
+                            registry_generation,
+                            enabled,
+                        )
+                        .await,
                     )
                 }));
             }
@@ -1015,14 +1026,23 @@ async fn schedule(
                 control.0.borrow_mut().draining = false;
                 match result {
                     Ok(reservations) if !control.0.borrow().closing => {
-                        for (invocation, registry) in reservations {
+                        for (invocation, registry, registry_generation) in reservations {
                             let session = session.clone();
+                            let registry_control = Rc::downgrade(&control);
                             events.push(Box::pin(async move {
                                 let id = invocation.id;
+                                let refresh = Rc::new(move || {
+                                    registry_control.upgrade().map(|control| {
+                                        let state = control.0.borrow();
+                                        (state.registry_generation, state.registry.clone())
+                                    })
+                                });
                                 let result = phase::execute_reserved(
                                     &session,
-                                    &registry,
+                                    registry,
                                     invocation.clone(),
+                                    registry_generation,
+                                    refresh,
                                 )
                                 .await;
                                 SchedulerEvent::Invocation(id, invocation, Box::new(result))
@@ -1032,7 +1052,7 @@ async fn schedule(
                     Ok(reservations) => {
                         let invocations = reservations
                             .into_iter()
-                            .map(|(invocation, _)| invocation)
+                            .map(|(invocation, _, _)| invocation)
                             .collect::<Vec<_>>();
                         {
                             let mut state = runner.0.borrow_mut();
@@ -1117,8 +1137,9 @@ async fn reserve_all(
     runner: &Rc<RunnerControl>,
     control: Weak<HarnessControl>,
     registry: TaskRegistry,
+    registry_generation: u64,
     enabled: bool,
-) -> Result<Vec<(Rc<Invocation>, TaskRegistry)>, SessionError> {
+) -> Result<Vec<(Rc<Invocation>, TaskRegistry, u64)>, SessionError> {
     let tentative = Rc::new(RefCell::new(Vec::<Rc<Invocation>>::new()));
     let callback_tentative = tentative.clone();
     let callback_runner = runner.clone();
@@ -1234,7 +1255,7 @@ async fn reserve_all(
         Ok(receipt) => Ok(receipt
             .value
             .into_iter()
-            .map(|invocation| (invocation, registry.clone()))
+            .map(|invocation| (invocation, registry.clone(), registry_generation))
             .collect()),
         Err(error) => {
             let invocations = tentative.borrow_mut().drain(..).collect::<Vec<_>>();
