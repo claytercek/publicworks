@@ -53,6 +53,8 @@ from allocation but is not automatically created; ordinary IDs start at 2.
   bundled SQLite through rusqlite, no external server.
 - `cli/` — `publicworks-cli`: the `publicworks` binary, composing the public
   Session interface and SQLite with futures-lite.
+- `perf/` — `publicworks-perf`: non-default deterministic performance/resource
+  workloads for Memory, SQLite, Session, Harness, context, and agent paths.
 
 The in-memory and SQLite storage adapters return boxed futures but **block while
 polled**. The opt-in HTTP provider uses asynchronous network I/O. SQLite uses WAL,
