@@ -5,6 +5,74 @@ use publicworks_runtime::*;
 use serde_json::json;
 use std::{cell::Cell, collections::BTreeMap, rc::Rc};
 
+struct FailCommitStorage {
+    inner: MemoryStorage,
+    fail: Rc<Cell<bool>>,
+}
+impl Storage for FailCommitStorage {
+    fn commit(&mut self, writes: Vec<StorageWrite>) -> StorageFuture<'_, Seq> {
+        if self.fail.replace(false) {
+            Box::pin(async { Err(StorageError::Other("uncertain test commit".into())) })
+        } else {
+            self.inner.commit(writes)
+        }
+    }
+    fn mint_id(&mut self) -> StorageFuture<'_, Id> {
+        self.inner.mint_id()
+    }
+    fn conversation(&mut self, id: Id) -> StorageFuture<'_, Option<ConversationRecord>> {
+        self.inner.conversation(id)
+    }
+    fn scan_conversations(
+        &mut self,
+        query: ConversationQuery,
+        limit: usize,
+        cursor: Option<Cursor>,
+    ) -> StorageFuture<'_, Page<ConversationRecord>> {
+        self.inner.scan_conversations(query, limit, cursor)
+    }
+    fn task(&mut self, id: Id) -> StorageFuture<'_, Option<TaskRecord>> {
+        self.inner.task(id)
+    }
+    fn scan_tasks(
+        &mut self,
+        query: TaskQuery,
+        limit: usize,
+        cursor: Option<Cursor>,
+    ) -> StorageFuture<'_, Page<TaskRecord>> {
+        self.inner.scan_tasks(query, limit, cursor)
+    }
+    fn entry(&mut self, id: Id) -> StorageFuture<'_, Option<StoredEntry>> {
+        self.inner.entry(id)
+    }
+    fn visible_entry(
+        &mut self,
+        conversation: Id,
+        id: Id,
+    ) -> StorageFuture<'_, Option<StoredEntry>> {
+        self.inner.visible_entry(conversation, id)
+    }
+    fn scan_entries(
+        &mut self,
+        query: EntryQuery,
+        limit: usize,
+        cursor: Option<Cursor>,
+    ) -> StorageFuture<'_, Page<EntryRecord>> {
+        self.inner.scan_entries(query, limit, cursor)
+    }
+    fn find_latest_head_marker(
+        &mut self,
+        conversation: Id,
+        at_or_before: Option<Id>,
+    ) -> StorageFuture<'_, Option<EntryRecord>> {
+        self.inner
+            .find_latest_head_marker(conversation, at_or_before)
+    }
+    fn close(&mut self) -> StorageFuture<'_, ()> {
+        self.inner.close()
+    }
+}
+
 fn record(id: u64, conversation_id: u64, state: TaskState) -> TaskRecord {
     TaskRecord {
         id: Id::new(id).unwrap(),
@@ -375,6 +443,10 @@ fn close_signals_and_joins_handlers_before_storage_close() {
                 harness.commit(|_| Box::pin(async { Ok(()) })).await,
                 Err(SessionError::Closed)
             ));
+            assert!(matches!(
+                harness.abort(Id::new(999).unwrap()).await,
+                Err(HarnessError::Closed)
+            ));
             close.await.unwrap();
             assert!(cancelled.get());
             assert!(late_write_rejected.get());
@@ -423,6 +495,123 @@ fn paused_abort_orphans_a_missing_definition() {
                 }
             ));
             harness.close().await.unwrap();
+        };
+        let ((), ()) = zip(command, driver).await;
+    });
+}
+
+#[test]
+fn failed_phase_settlement_stops_without_replaying_handler() {
+    block_on(async {
+        let fail = Rc::new(Cell::new(false));
+        let calls = Rc::new(Cell::new(0));
+        let handler: PhaseHandler = Rc::new({
+            let fail = fail.clone();
+            let calls = calls.clone();
+            move |_, _| {
+                fail.set(true);
+                calls.set(calls.get() + 1);
+                Box::pin(async { Ok(()) })
+            }
+        });
+        let definition = TaskDefinition::new(
+            "settlement-failure",
+            1,
+            |_| Ok(json!({"phase":"run"})),
+            BTreeMap::from([("run".into(), handler)]),
+        );
+        let storage = FailCommitStorage {
+            inner: MemoryStorage::new(),
+            fail,
+        };
+        let (opening, driver) =
+            Harness::open(storage, TaskRegistry::new([definition.clone()]).unwrap());
+        let command = async move {
+            let harness = opening.await.unwrap();
+            let task = harness
+                .commit(move |tx| {
+                    Box::pin(async move {
+                        let conversation = tx.create_conversation().await?;
+                        tx.create_task(
+                            definition,
+                            json!(null),
+                            TaskOptions {
+                                ownership: TaskOwnership::Conversation,
+                                conversation_id: Some(conversation.id),
+                                background: false,
+                            },
+                        )
+                        .await
+                    })
+                })
+                .await
+                .unwrap()
+                .value;
+            let waiter = harness.wait_task(task.id);
+            harness.resume().unwrap();
+            assert!(matches!(waiter.await, Err(HarnessError::Closed)));
+            assert_eq!(calls.get(), 1);
+            assert!(matches!(
+                harness.close().await,
+                Err(HarnessError::Session(SessionError::Storage(
+                    StorageError::Other(_)
+                )))
+            ));
+        };
+        let ((), ()) = zip(command, driver).await;
+    });
+}
+
+#[test]
+fn uncertain_public_commit_wakes_scheduler_and_fails_close() {
+    block_on(async {
+        let fail = Rc::new(Cell::new(false));
+        let storage = FailCommitStorage {
+            inner: MemoryStorage::new(),
+            fail: fail.clone(),
+        };
+        let definition = TaskDefinition::new(
+            "blocked",
+            1,
+            |_| Ok(json!({"phase":"run"})),
+            BTreeMap::new(),
+        );
+        let (opening, driver) = Harness::open(storage, TaskRegistry::default());
+        let command = async move {
+            let harness = opening.await.unwrap();
+            let task = harness
+                .commit(move |tx| {
+                    Box::pin(async move {
+                        let conversation = tx.create_conversation().await?;
+                        tx.create_task(
+                            definition,
+                            json!(null),
+                            TaskOptions {
+                                ownership: TaskOwnership::Conversation,
+                                conversation_id: Some(conversation.id),
+                                background: false,
+                            },
+                        )
+                        .await
+                    })
+                })
+                .await
+                .unwrap()
+                .value;
+            let task_waiter = harness.wait_task(task.id);
+            fail.set(true);
+            let failed = harness
+                .commit(|tx| Box::pin(async move { tx.create_conversation().await }))
+                .await;
+            assert!(matches!(
+                failed,
+                Err(SessionError::Storage(StorageError::Other(_)))
+            ));
+            assert!(matches!(task_waiter.await, Err(HarnessError::Closed)));
+            assert!(matches!(
+                harness.close().await,
+                Err(HarnessError::Session(SessionError::Poisoned))
+            ));
         };
         let ((), ()) = zip(command, driver).await;
     });

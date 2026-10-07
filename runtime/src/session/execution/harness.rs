@@ -105,6 +105,7 @@ struct HarnessState {
     closing: bool,
     finished: bool,
     stopped: bool,
+    failure: Option<SessionError>,
     dirty: bool,
     draining: bool,
     handles: usize,
@@ -118,13 +119,20 @@ struct HarnessState {
 struct HarnessControl(RefCell<HarnessState>);
 impl HarnessControl {
     fn wake(&self) {
-        if let Some(waker) = self.0.borrow_mut().waker.take() {
+        let waker = self.0.borrow_mut().waker.take();
+        if let Some(waker) = waker {
             waker.wake();
         }
     }
     fn seal(&self, runner: &RunnerControl) {
+        let session_error = runner.0.borrow().session_error.clone();
         let (waiters, waker) = {
             let mut state = self.0.borrow_mut();
+            if let Some(error) = session_error
+                && state.failure.is_none()
+            {
+                state.failure = Some(error);
+            }
             if state.closing {
                 return;
             }
@@ -231,6 +239,7 @@ impl Harness {
             closing: false,
             finished: false,
             stopped: false,
+            failure: None,
             dirty: false,
             draining: false,
             handles: 1,
@@ -340,9 +349,19 @@ impl Harness {
             session: session.clone(),
             close: close.clone(),
         };
+        let failed_open_close = close.clone();
         let opening_waiter = HarnessOpenWaiter(Box::pin(async move {
-            opening.await.map_err(HarnessError::Session)?;
-            Ok(harness)
+            match AssertUnwindSafe(opening).catch_unwind().await {
+                Ok(Ok(_)) => Ok(harness),
+                Ok(Err(error)) => {
+                    let _ = failed_open_close.await;
+                    Err(HarnessError::Session(error))
+                }
+                Err(panic) => {
+                    let _ = failed_open_close.await;
+                    resume_unwind(panic)
+                }
+            }
         }));
 
         let scheduler_control = control.clone();
@@ -355,11 +374,15 @@ impl Harness {
                 scheduler_runner.clone(),
             )
             .await;
-            let result = if scheduler_control.0.borrow().stopped {
+            let state = scheduler_control.0.borrow();
+            let result = if state.stopped {
                 Err(HarnessError::DriverStopped)
+            } else if let Some(error) = &state.failure {
+                Err(HarnessError::Session(error.clone()))
             } else {
                 result.map_err(HarnessError::Session)
             };
+            drop(state);
             let _ = close_sender.send(result);
         };
         let work = Box::pin(async move {
@@ -432,13 +455,31 @@ impl Harness {
     }
 
     pub fn inspect(&self) -> InspectionWaiter {
+        {
+            let state = self.control.0.borrow();
+            if state.stopped || state.closing {
+                let error = if state.stopped {
+                    HarnessError::DriverStopped
+                } else {
+                    HarnessError::Closed
+                };
+                return InspectionWaiter(Box::pin(async move { Err(error) }));
+            }
+        }
         let control = self.control.clone();
         let runner = self.runner.clone();
-        let registry = control.0.borrow().registry.clone();
         let waiter = self.session.commit(move |tx| {
             Box::pin(async move {
                 let tree = tx.tree().await?;
-                let state = control.0.borrow();
+                let (registry, progress_enabled, registry_generation, last_commit_seq) = {
+                    let state = control.0.borrow();
+                    (
+                        state.registry.clone(),
+                        state.enabled,
+                        state.registry_generation,
+                        state.last_commit_seq,
+                    )
+                };
                 let mut tasks = tree
                     .tasks
                     .values()
@@ -475,9 +516,9 @@ impl Harness {
                     .collect::<Vec<_>>();
                 tasks.sort_by_key(|inspection| inspection.task.id);
                 Ok(HarnessInspection {
-                    progress_enabled: state.enabled,
-                    registry_generation: state.registry_generation,
-                    last_commit_seq: state.last_commit_seq,
+                    progress_enabled,
+                    registry_generation,
+                    last_commit_seq,
                     tasks,
                 })
             })
@@ -551,6 +592,17 @@ impl Harness {
     }
 
     pub fn abort(&self, id: Id) -> HarnessAbortWaiter {
+        {
+            let state = self.control.0.borrow();
+            if state.stopped || state.closing {
+                let error = if state.stopped {
+                    HarnessError::DriverStopped
+                } else {
+                    HarnessError::Closed
+                };
+                return HarnessAbortWaiter(Box::pin(async move { Err(error) }));
+            }
+        }
         let runner = self.runner.clone();
         let waiter = self.session.commit(move |tx| {
             Box::pin(async move {
@@ -596,11 +648,12 @@ impl Harness {
 
 enum SchedulerEvent {
     Drain(Result<Vec<(Rc<Invocation>, TaskRegistry)>, SessionError>),
-    Invocation(Id, Rc<Invocation>),
+    Invocation(Id, Rc<Invocation>, Box<Result<RunResult, RunError>>),
 }
 enum SchedulerAction {
     Drain(TaskRegistry),
     Event(SchedulerEvent),
+    Failure(SessionError),
     Close,
 }
 
@@ -612,14 +665,23 @@ async fn schedule(
     let mut events: FuturesUnordered<LocalFuture<'static, SchedulerEvent>> =
         FuturesUnordered::new();
     loop {
-        if runner.0.borrow().closing && !control.0.borrow().closing {
-            control.seal(&runner);
-        }
         let action = std::future::poll_fn(|cx| {
             if let Poll::Ready(Some(event)) = events.poll_next_unpin(cx) {
                 return Poll::Ready(SchedulerAction::Event(event));
             }
             let mut state = control.0.borrow_mut();
+            if !state.closing {
+                let mut runner_state = runner.0.borrow_mut();
+                if runner_state.closing {
+                    return Poll::Ready(SchedulerAction::Failure(
+                        runner_state
+                            .session_error
+                            .clone()
+                            .unwrap_or(SessionError::Closed),
+                    ));
+                }
+                runner_state.waker = Some(cx.waker().clone());
+            }
             if state.closing && !state.draining && events.is_empty() {
                 return Poll::Ready(SchedulerAction::Close);
             }
@@ -636,9 +698,12 @@ async fn schedule(
             SchedulerAction::Drain(registry) => {
                 let session = session.clone();
                 let runner = runner.clone();
+                let weak_control = Rc::downgrade(&control);
                 let enabled = control.0.borrow().enabled;
                 events.push(Box::pin(async move {
-                    SchedulerEvent::Drain(reserve_all(&session, &runner, registry, enabled).await)
+                    SchedulerEvent::Drain(
+                        reserve_all(&session, &runner, weak_control, registry, enabled).await,
+                    )
                 }));
             }
             SchedulerAction::Event(SchedulerEvent::Drain(result)) => {
@@ -649,46 +714,74 @@ async fn schedule(
                             let session = session.clone();
                             events.push(Box::pin(async move {
                                 let id = invocation.id;
-                                let _ = phase::execute_reserved(
+                                let result = phase::execute_reserved(
                                     &session,
                                     &registry,
                                     invocation.clone(),
                                 )
                                 .await;
-                                SchedulerEvent::Invocation(id, invocation)
+                                SchedulerEvent::Invocation(id, invocation, Box::new(result))
                             }));
                         }
                     }
                     Ok(reservations) => {
-                        let mut state = runner.0.borrow_mut();
-                        for (invocation, _) in reservations {
-                            invocation.end();
-                            state.actives.remove(&invocation.id);
+                        let invocations = reservations
+                            .into_iter()
+                            .map(|(invocation, _)| invocation)
+                            .collect::<Vec<_>>();
+                        {
+                            let mut state = runner.0.borrow_mut();
+                            for invocation in &invocations {
+                                state.actives.remove(&invocation.id);
+                            }
                         }
+                        for invocation in invocations {
+                            invocation.end();
+                        }
+                    }
+                    Err(SessionError::Storage(StorageError::Rejected(_))) => {}
+                    Err(error) if !control.0.borrow().closing => {
+                        control.0.borrow_mut().failure = Some(error);
+                        control.seal(&runner);
                     }
                     Err(_) => {}
                 }
                 control.wake();
             }
-            SchedulerAction::Event(SchedulerEvent::Invocation(id, invocation)) => {
+            SchedulerAction::Event(SchedulerEvent::Invocation(id, invocation, result)) => {
                 invocation.end();
                 let mut state = runner.0.borrow_mut();
-                if state
+                let remove = state
                     .actives
                     .get(&id)
                     .and_then(Weak::upgrade)
-                    .is_some_and(|active| Rc::ptr_eq(&active, &invocation))
-                {
+                    .is_none_or(|active| Rc::ptr_eq(&active, &invocation));
+                if remove {
                     state.actives.remove(&id);
                 }
                 drop(state);
-                let mut state = control.0.borrow_mut();
-                state.dirty = true;
-                let waker = state.waker.take();
-                drop(state);
-                if let Some(waker) = waker {
-                    waker.wake();
+                if let Err(error) = *result
+                    && !control.0.borrow().closing
+                {
+                    let error = match error {
+                        RunError::Session(error) => error,
+                        other => SessionError::Invalid(other.to_string()),
+                    };
+                    control.0.borrow_mut().failure = Some(error);
+                    control.seal(&runner);
+                } else if !control.0.borrow().closing {
+                    let mut state = control.0.borrow_mut();
+                    state.dirty = true;
+                    let waker = state.waker.take();
+                    drop(state);
+                    if let Some(waker) = waker {
+                        waker.wake();
+                    }
                 }
+            }
+            SchedulerAction::Failure(error) => {
+                control.0.borrow_mut().failure = Some(error);
+                control.seal(&runner);
             }
             SchedulerAction::Close => break,
         }
@@ -702,17 +795,31 @@ async fn schedule(
 async fn reserve_all(
     session: &Session,
     runner: &Rc<RunnerControl>,
+    control: Weak<HarnessControl>,
     registry: TaskRegistry,
     enabled: bool,
 ) -> Result<Vec<(Rc<Invocation>, TaskRegistry)>, SessionError> {
     let tentative = Rc::new(RefCell::new(Vec::<Rc<Invocation>>::new()));
     let callback_tentative = tentative.clone();
     let callback_runner = runner.clone();
+    let callback_control = control.clone();
     let definitions = registry.clone();
     let receipt = session
         .commit(move |tx| {
             Box::pin(async move {
+                if callback_control
+                    .upgrade()
+                    .is_none_or(|control| control.0.borrow().closing)
+                {
+                    return Ok(Vec::new());
+                }
                 let mut tree = tx.tree().await?;
+                if callback_control
+                    .upgrade()
+                    .is_none_or(|control| control.0.borrow().closing)
+                {
+                    return Ok(Vec::new());
+                }
                 let before = tree.tasks.clone();
                 let mut scopes = BTreeMap::<Id, BTreeSet<Id>>::new();
                 for task in tree.tasks.values() {
@@ -792,6 +899,12 @@ async fn reserve_all(
                     selected.push(invocation);
                 }
                 tree.stage_changes(tx, &before).await?;
+                if callback_control
+                    .upgrade()
+                    .is_none_or(|control| control.0.borrow().closing)
+                {
+                    return Err(SessionError::Closed);
+                }
                 Ok(selected)
             })
         })
@@ -803,17 +916,22 @@ async fn reserve_all(
             .map(|invocation| (invocation, registry.clone()))
             .collect()),
         Err(error) => {
-            let mut state = runner.0.borrow_mut();
-            for invocation in tentative.borrow_mut().drain(..) {
-                invocation.end();
-                if state
-                    .actives
-                    .get(&invocation.id)
-                    .and_then(Weak::upgrade)
-                    .is_some_and(|active| Rc::ptr_eq(&active, &invocation))
-                {
-                    state.actives.remove(&invocation.id);
+            let invocations = tentative.borrow_mut().drain(..).collect::<Vec<_>>();
+            {
+                let mut state = runner.0.borrow_mut();
+                for invocation in &invocations {
+                    if state
+                        .actives
+                        .get(&invocation.id)
+                        .and_then(Weak::upgrade)
+                        .is_some_and(|active| Rc::ptr_eq(&active, invocation))
+                    {
+                        state.actives.remove(&invocation.id);
+                    }
                 }
+            }
+            for invocation in invocations {
+                invocation.end();
             }
             Err(error)
         }
