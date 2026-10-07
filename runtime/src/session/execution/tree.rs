@@ -314,24 +314,28 @@ impl Tree {
         matches!(&record.state, TaskState::Completing { outcome } | TaskState::Terminal { outcome }
             if !matches!(outcome, TaskOutcome::Completed { .. }))
     }
-    pub fn mark(&mut self, id: Id) {
+    pub fn mark(&mut self, id: Id) -> bool {
         if let Some(record) = self.tasks.get_mut(&id)
             && record.status() != TaskStatus::Terminal
+            && !record.abort_requested
         {
             record.abort_requested = true;
+            true
+        } else {
+            false
         }
     }
     /// Fixed point over this explicit ordinary scope only. External wait targets are observations.
     pub fn reconcile(&mut self, scope: &BTreeSet<Id>) {
         loop {
-            let before = self.tasks.clone();
+            let mut changed = false;
             for id in scope {
                 let record = &self.tasks[id];
                 if record.status() != TaskStatus::Terminal
                     && (record.abort_requested || Self::failed(record))
                 {
                     for child in self.descendants(*id) {
-                        self.mark(child);
+                        changed |= self.mark(child);
                     }
                 }
                 if let TaskState::Waiting {
@@ -354,7 +358,7 @@ impl Tree {
                                     .get(&target)
                                     .is_some_and(|r| r.owner == Some(*id) && !Self::failed(r))
                             {
-                                self.mark(target);
+                                changed |= self.mark(target);
                             }
                         }
                     }
@@ -387,9 +391,10 @@ impl Tree {
                 };
                 if let Some(next) = next {
                     self.tasks.get_mut(id).unwrap().state = next;
+                    changed = true;
                 }
             }
-            if self.tasks == before {
+            if !changed {
                 break;
             }
         }
