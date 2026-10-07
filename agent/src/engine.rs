@@ -229,6 +229,14 @@ impl Agent {
                 if runtime.is_cancelled() {
                     return Ok(());
                 }
+                let resolved = self.resolve(&runtime).await?;
+                let request = resolved.before_request(&runtime, request).await?;
+                // Replacements remain provider-neutral but must obey the same
+                // wire/JSON contract before being offered to a model.
+                validate_request(&request)?;
+                if runtime.is_cancelled() {
+                    return Ok(());
+                }
                 let offers = request.tools.clone();
                 let future = self
                     .0
@@ -256,6 +264,7 @@ impl Agent {
                                 )
                                 .await;
                         }
+                        resolved.after_response(&runtime, response.clone()).await?;
                         let ModelMessage::Assistant { ref tool_calls, .. } = response.message
                         else {
                             unreachable!()
@@ -345,6 +354,29 @@ impl Agent {
                     .get(index)
                     .ok_or_else(|| invalid("Invalid tool index"))?
                     .clone();
+                if index + 1 == calls.len() {
+                    let resolved = self.resolve(&runtime).await?;
+                    let observed_calls = calls.clone();
+                    let outcomes = runtime
+                        .read(move |tx, task| {
+                            Box::pin(async move {
+                                let settled = tx
+                                    .task(child)
+                                    .await?
+                                    .ok_or_else(|| invalid("Missing tool child"))?;
+                                if settled.status() != TaskStatus::Terminal
+                                    || settled.owner != Some(task.id)
+                                {
+                                    return Err(invalid("Tool child not settled or wrong owner"));
+                                }
+                                tool_outcomes(tx, task.conversation_id, assistant, observed_calls)
+                                    .await
+                            })
+                        })
+                        .await?
+                        .value;
+                    resolved.after_tools(&runtime, outcomes).await?;
+                }
                 let agent = self.clone();
                 runtime
                     .commit(move |tx, task| {
@@ -632,7 +664,49 @@ impl Agent {
             )
             .await;
         }
-        let execute = tool.expect("validated installed tool").execute.clone();
+        let tool = tool.expect("validated installed tool");
+        let resolved = resolved.as_ref().expect("offered tool resolution");
+        let (call, block) = resolved.before_tool(&runtime, call).await?;
+        // All rewrites run before intent. Validate native JSON as well as the
+        // pinned tool's schema; no later extension can override a first block.
+        let rejection = block.map(|message| (message, "tool_blocked")).or_else(|| {
+            if !resolved
+                .extensions()
+                .iter()
+                .any(|e| e.hooks().before_tool.is_some())
+            {
+                return None;
+            }
+            validate_entry(
+                Some(vec![encode_message(&ModelMessage::Assistant {
+                    text: String::new(),
+                    tool_calls: vec![call.clone()],
+                })]),
+                None,
+            )
+            .map_err(|e| e.to_string())
+            .and_then(|()| (tool.validate)(&call.arguments))
+            .err()
+            .map(|message| (message, "invalid_tool_call"))
+        });
+        if let Some((message, code)) = rejection {
+            return finish_tool(
+                &runtime,
+                &input,
+                ToolResult {
+                    content: message,
+                    is_error: true,
+                    usage: None,
+                },
+                Some(code),
+                End::Complete,
+            )
+            .await;
+        }
+        if runtime.is_cancelled() {
+            return Ok(());
+        }
+        let execute = tool.execute.clone();
         runtime
             .commit(|_, _| {
                 Box::pin(async { Ok(Some(TaskUpdate::Checkpoint(json!({"phase":"in_flight"})))) })
@@ -642,7 +716,7 @@ impl Agent {
         if runtime.is_cancelled() {
             return Ok(());
         }
-        let future = execute(call, Cancellation(runtime.clone()));
+        let future = execute(call.clone(), Cancellation(runtime.clone()));
         let result = match select(future, Box::pin(runtime.cancelled())).await {
             Either::Left((result, _)) => result,
             Either::Right(_) => return Ok(()),
@@ -650,23 +724,22 @@ impl Agent {
         if runtime.is_cancelled() {
             return Ok(());
         }
-        match result {
-            Ok(result) => finish_tool(&runtime, &input, result, None, End::Complete).await,
-            Err(error) => {
-                finish_tool(
-                    &runtime,
-                    &input,
-                    ToolResult {
-                        content: error.message.clone(),
-                        is_error: true,
-                        usage: error.usage,
-                    },
-                    Some("tool_error"),
-                    End::Fail(error.message),
-                )
-                .await
-            }
-        }
+        let (result, code, end) = match result {
+            Ok(result) => (result, None, End::Complete),
+            Err(error) => (
+                ToolResult {
+                    content: error.message.clone(),
+                    is_error: true,
+                    usage: error.usage,
+                },
+                Some("tool_error"),
+                End::Fail(error.message),
+            ),
+        };
+        let result = resolved
+            .after_tool(&runtime, ToolOutcome { call, result })
+            .await?;
+        finish_tool(&runtime, &input, result, code, end).await
     }
     async fn abort_turn(
         &self,
@@ -720,6 +793,17 @@ fn checkpoint(task: &TaskRecord) -> Result<&Value, SessionError> {
         | TaskState::Waiting { checkpoint, .. } => Ok(checkpoint),
         _ => Err(invalid("Task has no checkpoint")),
     }
+}
+fn validate_request(request: &ModelRequest) -> Result<(), SessionError> {
+    let tools = Value::Array(request.tools.iter().map(declaration).collect());
+    declarations(&tools)?;
+    for message in &request.messages {
+        decode_message(&encode_message(message))?;
+    }
+    validate_entry(
+        Some(request.messages.iter().map(encode_message).collect()),
+        Some(json!({"model":request.model,"instructions":request.instructions,"tools":tools})),
+    )
 }
 fn decode_request(cp: &Value) -> Result<ModelRequest, SessionError> {
     id(cp, "cutoff")?;
@@ -822,6 +906,68 @@ fn decode_tool_input(value: &Value) -> Result<ToolInput, SessionError> {
         return Err(invalid("Empty tool input ID or name"));
     }
     Ok(result)
+}
+// Observe the batch in original call order. Missing child results use the same
+// fallback that the tools phase will durably append; observers cannot write it.
+async fn tool_outcomes(
+    tx: &Tx,
+    conversation: Id,
+    assistant: Id,
+    calls: Vec<ToolCall>,
+) -> Result<Vec<ToolOutcome>, SessionError> {
+    let mut results = BTreeMap::new();
+    let mut cursor = None;
+    loop {
+        let page = tx
+            .scan_entries(EntryQuery::new(conversation), 128, cursor)
+            .await?;
+        for entry in page.items {
+            if entry.kind != "agent.toolResult"
+                || entry
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("assistantEntryId"))
+                    .and_then(Value::as_u64)
+                    != Some(assistant.get())
+            {
+                continue;
+            }
+            if let Some(messages) = entry.model {
+                for message in messages {
+                    if let ModelMessage::ToolResult {
+                        call_id,
+                        content,
+                        is_error,
+                    } = decode_message(&message)?
+                    {
+                        results.insert(
+                            call_id,
+                            ToolResult {
+                                content,
+                                is_error,
+                                usage: entry.data.as_ref().and_then(|d| d.get("usage")).cloned(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        cursor = page.next;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(calls
+        .into_iter()
+        .map(|call| {
+            let result = results.remove(&call.id).unwrap_or_else(|| ToolResult {
+                content: "Tool result unavailable; the operation may have run.".into(),
+                is_error: true,
+                usage: None,
+            });
+            ToolOutcome { call, result }
+        })
+        .collect())
 }
 async fn result_ids(
     tx: &Tx,

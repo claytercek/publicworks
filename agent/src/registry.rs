@@ -1,5 +1,5 @@
 //! Process-local extension publication and selection policy.
-use crate::{SessionError, Tool, invalid, wire};
+use crate::{LifecycleHooks, SessionError, Tool, invalid, wire};
 use std::{collections::BTreeSet, rc::Rc};
 
 /// A named bundle of trusted local code. Names are case-sensitive.
@@ -7,13 +7,22 @@ use std::{collections::BTreeSet, rc::Rc};
 pub struct Extension {
     name: String,
     tools: Vec<Tool>,
+    hooks: LifecycleHooks,
 }
 impl Extension {
     pub fn new(name: impl Into<String>, tools: Vec<Tool>) -> Self {
         Self {
             name: name.into(),
             tools,
+            hooks: LifecycleHooks::default(),
         }
+    }
+    pub fn with_hooks(mut self, hooks: LifecycleHooks) -> Self {
+        self.hooks = hooks;
+        self
+    }
+    pub fn hooks(&self) -> &LifecycleHooks {
+        &self.hooks
     }
     pub fn name(&self) -> &str {
         &self.name

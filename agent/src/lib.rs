@@ -10,6 +10,10 @@ mod config;
 pub use config::ExtensionConfig;
 mod context;
 mod engine;
+mod hooks;
+pub use hooks::{
+    BeforeTool, Hook, HookContext, HookError, HookFuture, LifecycleHooks, ToolOutcome,
+};
 mod registry;
 mod wire;
 pub use context::{ContextProjection, project_context};

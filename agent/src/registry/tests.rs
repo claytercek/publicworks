@@ -438,3 +438,44 @@ fn publication_and_resolution_never_invoke_callbacks() {
     );
     registry.uninstall("a").unwrap();
 }
+
+#[test]
+fn selected_hook_objects_survive_replacement_and_uninstall() {
+    use crate::LifecycleHooks;
+    let callback = Rc::new(
+        |_: crate::ModelResponse, _: crate::HookContext| -> crate::HookFuture<()> {
+            panic!("publication and selection cannot run hooks")
+        },
+    );
+    let weak = Rc::downgrade(&callback);
+    let mut registry = AgentRegistry::new();
+    registry
+        .install(Extension::new("hooks", vec![]).with_hooks(LifecycleHooks {
+            after_response: Some(callback),
+            ..LifecycleHooks::default()
+        }))
+        .unwrap();
+    let snapshot = registry.snapshot();
+    let selected = snapshot.resolve(&ExtensionSelection::Exact(names(&["hooks", "hooks"])), None);
+    assert_eq!(selected.extensions().len(), 1);
+    assert!(Rc::ptr_eq(
+        snapshot
+            .get("hooks")
+            .unwrap()
+            .hooks()
+            .after_response
+            .as_ref()
+            .unwrap(),
+        selected.extensions()[0]
+            .hooks()
+            .after_response
+            .as_ref()
+            .unwrap()
+    ));
+    registry.install(Extension::new("hooks", vec![])).unwrap();
+    registry.uninstall("hooks").unwrap();
+    drop(snapshot);
+    assert!(weak.upgrade().is_some());
+    drop(selected);
+    assert!(weak.upgrade().is_none());
+}

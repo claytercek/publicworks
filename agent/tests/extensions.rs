@@ -681,3 +681,9 @@ fn sqlite_publication_wakes_blocked_work_and_deselection_prevents_execution() {
         db.open(),
     )));
 }
+
+#[path = "extensions/hooks.rs"]
+mod hooks;
+
+#[path = "extensions/hook_lifetime.rs"]
+mod hook_lifetime;
