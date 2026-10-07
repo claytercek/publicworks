@@ -60,8 +60,10 @@ The in-memory and SQLite storage adapters return boxed futures but **block while
 polled**. The opt-in HTTP provider uses asynchronous network I/O. SQLite uses WAL,
 NORMAL synchronization, and one transaction per batch. This is an embedded,
 single-logical-owner foundation, not a multiwriter runtime or a power-loss
-persistence guarantee. The current schema is Public Works' own v4. There are no
-existing users or schema migrations: incompatible databases reject without being
+persistence guarantee. The current schema is Public Works' own typed, indexed v5.
+It uses separate record tables plus a global ID registry, bounded SQL reads, and
+leased durable ID ranges. There are no existing users or schema migrations:
+incompatible databases reject without being
 deleted or rewritten. Use a new path or manually recreate a disposable development
 database when the format changes. Backward compatibility is not promised during
 this pre-user phase. Atomic write rollback remains required; it prevents partial
