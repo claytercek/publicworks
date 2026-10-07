@@ -164,43 +164,54 @@ fn decode_contribution(
 /// matching result wins; results never cross the next assistant, even when an
 /// explicit association points backward. Unmatched results are discarded.
 fn order_tool_results(messages: &[ProjectedMessage]) -> Vec<ModelMessage> {
-    let mut ordered = Vec::new();
-    for (index, projected) in messages.iter().enumerate() {
-        if matches!(projected.message, ModelMessage::ToolResult { .. }) {
-            continue;
-        }
-        ordered.push(projected.message.clone());
-        let ModelMessage::Assistant { tool_calls, .. } = &projected.message else {
-            continue;
-        };
-        if tool_calls.is_empty() {
-            continue;
-        }
-        let mut results = BTreeMap::new();
-        for candidate in &messages[index + 1..] {
-            match &candidate.message {
-                ModelMessage::Assistant { .. } => break,
-                ModelMessage::ToolResult { call_id, .. }
-                    if candidate
-                        .assistant_id
-                        .is_none_or(|id| id == projected.entry_id) =>
-                {
-                    results
-                        .entry(call_id.as_str())
-                        .or_insert(&candidate.message);
-                }
-                _ => {}
+    let mut ordered = Vec::with_capacity(messages.len());
+    let mut index = 0;
+    while index < messages.len() {
+        let projected = &messages[index];
+        match &projected.message {
+            ModelMessage::ToolResult { .. } => {
+                index += 1;
             }
-        }
-        for call in tool_calls {
-            ordered.push(results.get(call.id.as_str()).map_or_else(
-                || ModelMessage::ToolResult {
-                    call_id: call.id.clone(),
-                    content: MISSING_RESULT_TEXT.into(),
-                    is_error: true,
-                },
-                |message| (*message).clone(),
-            ));
+            ModelMessage::User { .. } => {
+                ordered.push(projected.message.clone());
+                index += 1;
+            }
+            ModelMessage::Assistant { tool_calls, .. } => {
+                ordered.push(projected.message.clone());
+                let mut results = BTreeMap::new();
+                let mut following = Vec::new();
+                let mut end = index + 1;
+                while end < messages.len() {
+                    let candidate = &messages[end];
+                    match &candidate.message {
+                        ModelMessage::Assistant { .. } => break,
+                        ModelMessage::ToolResult { call_id, .. }
+                            if candidate
+                                .assistant_id
+                                .is_none_or(|id| id == projected.entry_id) =>
+                        {
+                            results
+                                .entry(call_id.as_str())
+                                .or_insert(&candidate.message);
+                        }
+                        ModelMessage::User { .. } => following.push(candidate.message.clone()),
+                        ModelMessage::ToolResult { .. } => {}
+                    }
+                    end += 1;
+                }
+                for call in tool_calls {
+                    ordered.push(results.get(call.id.as_str()).map_or_else(
+                        || ModelMessage::ToolResult {
+                            call_id: call.id.clone(),
+                            content: MISSING_RESULT_TEXT.into(),
+                            is_error: true,
+                        },
+                        |message| (*message).clone(),
+                    ));
+                }
+                ordered.extend(following);
+                index = end;
+            }
         }
     }
     ordered
