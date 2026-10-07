@@ -345,10 +345,16 @@ where
                         std::mem::take(&mut state.conversation_states),
                     )
                 };
-                let writes = tasks::assemble(storage, writes, tasks, control).await?;
-                let writes =
-                    submissions::assemble(storage, writes, submissions, conversation_states)
-                        .await?;
+                let mut tree = None;
+                let writes = tasks::assemble(storage, writes, tasks, control, &mut tree).await?;
+                let writes = submissions::assemble(
+                    storage,
+                    writes,
+                    submissions,
+                    conversation_states,
+                    &mut tree,
+                )
+                .await?;
                 let fence = state.borrow_mut().fence.take();
                 Ok((value, writes, fence))
             })

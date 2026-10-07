@@ -223,6 +223,7 @@ pub(super) async fn assemble(
     mut writes: Vec<StorageWrite>,
     mut tasks: BTreeMap<Id, TaskCandidate>,
     control: Rc<RefCell<Control>>,
+    cached_tree: &mut Option<execution::tree::Tree>,
 ) -> Result<Vec<StorageWrite>, SessionError> {
     let mut owners = Vec::new();
     for write in &writes {
@@ -287,7 +288,10 @@ pub(super) async fn assemble(
         .values()
         .any(|c| c.validate_wait || c.record.status() == TaskStatus::Terminal);
     if needs_outcome_view || (guarded && changes_ownership) {
-        let mut tree = execution::tree::Tree::load(storage).await?;
+        if cached_tree.is_none() {
+            *cached_tree = Some(execution::tree::Tree::load(storage).await?);
+        }
+        let tree = cached_tree.as_mut().expect("loaded tree");
         for candidate in tasks.values() {
             tree.tasks
                 .insert(candidate.record.id, candidate.record.clone());

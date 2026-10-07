@@ -598,6 +598,7 @@ pub(super) async fn assemble(
     mut writes: Vec<StorageWrite>,
     mut submissions: BTreeMap<Id, SubmissionCandidate>,
     mut states: BTreeMap<Id, ConversationStateRecord>,
+    cached_tree: &mut Option<execution::tree::Tree>,
 ) -> Result<Vec<StorageWrite>, SessionError> {
     // Abort/failure candidates cascade into owned conversation nodes even when
     // those nodes have no live tasks. The task's own conversation is excluded:
@@ -614,7 +615,10 @@ pub(super) async fn assemble(
         })
         .collect::<Vec<_>>();
     if !cascades.is_empty() {
-        let mut tree = execution::tree::Tree::load(storage).await?;
+        if cached_tree.is_none() {
+            *cached_tree = Some(execution::tree::Tree::load(storage).await?);
+        }
+        let tree = cached_tree.as_mut().expect("loaded tree");
         for write in &writes {
             match write {
                 StorageWrite::Task(task) => {

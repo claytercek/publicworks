@@ -116,7 +116,8 @@ fn final_assembly_rejects_conflicting_ids_and_state_identity_changes() {
                 &mut storage,
                 vec![],
                 BTreeMap::new(),
-                BTreeMap::from([(id(2), changed)])
+                BTreeMap::from([(id(2), changed)]),
+                &mut None,
             )
             .await
             .is_err()
@@ -128,7 +129,8 @@ fn final_assembly_rejects_conflicting_ids_and_state_identity_changes() {
                 &mut storage,
                 vec![],
                 BTreeMap::new(),
-                BTreeMap::from([(id(2), changed)])
+                BTreeMap::from([(id(2), changed)]),
+                &mut None,
             )
             .await
             .is_err()
@@ -143,7 +145,8 @@ fn final_assembly_rejects_conflicting_ids_and_state_identity_changes() {
                     "collision"
                 ))],
                 BTreeMap::new(),
-                BTreeMap::from([(id(2), state)])
+                BTreeMap::from([(id(2), state)]),
+                &mut None,
             )
             .await
             .is_err()
@@ -170,7 +173,8 @@ fn final_assembly_rejects_conflicting_ids_and_state_identity_changes() {
                     owner: None
                 })],
                 BTreeMap::new(),
-                BTreeMap::from(states)
+                BTreeMap::from(states),
+                &mut None,
             )
             .await
             .is_err()
@@ -231,7 +235,8 @@ fn final_assembly_rechecks_submission_identity_and_creation_class() {
                     &mut storage,
                     vec![],
                     BTreeMap::from([(id(3), candidate)]),
-                    BTreeMap::new()
+                    BTreeMap::new(),
+                    &mut None,
                 )
                 .await
                 .is_err()
