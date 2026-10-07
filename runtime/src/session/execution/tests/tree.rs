@@ -227,7 +227,7 @@ fn drive_drop_fences_scans_in_reconciliation_reservation_and_final_assembly() {
 }
 
 #[test]
-fn late_page_unsupported_work_blocks_before_partial_execution() {
+fn late_page_background_and_owned_conversations_are_supported_boundaries() {
     for owned_conversation in [false, true] {
         block_on(async {
             let probe = Rc::new(Probe::default());
@@ -259,32 +259,25 @@ fn late_page_unsupported_work_blocks_before_partial_execution() {
                     .unwrap();
             zip(
                 async {
-                    let before = probe
-                        .events
-                        .borrow()
-                        .iter()
-                        .filter(|&&e| e == "persisted")
-                        .count();
-                    assert_eq!(
+                    assert!(matches!(
                         runner.run(id(10)).await.unwrap(),
-                        RunResult::Blocked(BlockReason::UnsupportedScope)
-                    );
-                    assert_eq!(
-                        runner.abort(id(169)).await.unwrap(),
-                        AbortResult::Blocked(BlockReason::UnsupportedScope)
-                    );
-                    assert_eq!(
-                        probe
-                            .events
-                            .borrow()
-                            .iter()
-                            .filter(|&&e| e == "persisted")
-                            .count(),
-                        before
-                    );
+                        RunResult::Terminal(_)
+                    ));
+                    if !owned_conversation {
+                        let background = session
+                            .commit(|tx| Box::pin(async { tx.task(id(169)).await }))
+                            .await
+                            .unwrap()
+                            .value
+                            .unwrap();
+                        assert_eq!(background.status(), TaskStatus::Pending);
+                        assert!(matches!(
+                            runner.run(id(169)).await.unwrap(),
+                            RunResult::Terminal(_)
+                        ));
+                    }
                     runner.close().await.unwrap();
                     session.close().await.unwrap();
-                    assert_eq!(*probe.closed_tasks.borrow(), records);
                 },
                 zip(driver, tasks),
             )
@@ -503,7 +496,7 @@ fn candidate_wait_is_atomic_and_final_owners_reject_new_children_in_both_orders(
 }
 
 #[test]
-fn candidate_scope_guard_rejects_nested_unsupported_work_but_allows_unrelated_scopes() {
+fn candidate_scope_guard_accepts_owned_conversations_but_rejects_background_children() {
     block_on(async {
         let (definition, context) = captured();
         let (session, driver) = Session::new(MemoryStorage::new());
@@ -542,7 +535,11 @@ fn candidate_scope_guard_rejects_nested_unsupported_work_but_allows_unrelated_sc
                                 })
                             })
                             .await;
-                        assert!(matches!(result, Err(SessionError::Invalid(_))));
+                        if background {
+                            assert!(matches!(result, Err(SessionError::Invalid(_))));
+                        } else {
+                            result.unwrap();
+                        }
                     }
                 }
                 let conversation_id = root.conversation_id;
@@ -554,7 +551,7 @@ fn candidate_scope_guard_rejects_nested_unsupported_work_but_allows_unrelated_sc
                                     .await?
                                     .items
                                     .len(),
-                                1
+                                3
                             );
                             let unrelated = tx
                                 .create_task(
@@ -686,9 +683,9 @@ fn tree_guard_covers_reconcile_gap_after_invocation_ends() {
         });
         gate.release();
         // Drain Session first, before TaskDriver can observe quiescence and release
-        // its drive. No invocation guard exists at this point.
+        // its drive. Owned conversations remain valid while the drive is live.
         tick(&mut driver).await;
-        assert!(matches!(ownership.await, Err(SessionError::Invalid(_))));
+        ownership.await.unwrap();
         tick(&mut tasks).await;
         assert!(matches!(run.await.unwrap(), RunResult::Suspended(_)));
         let released = session.commit(|tx| {

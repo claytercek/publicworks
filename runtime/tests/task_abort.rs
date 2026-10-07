@@ -775,15 +775,17 @@ fn abort_handles_orphans_unsupported_scope_missing_tasks_and_terminal_noops() {
                 ));
                 assert_eq!(
                     runner.abort(unsupported.id).await.unwrap(),
-                    AbortResult::Blocked(BlockReason::UnsupportedScope)
+                    AbortResult::Marked
                 );
-                assert_eq!(read(&session, unsupported.id).await, unsupported);
+                let marked_background = read(&session, unsupported.id).await;
+                assert!(marked_background.abort_requested);
+                assert_eq!(marked_background.status(), TaskStatus::Pending);
                 assert_eq!(
                     runner.abort(terminal_task.id).await.unwrap(),
                     AbortResult::Terminal
                 );
                 assert_eq!(read(&session, terminal_task.id).await, completed);
-                assert_eq!(marker(&session).await.get(), before.get() + 1);
+                assert_eq!(marker(&session).await.get(), before.get() + 2);
 
                 runner.close().await.unwrap();
                 session.close().await.unwrap();

@@ -100,11 +100,7 @@ fn tree_guard_checks_all_transactions_and_both_staging_orders() {
                                 })
                             })
                             .await;
-                        if conversation {
-                            assert!(matches!(result, Err(SessionError::Invalid(_))));
-                        } else {
-                            result.unwrap();
-                        }
+                        result.unwrap();
                     }
                 }
                 let result = runtime
@@ -526,10 +522,10 @@ fn reservation_rejection_releases_guard_but_uncertainty_poison_stops_runner() {
                             })
                             .await
                             .unwrap();
-                        assert_eq!(
+                        assert!(matches!(
                             runner.run(id).await.unwrap(),
-                            RunResult::Blocked(BlockReason::UnsupportedScope)
-                        );
+                            RunResult::Terminal(_)
+                        ));
                         runner.close().await.unwrap();
                     } else {
                         assert!(matches!(
@@ -553,7 +549,9 @@ fn reservation_rejection_releases_guard_but_uncertainty_poison_stops_runner() {
                     let state = probe.closed_tasks.borrow()[0].status();
                     assert_eq!(
                         state,
-                        if matches!(fault_mode, Fault::After) {
+                        if matches!(fault_mode, Fault::Rejected) {
+                            TaskStatus::Terminal
+                        } else if matches!(fault_mode, Fault::After) {
                             TaskStatus::Running
                         } else {
                             TaskStatus::Pending

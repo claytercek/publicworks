@@ -2,6 +2,12 @@
 use super::*;
 use std::collections::BTreeSet;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Up {
+    Task(Id),
+    Conversation(Id),
+}
+
 pub(in crate::session) struct Tree {
     pub tasks: BTreeMap<Id, TaskRecord>,
     pub conversations: BTreeMap<Id, ConversationRecord>,
@@ -37,81 +43,147 @@ impl Tree {
             conversations,
         })
     }
-    /// Missing edges and cycles are errors, never permission to drive a partial tree.
-    pub fn root(&self, id: Id) -> Option<Id> {
-        let conversation = self.tasks.get(&id)?.conversation_id;
-        if self.conversations.get(&conversation)?.owner.is_some() {
-            return None;
-        }
-        let mut seen = BTreeSet::new();
-        let mut current = id;
-        loop {
-            if !seen.insert(current) {
-                return None;
-            }
-            let record = self.tasks.get(&current)?;
-            if record.background || record.conversation_id != conversation {
-                return None;
-            }
-            match record.owner {
-                Some(owner) => current = owner,
-                None => return Some(current),
-            }
+
+    fn parent(&self, record: &TaskRecord) -> Option<Up> {
+        if let Some(owner) = record.owner {
+            let owner = self.tasks.get(&owner)?;
+            (owner.conversation_id == record.conversation_id).then_some(Up::Task(owner.id))
+        } else {
+            self.conversations
+                .contains_key(&record.conversation_id)
+                .then_some(Up::Conversation(record.conversation_id))
         }
     }
-    pub fn descendants(&self, id: Id) -> BTreeSet<Id> {
-        let mut result = BTreeSet::from([id]);
-        loop {
-            let before = result.len();
-            for record in self.tasks.values() {
-                if record.owner.is_some_and(|owner| result.contains(&owner)) {
-                    result.insert(record.id);
+
+    fn next(&self, node: Up) -> Option<Option<Up>> {
+        match node {
+            Up::Task(id) => Some(Some(self.parent(self.tasks.get(&id)?)?)),
+            Up::Conversation(id) => {
+                let conversation = self.conversations.get(&id)?;
+                match &conversation.owner {
+                    Some(owner) => {
+                        let task = self.tasks.get(&owner.task_id)?;
+                        (task.conversation_id == owner.conversation_id)
+                            .then_some(Some(Up::Task(task.id)))
+                    }
+                    None => Some(None),
                 }
             }
-            if before == result.len() {
-                break;
-            }
         }
-        result.remove(&id);
-        result
     }
+
+    fn above(&self, start: Up) -> Option<Vec<Up>> {
+        let mut seen = BTreeSet::new();
+        let mut result = Vec::new();
+        let mut current = Some(start);
+        while let Some(node) = current {
+            if !seen.insert(node) {
+                return None;
+            }
+            result.push(node);
+            current = self.next(node)?;
+        }
+        Some(result)
+    }
+
+    /// The scheduling anchor reached through task and conversation ownership.
+    /// A background task is an independent anchor. Fork ancestry is never followed.
+    pub fn root(&self, id: Id) -> Option<Id> {
+        let record = self.tasks.get(&id)?;
+        if record.background {
+            return Some(id);
+        }
+        let mut root = id;
+        let mut seen = BTreeSet::new();
+        let mut current = Some(self.parent(record)?);
+        while let Some(node) = current {
+            if !seen.insert(node) {
+                return None;
+            }
+            if let Up::Task(task) = node {
+                root = task;
+                if self.tasks.get(&task)?.background {
+                    return Some(root);
+                }
+            }
+            current = self.next(node)?;
+        }
+        Some(root)
+    }
+
+    fn ordinary_descendant(&self, record: &TaskRecord, owner: Id) -> bool {
+        if record.id == owner || record.background {
+            return false;
+        }
+        let Some(parent) = self.parent(record) else {
+            return false;
+        };
+        let mut seen = BTreeSet::new();
+        let mut current = Some(parent);
+        while let Some(node) = current {
+            if !seen.insert(node) {
+                return false;
+            }
+            if let Up::Task(id) = node {
+                if id == owner {
+                    return true;
+                }
+                if self.tasks.get(&id).is_some_and(|task| task.background) {
+                    return false;
+                }
+            }
+            let Some(next) = self.next(node) else {
+                return false;
+            };
+            current = next;
+        }
+        false
+    }
+
+    pub fn descendants(&self, id: Id) -> BTreeSet<Id> {
+        self.tasks
+            .values()
+            .filter(|record| self.ordinary_descendant(record, id))
+            .map(|record| record.id)
+            .collect()
+    }
+
     pub fn scope(&self, root: Id) -> Option<BTreeSet<Id>> {
         if self.root(root)? != root {
             return None;
         }
         let mut scope = self.descendants(root);
         scope.insert(root);
-        if scope.iter().any(|id| self.root(*id) != Some(root))
-            || self
-                .conversations
-                .values()
-                .any(|c| c.owner.as_ref().is_some_and(|o| scope.contains(&o.task_id)))
-        {
+        if scope.iter().any(|id| self.root(*id) != Some(root)) {
             return None;
         }
         Some(scope)
     }
+
     pub fn owned_live(&self, id: Id) -> bool {
         self.descendants(id)
             .iter()
             .any(|id| self.tasks[id].status() != TaskStatus::Terminal)
     }
+
     pub fn validate_wait(&self, record: &TaskRecord) -> Result<(), SessionError> {
         let TaskState::Waiting { on, policy, .. } = &record.state else {
             return Ok(());
         };
-        let mut ancestors = BTreeSet::from([record.id]);
-        let mut owner = record.owner;
-        while let Some(id) = owner {
-            if !ancestors.insert(id) {
-                return Err(SessionError::Invalid("Cyclic task ownership".into()));
-            }
-            owner = self
-                .tasks
-                .get(&id)
-                .ok_or_else(|| SessionError::Invalid("Missing task owner".into()))?
-                .owner;
-        }
+        let parent = self
+            .parent(record)
+            .ok_or_else(|| SessionError::Invalid("Missing task or conversation owner".into()))?;
+        let above = self
+            .above(parent)
+            .ok_or_else(|| SessionError::Invalid("Cyclic or missing ownership".into()))?;
+        let ancestors = above
+            .into_iter()
+            .filter_map(|node| match node {
+                Up::Task(id) => Some(id),
+                Up::Conversation(_) => None,
+            })
+            .chain(std::iter::once(record.id))
+            .collect::<BTreeSet<_>>();
         for id in on {
             let member = self
                 .tasks
@@ -139,7 +211,7 @@ impl Tree {
             record.abort_requested = true;
         }
     }
-    /// Fixed point over this explicit scope only. External wait targets are observations.
+    /// Fixed point over this explicit ordinary scope only. External wait targets are observations.
     pub fn reconcile(&mut self, scope: &BTreeSet<Id>) {
         loop {
             let before = self.tasks.clone();
