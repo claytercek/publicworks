@@ -600,16 +600,19 @@ fn uncertain_public_commit_wakes_scheduler_and_fails_close() {
                 .value;
             let task_waiter = harness.wait_task(task.id);
             fail.set(true);
-            let failed = harness
-                .commit(|tx| Box::pin(async move { tx.create_conversation().await }))
-                .await;
+            let failed =
+                harness.commit(|tx| Box::pin(async move { tx.create_conversation().await }));
+            let close = harness.close();
             assert!(matches!(
-                failed,
+                failed.await,
                 Err(SessionError::Storage(StorageError::Other(_)))
             ));
-            assert!(matches!(task_waiter.await, Err(HarnessError::Closed)));
             assert!(matches!(
-                harness.close().await,
+                task_waiter.await,
+                Err(HarnessError::Closed | HarnessError::Session(SessionError::Closed))
+            ));
+            assert!(matches!(
+                close.await,
                 Err(HarnessError::Session(SessionError::Poisoned))
             ));
         };

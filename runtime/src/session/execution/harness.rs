@@ -59,13 +59,22 @@ impl Drop for TaskWaiter {
         };
         registration.cancelled.set(true);
         if let Some(control) = registration.control.upgrade() {
-            let mut state = control.0.borrow_mut();
-            if let Some(waiters) = state.task_waiters.get_mut(&registration.task) {
-                waiters.remove(&registration.key);
-                if waiters.is_empty() {
+            let removed = {
+                let mut state = control.0.borrow_mut();
+                let (removed, empty) = state
+                    .task_waiters
+                    .get_mut(&registration.task)
+                    .map(|waiters| {
+                        let removed = waiters.remove(&registration.key);
+                        (removed, waiters.is_empty())
+                    })
+                    .unwrap_or((None, false));
+                if empty {
                     state.task_waiters.remove(&registration.task);
                 }
-            }
+                removed
+            };
+            drop(removed);
         }
     }
 }
@@ -435,7 +444,7 @@ impl Harness {
 
     /// Replace the immutable process-local definition snapshot.
     pub fn replace_registry(&self, registry: TaskRegistry) -> Result<(), HarnessError> {
-        let waker = {
+        let (previous, waker) = {
             let mut state = self.control.0.borrow_mut();
             if state.stopped {
                 return Err(HarnessError::DriverStopped);
@@ -443,11 +452,12 @@ impl Harness {
             if state.closing {
                 return Err(HarnessError::Closed);
             }
-            state.registry = registry;
+            let previous = std::mem::replace(&mut state.registry, registry);
             state.registry_generation += 1;
             state.dirty = true;
-            state.waker.take()
+            (previous, state.waker.take())
         };
+        drop(previous);
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -740,34 +750,41 @@ async fn schedule(
                         }
                     }
                     Err(SessionError::Storage(StorageError::Rejected(_))) => {}
-                    Err(error) if !control.0.borrow().closing => {
-                        control.0.borrow_mut().failure = Some(error);
+                    Err(SessionError::Closed) if control.0.borrow().closing => {}
+                    Err(error) => {
+                        if control.0.borrow().failure.is_none() {
+                            control.0.borrow_mut().failure = Some(error);
+                        }
                         control.seal(&runner);
                     }
-                    Err(_) => {}
                 }
                 control.wake();
             }
             SchedulerAction::Event(SchedulerEvent::Invocation(id, invocation, result)) => {
-                invocation.end();
-                let mut state = runner.0.borrow_mut();
-                let remove = state
+                let current = runner
+                    .0
+                    .borrow_mut()
                     .actives
-                    .get(&id)
-                    .and_then(Weak::upgrade)
-                    .is_none_or(|active| Rc::ptr_eq(&active, &invocation));
-                if remove {
-                    state.actives.remove(&id);
-                }
-                drop(state);
-                if let Err(error) = *result
-                    && !control.0.borrow().closing
+                    .remove(&id)
+                    .and_then(|active| active.upgrade());
+                invocation.end();
+                if let Some(current) = current
+                    && !Rc::ptr_eq(&current, &invocation)
                 {
-                    let error = match error {
-                        RunError::Session(error) => error,
-                        other => SessionError::Invalid(other.to_string()),
-                    };
-                    control.0.borrow_mut().failure = Some(error);
+                    current.end();
+                }
+                let error = match *result {
+                    Err(RunError::Session(SessionError::Closed)) if control.0.borrow().closing => {
+                        None
+                    }
+                    Err(RunError::Session(error)) => Some(error),
+                    Err(other) => Some(SessionError::Invalid(other.to_string())),
+                    Ok(_) => None,
+                };
+                if let Some(error) = error {
+                    if control.0.borrow().failure.is_none() {
+                        control.0.borrow_mut().failure = Some(error);
+                    }
                     control.seal(&runner);
                 } else if !control.0.borrow().closing {
                     let mut state = control.0.borrow_mut();
@@ -787,8 +804,16 @@ async fn schedule(
         }
     }
     let result = session.close().await;
-    runner.0.borrow_mut().finished = true;
-    control.0.borrow_mut().finished = true;
+    let runner_error = {
+        let mut state = runner.0.borrow_mut();
+        state.finished = true;
+        state.session_error.clone()
+    };
+    let mut state = control.0.borrow_mut();
+    state.finished = true;
+    if state.failure.is_none() {
+        state.failure = runner_error;
+    }
     result
 }
 
