@@ -62,12 +62,14 @@ NORMAL synchronization, and one transaction per batch. This is an embedded,
 single-logical-owner foundation, not a multiwriter runtime or a power-loss
 persistence guarantee. The current schema is Public Works' own typed, indexed v5.
 It uses separate record tables plus a global ID registry, bounded SQL reads, and
-leased durable ID ranges. There are no existing users or schema migrations:
-incompatible databases reject without being
-deleted or rewritten. Use a new path or manually recreate a disposable development
-database when the format changes. Backward compatibility is not promised during
-this pre-user phase. Atomic write rollback remains required; it prevents partial
-batches and is separate from migrating old formats. Payloads use finite
+leased durable ID ranges. There are no existing users or schema migrations: incompatible databases reject
+without being deleted or rewritten. Use a new path or manually recreate a
+disposable development database when the format changes. During this pre-user
+phase, backward compatibility is not promised for the SQLite schema, persisted
+agent/task checkpoints, or task-definition versions. Exact definition versions
+remain required; neither startup path migrates them. Add migration machinery only
+after retained user data creates that requirement. Atomic write rollback remains
+required; it prevents partial batches and is separate from migrating old formats. Payloads use finite
 native serde_json numbers (full i64/u64 and round-trippable f64), not arbitrary
 precision decimal text, and have a maximum nesting depth of 64. See the contract
 for how model/edit and task state/outcome/memo wrappers count toward that limit. Opaque JSON decoding remains
@@ -459,6 +461,13 @@ cargo test --workspace --all-features --locked --features serde_json/arbitrary_p
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo clippy --workspace --all-targets --all-features --locked --features serde_json/arbitrary_precision -- -D warnings
 ```
+
+These commands are the documented development checks, not a statement that the
+release gate has passed. The unchecked release gates
+also require package checks, fake/local-provider examples, and Markdown-link
+checks. This repository does not currently define one checked-in release command
+or Markdown-link-checker configuration. Do not run the live OpenAI example as a
+release smoke test without explicit credential opt-in.
 
 The shared conformance checks exercise the public `Storage` seam against both
 adapters. SQLite tests also cover reopen, allocator continuity, rollback, invalid
