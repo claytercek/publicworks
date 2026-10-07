@@ -208,6 +208,7 @@ impl Storage for SqliteStorage {
         Box::pin(async move {
             let mut filter = Filter::new(cursor);
             filter.id("conversation_id", query.conversation_id);
+            filter.id("owner", query.owner);
             filter.eq("kind", query.kind.map(Into::into));
             filter.eq(
                 "status",

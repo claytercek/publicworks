@@ -1094,6 +1094,7 @@ fn filtered_scans_match_memory_for_all_filter_combinations() {
                         for abort_requested in [None, Some(false), Some(true)] {
                             let query = TaskQuery {
                                 conversation_id,
+                                owner: None,
                                 kind: kind.clone(),
                                 status,
                                 background,

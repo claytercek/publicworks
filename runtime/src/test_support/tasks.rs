@@ -25,6 +25,7 @@ pub async fn task_storage(store: &mut dyn Storage) {
     first.memos = Some(BTreeMap::from([("memo".into(), json!({"x":1}))]));
     let mut second = task(3);
     second.kind = "other".into();
+    second.owner = Some(id(1));
     second.background = true;
     second.abort_requested = true;
     second.state = TaskState::Running {
@@ -98,6 +99,7 @@ pub async fn task_storage(store: &mut dyn Storage) {
     assert_eq!(store.task(id(3)).await.unwrap(), Some(second.clone()));
     let query = TaskQuery {
         conversation_id: Some(id(1)),
+        owner: Some(id(1)),
         kind: Some("other".into()),
         status: Some(TaskStatus::Running),
         abort_requested: Some(true),
@@ -111,13 +113,14 @@ pub async fn task_storage(store: &mut dyn Storage) {
             .items,
         vec![second]
     );
-    for field in 0..5 {
+    for field in 0..6 {
         let mut q = query.clone();
         match field {
             0 => q.conversation_id = Some(id(9)),
-            1 => q.kind = Some("unknown.task".into()),
-            2 => q.status = Some(TaskStatus::Pending),
-            3 => q.abort_requested = Some(false),
+            1 => q.owner = Some(id(9)),
+            2 => q.kind = Some("unknown.task".into()),
+            3 => q.status = Some(TaskStatus::Pending),
+            4 => q.abort_requested = Some(false),
             _ => q.background = Some(false),
         }
         assert!(

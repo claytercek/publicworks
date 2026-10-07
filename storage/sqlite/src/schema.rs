@@ -55,6 +55,7 @@ CREATE INDEX conversations_owner_task ON publicworks_conversations(owner_task_id
 CREATE INDEX entries_conversation ON publicworks_entries(conversation_id,id);
 CREATE INDEX entries_head ON publicworks_entries(conversation_id,id) WHERE head IS NOT NULL;
 CREATE INDEX tasks_conversation ON publicworks_tasks(conversation_id,id);
+CREATE INDEX tasks_owner ON publicworks_tasks(owner,id);
 CREATE INDEX tasks_kind ON publicworks_tasks(kind,id);
 CREATE INDEX tasks_status ON publicworks_tasks(status,id);
 CREATE INDEX tasks_abort ON publicworks_tasks(abort_requested,id);

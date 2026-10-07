@@ -22,6 +22,7 @@ pub enum TaskStatus {
 #[derive(Clone, Debug, Default)]
 pub struct TaskQuery {
     pub conversation_id: Option<Id>,
+    pub owner: Option<Id>,
     pub kind: Option<String>,
     pub status: Option<TaskStatus>,
     pub abort_requested: Option<bool>,
@@ -31,6 +32,7 @@ impl TaskQuery {
     pub fn matches(&self, record: &TaskRecord) -> bool {
         self.conversation_id
             .is_none_or(|v| v == record.conversation_id)
+            && self.owner.is_none_or(|v| record.owner == Some(v))
             && self.kind.as_ref().is_none_or(|v| v == &record.kind)
             && self.status.is_none_or(|v| v == record.status())
             && self

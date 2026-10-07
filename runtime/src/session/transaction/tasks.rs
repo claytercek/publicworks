@@ -205,6 +205,38 @@ fn replaceable(previous: &TaskRecord, next: &TaskRecord) -> Result<(), SessionEr
     }
     Ok(())
 }
+async fn has_committed_ownership_edges(
+    storage: &mut dyn Storage,
+    id: Id,
+) -> Result<bool, SessionError> {
+    if !storage
+        .scan_tasks(
+            TaskQuery {
+                owner: Some(id),
+                ..TaskQuery::default()
+            },
+            1,
+            None,
+        )
+        .await?
+        .items
+        .is_empty()
+    {
+        return Ok(true);
+    }
+    Ok(!storage
+        .scan_conversations(
+            ConversationQuery {
+                owner_task_id: Some(id),
+                ..ConversationQuery::default()
+            },
+            1,
+            None,
+        )
+        .await?
+        .items
+        .is_empty())
+}
 async fn final_task(
     storage: &mut dyn Storage,
     tasks: &BTreeMap<Id, TaskCandidate>,
@@ -284,9 +316,18 @@ pub(super) async fn assemble(
         || writes
             .iter()
             .any(|w| matches!(w, StorageWrite::Conversation(r) if r.owner.is_some()));
-    let needs_outcome_view = tasks
-        .values()
-        .any(|c| c.validate_wait || c.record.status() == TaskStatus::Terminal);
+    let mut needs_outcome_view = tasks.values().any(|c| c.validate_wait);
+    if !needs_outcome_view {
+        for candidate in tasks
+            .values()
+            .filter(|c| c.record.status() == TaskStatus::Terminal)
+        {
+            if has_committed_ownership_edges(storage, candidate.record.id).await? {
+                needs_outcome_view = true;
+                break;
+            }
+        }
+    }
     if needs_outcome_view || (guarded && changes_ownership) {
         if cached_tree.is_none() {
             *cached_tree = Some(execution::tree::Tree::load(storage).await?);

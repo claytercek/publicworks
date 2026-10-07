@@ -274,6 +274,7 @@ mod tests {
                 integer(1),
                 "tasks_conversation",
             ),
+            (Kind::Task, "owner", integer(1), "tasks_owner"),
             (Kind::Task, "kind", "host".to_owned().into(), "tasks_kind"),
             (
                 Kind::Task,
