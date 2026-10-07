@@ -1,0 +1,68 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+
+      - name: Configure devenv cache
+        uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: devenv
+
+      - name: Install devenv
+        run: nix profile add nixpkgs#devenv
+
+      - name: Fetch locked Rust dependencies
+        run: devenv shell -- cargo fetch --locked
+
+      - name: Check formatting
+        run: devenv shell -- cargo fmt --all -- --check
+
+      - name: Test workspace
+        run: devenv shell -- cargo test --workspace --all-features --locked --offline
+
+      - name: Test unified JSON features
+        run: devenv shell -- cargo test --workspace --all-features --locked --offline --features serde_json/arbitrary_precision
+
+      - name: Lint workspace
+        run: devenv shell -- cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
+
+      - name: Lint unified JSON features
+        run: devenv shell -- cargo clippy --workspace --all-targets --all-features --locked --offline --features serde_json/arbitrary_precision -- -D warnings
+
+      - name: Build rustdoc
+        run: devenv shell -- env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked --offline
+
+      - name: Run local examples
+        run: |
+          devenv shell -- cargo run -p publicworks-runtime --example task_abort --locked --offline
+          devenv shell -- cargo run -p publicworks-runtime --example task_execution --locked --offline
+          devenv shell -- cargo run -p publicworks-runtime --example task_memo --locked --offline
+          devenv shell -- cargo run -p publicworks-runtime --example task_tree --locked --offline
+          devenv shell -- cargo run -p publicworks-agent --example agent_turn --locked --offline
+          devenv shell -- cargo run -p publicworks-agent --example tool_policy --locked --offline
+
+      - name: Verify packages
+        run: devenv shell -- cargo package --workspace --locked --offline
