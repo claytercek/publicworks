@@ -83,6 +83,16 @@ pub type CloseWaiter = Shared<LocalFuture<'static, Result<(), SessionError>>>;
 
 type Settlement<T> = Box<dyn FnOnce(&Outcome<CommitReceipt<T>>)>;
 
+/// Final records acknowledged by one non-empty Storage commit. This is an
+/// internal wakeup seam for lifecycle owners, not a retained public event log.
+#[derive(Clone)]
+pub(super) struct CommittedChanges {
+    pub(super) seq: Seq,
+    pub(super) tasks: Vec<TaskRecord>,
+    pub(super) conversations: Vec<ConversationRecord>,
+}
+type Publication = Rc<dyn Fn(CommittedChanges)>;
+
 type Job =
     Box<dyn for<'a> FnOnce(&'a mut dyn Storage, Rc<RefCell<Control>>) -> LocalFuture<'a, ()>>;
 struct Control {
@@ -96,6 +106,7 @@ struct Control {
     waker: Option<Waker>,
     runner: std::rc::Weak<execution::RunnerControl>,
     tree: std::rc::Weak<execution::drive::Drive>,
+    publication: Option<Publication>,
 }
 type RunnerNotification = (Rc<execution::RunnerControl>, bool, bool, bool);
 fn notify_runner(notification: Option<RunnerNotification>) {
@@ -202,6 +213,7 @@ impl Session {
             waker: None,
             runner: Default::default(),
             tree: Default::default(),
+            publication: None,
         }));
         let (sender, receiver) = oneshot::channel();
         let close: CloseWaiter =
@@ -247,6 +259,10 @@ impl Session {
             },
             SessionDriver { work, control },
         )
+    }
+
+    pub(super) fn observe_commits(&self, publication: Publication) {
+        self.control.borrow_mut().publication = Some(publication);
     }
 
     /// Synchronously checks admission and queues the owned callback. The returned
@@ -343,14 +359,40 @@ impl Session {
                         Ok(Ok(CommitReceipt { value, seq: None }))
                     }
                     Ok(Ok((value, writes))) => {
+                        let tasks = writes
+                            .iter()
+                            .filter_map(|write| match write {
+                                StorageWrite::Task(record) => Some(record.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        let conversations = writes
+                            .iter()
+                            .filter_map(|write| match write {
+                                StorageWrite::Conversation(record) => Some(record.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
                         let settled = AssertUnwindSafe(async { storage.commit(writes).await })
                             .catch_unwind()
                             .await;
                         match settled {
-                            Ok(Ok(seq)) => Ok(Ok(CommitReceipt {
-                                value,
-                                seq: Some(seq),
-                            })),
+                            Ok(Ok(seq)) => {
+                                if !tasks.is_empty() || !conversations.is_empty() {
+                                    let observer = owner.borrow().publication.clone();
+                                    if let Some(observer) = observer {
+                                        observer(CommittedChanges {
+                                            seq,
+                                            tasks,
+                                            conversations,
+                                        });
+                                    }
+                                }
+                                Ok(Ok(CommitReceipt {
+                                    value,
+                                    seq: Some(seq),
+                                }))
+                            }
                             Ok(Err(error)) => {
                                 if !matches!(error, StorageError::Rejected(_)) {
                                     owner.borrow_mut().poisoned = true;
