@@ -2,7 +2,7 @@
 
 Public Works is our own Rust runtime project, modeled on Pi Durable. The working
 slice is a **Session transaction layer for conversations, immutable entries, and
-durable tasks**, with in-memory and SQLite storage. A host-polled `Harness` opens and reconciles
+durable tasks and submissions**, with in-memory and SQLite storage. A host-polled `Harness` opens and reconciles
 all supported foreground task trees, then atomically reserves every eligible task
 and polls their local handler futures concurrently after explicit `resume`.
 Durable waits, held outcomes, cancellation cascades, task observation, and orderly
@@ -102,6 +102,15 @@ including before its first poll, does not cancel the admitted transaction. The
 driver owns callback execution and storage settlement. Read-only and empty
 transactions skip Storage.commit and return `seq: None`. Returned records are
 detached values; public table reads after any mutation attempt reject.
+
+Submission transactions support queued input/write creation, placement,
+first-writer-wins settlement, and atomic queued withdrawal. Dedicated conversation
+state stores the run marker, ordered inbox, and opaque agent configuration. State
+updates and submission changes compose privately in either staging order; final
+assembly validates their references before persistence. Request-ID lookup is
+conversation-scoped and can return an existing receipt without writing. This is
+not yet agent admission or a Harness submission handle API; see the
+implemented Tx reference.
 
 `close()` immediately seals admission, drains admitted transactions, and calls
 Storage.close once. Repeated calls share the result; dropping a close waiter does

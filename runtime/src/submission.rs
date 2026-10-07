@@ -114,8 +114,8 @@ impl SubmissionRecord {
     }
 }
 
-/// Terminal change requested by lifecycle code. Applicability is checked by Tx
-/// in a later slice; the enum itself cannot encode a malformed settlement.
+/// Terminal change requested by lifecycle code. Applicability is checked by Tx;
+/// the enum itself cannot encode a malformed settlement.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SubmissionSettlement {
     Done {

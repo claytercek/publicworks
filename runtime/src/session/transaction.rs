@@ -3,6 +3,8 @@ use futures_util::future::{Either, select};
 use std::collections::BTreeMap;
 mod tasks;
 use tasks::TaskCandidate;
+mod submissions;
+pub use submissions::{ConversationStateDraft, WithdrawalResult};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Head {
@@ -36,6 +38,8 @@ type Operation = Box<dyn for<'a> FnOnce(&'a mut dyn Storage) -> LocalFuture<'a, 
 struct State {
     writes: Vec<StorageWrite>,
     tasks: BTreeMap<Id, TaskCandidate>,
+    submissions: BTreeMap<Id, submissions::SubmissionCandidate>,
+    conversation_states: BTreeMap<Id, ConversationStateRecord>,
     operations: VecDeque<Operation>,
     pending: usize,
     mutated: bool,
@@ -332,14 +336,19 @@ where
         Ok(Ok(_)) if pending => Ok(Err(SessionError::PendingOperations)),
         Ok(Ok(value)) => {
             AssertUnwindSafe(async {
-                let (writes, tasks) = {
+                let (writes, tasks, submissions, conversation_states) = {
                     let mut state = state.borrow_mut();
                     (
                         std::mem::take(&mut state.writes),
                         std::mem::take(&mut state.tasks),
+                        std::mem::take(&mut state.submissions),
+                        std::mem::take(&mut state.conversation_states),
                     )
                 };
                 let writes = tasks::assemble(storage, writes, tasks, control).await?;
+                let writes =
+                    submissions::assemble(storage, writes, submissions, conversation_states)
+                        .await?;
                 let fence = state.borrow_mut().fence.take();
                 Ok((value, writes, fence))
             })

@@ -16,7 +16,7 @@ mod transaction;
 pub use tasks::{Owner, TaskOptions, TaskOwnership};
 mod execution;
 pub use execution::*;
-pub use transaction::{EntryDraft, Head, Tx};
+pub use transaction::{ConversationStateDraft, EntryDraft, Head, Tx, WithdrawalResult};
 
 /// Local, scoped callback future. The transaction cannot escape the callback.
 pub type TxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, SessionError>> + 'a>>;
