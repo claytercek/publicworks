@@ -10,9 +10,11 @@ use std::{fmt, future::Future, pin::Pin};
 mod session;
 pub use session::{
     AbortResult, AbortWaiter, BlockReason, CloseWaiter, CommitReceipt, CommitWaiter, EntryDraft,
-    Head, Owner, PhaseFuture, PhaseHandler, RunError, RunResult, RunWaiter, RunnerCloseWaiter,
-    Session, SessionDriver, SessionError, TaskDefinition, TaskDriver, TaskOptions, TaskOwnership,
-    TaskRegistry, TaskRunner, TaskRuntime, TaskUpdate, Tx, TxFuture,
+    Harness, HarnessAbortWaiter, HarnessCloseWaiter, HarnessDriver, HarnessError,
+    HarnessInspection, HarnessOpenWaiter, Head, InspectionWaiter, Owner, PhaseFuture, PhaseHandler,
+    RunError, RunResult, RunWaiter, RunnerCloseWaiter, Session, SessionDriver, SessionError,
+    TaskDefinition, TaskDriver, TaskInspection, TaskOptions, TaskOwnership, TaskRegistry,
+    TaskRunner, TaskRuntime, TaskUpdate, TaskWaiter, Tx, TxFuture,
 };
 
 mod task;

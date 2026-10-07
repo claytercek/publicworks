@@ -8,69 +8,89 @@ enum Decision {
 pub(super) async fn execute(
     session: &Session,
     registry: &TaskRegistry,
-    mut invocation: Rc<Invocation>,
+    invocation: Rc<Invocation>,
 ) -> Result<RunResult, RunError> {
-    let definitions = registry.clone();
-    let inv = invocation.clone();
-    let reservation = session
-        .commit_reservation(invocation.clone(), move |tx| {
-            Box::pin(async move {
-                tx.fence(inv.clone(), false);
-                if inv.check().is_err() {
-                    return Ok(Some(RunResult::Interrupted));
-                }
-                let Some(mut record) = tx.task(inv.id).await? else {
-                    return Ok(Some(RunResult::Blocked(BlockReason::MissingTask)));
-                };
-                if record.status() == TaskStatus::Terminal {
-                    // Initial terminal roots were blocked by the drive. Here an
-                    // acknowledged abort may have orphaned a selected task.
-                    return Ok(Some(RunResult::Terminal(record)));
-                }
-                if record.status() != TaskStatus::Pending {
-                    return Ok(Some(RunResult::Blocked(BlockReason::NotPending)));
-                }
-                if !supported(tx, &record).await? {
-                    return Ok(Some(RunResult::Blocked(BlockReason::UnsupportedScope)));
-                }
-                if record.abort_requested && tx.tree().await?.owned_live(record.id) {
-                    return Ok(Some(RunResult::Suspended(record)));
-                }
-                let definition = definitions.0.get(&record.kind);
-                let missing = definition.is_none();
-                let mismatched = definition.is_some_and(|d| d.version != record.version);
-                if missing || mismatched {
-                    if record.abort_requested {
-                        record.state = TaskState::Terminal {
-                            outcome: TaskOutcome::Orphaned {
-                                reason: "Missing task definition or exact version for abort".into(),
-                            },
-                        };
-                        record.memos = None;
-                        tx.set_task(record.clone()).await?;
+    execute_inner(session, registry, invocation, false).await
+}
+
+pub(super) async fn execute_reserved(
+    session: &Session,
+    registry: &TaskRegistry,
+    invocation: Rc<Invocation>,
+) -> Result<RunResult, RunError> {
+    execute_inner(session, registry, invocation, true).await
+}
+
+async fn execute_inner(
+    session: &Session,
+    registry: &TaskRegistry,
+    mut invocation: Rc<Invocation>,
+    already_reserved: bool,
+) -> Result<RunResult, RunError> {
+    if !already_reserved {
+        let definitions = registry.clone();
+        let inv = invocation.clone();
+        let reservation = session
+            .commit_reservation(invocation.clone(), move |tx| {
+                Box::pin(async move {
+                    tx.fence(inv.clone(), false);
+                    if inv.check().is_err() {
+                        return Ok(Some(RunResult::Interrupted));
+                    }
+                    let Some(mut record) = tx.task(inv.id).await? else {
+                        return Ok(Some(RunResult::Blocked(BlockReason::MissingTask)));
+                    };
+                    if record.status() == TaskStatus::Terminal {
+                        // Initial terminal roots were blocked by the drive. Here an
+                        // acknowledged abort may have orphaned a selected task.
                         return Ok(Some(RunResult::Terminal(record)));
                     }
-                    return Ok(Some(RunResult::Blocked(if missing {
-                        BlockReason::MissingDefinition
-                    } else {
-                        BlockReason::VersionMismatch
-                    })));
-                }
-                if inv.check().is_err() {
-                    return Ok(Some(RunResult::Interrupted));
-                }
-                let TaskState::Pending { checkpoint } = record.state else {
-                    unreachable!()
-                };
-                record.state = TaskState::Running { checkpoint };
-                tx.set_task(record).await?;
-                Ok(None)
+                    if record.status() != TaskStatus::Pending {
+                        return Ok(Some(RunResult::Blocked(BlockReason::NotPending)));
+                    }
+                    if !supported(tx, &record).await? {
+                        return Ok(Some(RunResult::Blocked(BlockReason::UnsupportedScope)));
+                    }
+                    if record.abort_requested && tx.tree().await?.owned_live(record.id) {
+                        return Ok(Some(RunResult::Suspended(record)));
+                    }
+                    let definition = definitions.0.get(&record.kind);
+                    let missing = definition.is_none();
+                    let mismatched = definition.is_some_and(|d| d.version != record.version);
+                    if missing || mismatched {
+                        if record.abort_requested {
+                            record.state = TaskState::Terminal {
+                                outcome: TaskOutcome::Orphaned {
+                                    reason: "Missing task definition or exact version for abort"
+                                        .into(),
+                                },
+                            };
+                            record.memos = None;
+                            tx.set_task(record.clone()).await?;
+                            return Ok(Some(RunResult::Terminal(record)));
+                        }
+                        return Ok(Some(RunResult::Blocked(if missing {
+                            BlockReason::MissingDefinition
+                        } else {
+                            BlockReason::VersionMismatch
+                        })));
+                    }
+                    if inv.check().is_err() {
+                        return Ok(Some(RunResult::Interrupted));
+                    }
+                    let TaskState::Pending { checkpoint } = record.state else {
+                        unreachable!()
+                    };
+                    record.state = TaskState::Running { checkpoint };
+                    tx.set_task(record).await?;
+                    Ok(None)
+                })
             })
-        })
-        .await?
-        .value;
-    if let Some(result) = reservation {
-        return Ok(result);
+            .await?
+            .value;
+        if let Some(result) = reservation {
+            return Ok(result);
+        }
     }
     loop {
         // A fresh Session-line decision is essential: abort can be queued behind

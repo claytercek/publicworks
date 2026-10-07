@@ -142,7 +142,22 @@ pub(super) fn handoff(_session: &Session, normal: &Rc<Invocation>) -> Rc<Invocat
     });
     normal.ended.set(true);
     if let Some(runner) = normal.runner.upgrade() {
-        runner.0.borrow_mut().active = Rc::downgrade(&abort);
+        let mut state = runner.0.borrow_mut();
+        if state
+            .active
+            .upgrade()
+            .is_some_and(|active| Rc::ptr_eq(&active, normal))
+        {
+            state.active = Rc::downgrade(&abort);
+        }
+        if state
+            .actives
+            .get(&normal.id)
+            .and_then(Weak::upgrade)
+            .is_some_and(|active| Rc::ptr_eq(&active, normal))
+        {
+            state.actives.insert(normal.id, Rc::downgrade(&abort));
+        }
     }
     normal.end();
     abort

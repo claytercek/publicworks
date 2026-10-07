@@ -158,6 +158,7 @@ struct RunnerState {
     session_error: Option<SessionError>,
     waker: Option<Waker>,
     active: Weak<Invocation>,
+    actives: BTreeMap<Id, Weak<Invocation>>,
     drive: Weak<drive::Drive>,
 }
 pub(super) struct RunnerControl(RefCell<RunnerState>);
@@ -172,6 +173,11 @@ impl RunnerControl {
             }
             state.closing = true;
             let active = state.active.upgrade();
+            let actives = state
+                .actives
+                .values()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>();
             let requests = std::mem::take(&mut state.requests);
             let waker = state.waker.take();
             drop(state);
@@ -179,6 +185,9 @@ impl RunnerControl {
                 let _ = request.sender.send(Ok(RunResult::Interrupted));
             }
             if let Some(active) = active {
+                active.signal();
+            }
+            for active in actives {
                 active.signal();
             }
             if let Some(waker) = waker {
@@ -233,10 +242,15 @@ impl Invocation {
             let state = runner.0.borrow();
             !state.closing
                 && !state.finished
-                && state
+                && (state
                     .active
                     .upgrade()
                     .is_some_and(|inv| std::ptr::eq(inv.as_ref(), self))
+                    || state
+                        .actives
+                        .get(&self.id)
+                        .and_then(Weak::upgrade)
+                        .is_some_and(|inv| std::ptr::eq(inv.as_ref(), self)))
         });
         if self.ended.get() || !active {
             Err(SessionError::Invalid(
@@ -267,10 +281,15 @@ impl PersistenceFence {
             let state = runner.0.borrow();
             !state.finished
                 && !state.dropped
-                && state
+                && (state
                     .active
                     .upgrade()
                     .is_some_and(|active| Rc::ptr_eq(&active, inv))
+                    || state
+                        .actives
+                        .get(&inv.id)
+                        .and_then(Weak::upgrade)
+                        .is_some_and(|active| Rc::ptr_eq(&active, inv)))
         });
         if !valid || (inv.ended.get() && !*ending) {
             Err(SessionError::Invalid(
@@ -309,11 +328,19 @@ impl Drop for TaskDriver {
         state.finished = true;
         let requests = std::mem::take(&mut state.requests);
         let active = state.active.upgrade();
+        let actives = state
+            .actives
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
         if let Some(drive) = state.drive.upgrade() {
             drive.ended.set(true);
         }
         drop(state);
         if let Some(active) = active {
+            active.end();
+        }
+        for active in actives {
             active.end();
         }
         drop(requests);
@@ -601,6 +628,8 @@ fn fault(message: impl Into<String>) -> TaskOutcomeError {
 
 mod abort;
 pub(super) mod drive;
+mod harness;
+pub use harness::*;
 mod phase;
 pub(super) mod tree;
 
