@@ -348,6 +348,87 @@ fn persisted_missing_wait_edges_and_terminal_owners_follow_reference() {
 }
 
 #[test]
+fn conversation_owner_cycles_and_missing_chains_block_without_partial_writes() {
+    block_on(async {
+        let probe = Rc::new(Probe::default());
+        let mut storage = store(probe.clone());
+        let first = record(10, None);
+        let mut second = record(20, None);
+        second.conversation_id = id(2);
+        let mut missing = record(30, None);
+        missing.conversation_id = id(3);
+        storage
+            .commit(vec![
+                StorageWrite::Conversation(ConversationRecord {
+                    id: id(1),
+                    parent: None,
+                    owner: Some(OwnerLink {
+                        conversation_id: id(2),
+                        task_id: second.id,
+                    }),
+                }),
+                StorageWrite::Conversation(ConversationRecord {
+                    id: id(2),
+                    parent: None,
+                    owner: Some(OwnerLink {
+                        conversation_id: id(1),
+                        task_id: first.id,
+                    }),
+                }),
+                StorageWrite::Conversation(ConversationRecord {
+                    id: id(3),
+                    parent: None,
+                    owner: Some(OwnerLink {
+                        conversation_id: id(99),
+                        task_id: id(999),
+                    }),
+                }),
+                StorageWrite::Task(first),
+                StorageWrite::Task(second),
+                StorageWrite::Task(missing),
+            ])
+            .await
+            .unwrap();
+        let (session, driver) = Session::new(storage);
+        let (runner, tasks) =
+            TaskRunner::attach(&session, TaskRegistry::new([complete("leaf")]).unwrap()).unwrap();
+        zip(
+            async {
+                let before = probe
+                    .events
+                    .borrow()
+                    .iter()
+                    .filter(|&&event| event == "persisted")
+                    .count();
+                for target in [id(10), id(20), id(30)] {
+                    assert_eq!(
+                        runner.run(target).await.unwrap(),
+                        RunResult::Blocked(BlockReason::UnsupportedScope)
+                    );
+                    assert_eq!(
+                        runner.abort(target).await.unwrap(),
+                        AbortResult::Blocked(BlockReason::UnsupportedScope)
+                    );
+                }
+                assert_eq!(
+                    probe
+                        .events
+                        .borrow()
+                        .iter()
+                        .filter(|&&event| event == "persisted")
+                        .count(),
+                    before
+                );
+                runner.close().await.unwrap();
+                session.close().await.unwrap();
+            },
+            zip(driver, tasks),
+        )
+        .await;
+    });
+}
+
+#[test]
 fn malformed_ownership_and_wait_cycles_quiesce_without_partial_writes() {
     block_on(async {
         let probe = Rc::new(Probe::default());
