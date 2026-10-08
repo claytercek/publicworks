@@ -700,7 +700,7 @@ dependencies = [
 
 [[package]]
 name = "publicworks-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-lite",
  "futures-util",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "publicworks-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-lite",
  "publicworks-runtime",
@@ -722,7 +722,7 @@ dependencies = [
 
 [[package]]
 name = "publicworks-perf"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-lite",
  "futures-util",
@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "publicworks-provider-openai"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-lite",
  "futures-util",
@@ -748,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "publicworks-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-channel",
  "futures-lite",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "publicworks-storage-sqlite"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-lite",
  "publicworks-runtime",
