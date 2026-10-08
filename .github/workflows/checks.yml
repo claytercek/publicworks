@@ -60,16 +60,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
-
-      - name: Configure devenv cache
-        uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
-          name: devenv
-
-      - name: Install devenv
-        run: nix profile add nixpkgs#devenv
+          toolchain: stable
+          components: rustfmt, clippy
 
       - name: Cache Rust dependencies and build artifacts
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
@@ -83,34 +78,34 @@ jobs:
             cargo-release-${{ runner.os }}-
 
       - name: Fetch locked Rust dependencies
-        run: devenv shell -- cargo fetch --locked
+        run: cargo fetch --locked
 
       - name: Check formatting
-        run: devenv shell -- cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
 
       - name: Test workspace
-        run: devenv shell -- cargo test --workspace --all-features --locked --offline
+        run: cargo test --workspace --all-features --locked --offline
 
       - name: Test unified JSON features
-        run: devenv shell -- cargo test --workspace --all-features --locked --offline --features serde_json/arbitrary_precision
+        run: cargo test --workspace --all-features --locked --offline --features serde_json/arbitrary_precision
 
       - name: Lint workspace
-        run: devenv shell -- cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings
 
       - name: Lint unified JSON features
-        run: devenv shell -- cargo clippy --workspace --all-targets --all-features --locked --offline --features serde_json/arbitrary_precision -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked --offline --features serde_json/arbitrary_precision -- -D warnings
 
       - name: Build rustdoc
-        run: devenv shell -- env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked --offline
+        run: env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked --offline
 
       - name: Run local examples
         run: |
-          devenv shell -- cargo run -p publicworks-runtime --example task_abort --locked --offline
-          devenv shell -- cargo run -p publicworks-runtime --example task_execution --locked --offline
-          devenv shell -- cargo run -p publicworks-runtime --example task_memo --locked --offline
-          devenv shell -- cargo run -p publicworks-runtime --example task_tree --locked --offline
-          devenv shell -- cargo run -p publicworks-agent --example agent_turn --locked --offline
-          devenv shell -- cargo run -p publicworks-agent --example tool_policy --locked --offline
+          cargo run -p publicworks-runtime --example task_abort --locked --offline
+          cargo run -p publicworks-runtime --example task_execution --locked --offline
+          cargo run -p publicworks-runtime --example task_memo --locked --offline
+          cargo run -p publicworks-runtime --example task_tree --locked --offline
+          cargo run -p publicworks-agent --example agent_turn --locked --offline
+          cargo run -p publicworks-agent --example tool_policy --locked --offline
 
       - name: Verify packages
-        run: devenv shell -- cargo package --workspace --locked --offline
+        run: cargo package --workspace --locked --offline
