@@ -1,5 +1,12 @@
-//! Shared black-box storage checks. Each check requires a fresh, empty adapter.
+//! Shared black-box storage checks and test scaffolding.
 use crate::*;
+
+mod scaffold;
+pub use scaffold::{Gate, bounded, bounded_with_budget};
+mod storage;
+pub use storage::forward_storage_methods;
+mod temp;
+pub use temp::TempDatabase;
 
 pub fn id(n: u64) -> Id {
     Id::new(n).unwrap()

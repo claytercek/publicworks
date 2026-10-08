@@ -1,5 +1,10 @@
 use futures_lite::future::block_on;
-use publicworks_runtime::MemoryStorage;
+use publicworks_runtime::*;
+#[path = "../src/test_support/scaffold.rs"]
+mod scaffold;
+#[path = "../src/test_support/storage.rs"]
+mod storage_scaffold;
+use scaffold::Gate;
 #[path = "support/submission_cleanup.rs"]
 mod contracts;
 

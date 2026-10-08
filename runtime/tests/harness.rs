@@ -2,6 +2,8 @@ use futures_channel::oneshot;
 use futures_lite::future::{block_on, zip};
 use futures_util::future::join_all;
 use publicworks_runtime::*;
+#[path = "../src/test_support/storage.rs"]
+mod storage_scaffold;
 use serde_json::json;
 use std::{cell::Cell, collections::BTreeMap, rc::Rc};
 
@@ -10,91 +12,28 @@ struct FailCommitStorage {
     fail: Rc<Cell<bool>>,
 }
 impl Storage for FailCommitStorage {
+    forward_storage_methods!(inner;
+        mint_id,
+        conversation,
+        scan_conversations,
+        task,
+        scan_tasks,
+        submission,
+        scan_submissions,
+        submission_by_request,
+        conversation_state,
+        entry,
+        visible_entry,
+        scan_entries,
+        find_latest_head_marker,
+        close,
+    );
     fn commit(&mut self, writes: Vec<StorageWrite>) -> StorageFuture<'_, Seq> {
         if self.fail.replace(false) {
             Box::pin(async { Err(StorageError::Other("uncertain test commit".into())) })
         } else {
             self.inner.commit(writes)
         }
-    }
-    fn mint_id(&mut self) -> StorageFuture<'_, Id> {
-        self.inner.mint_id()
-    }
-    fn conversation(&mut self, id: Id) -> StorageFuture<'_, Option<ConversationRecord>> {
-        self.inner.conversation(id)
-    }
-    fn scan_conversations(
-        &mut self,
-        query: ConversationQuery,
-        limit: usize,
-        cursor: Option<Cursor>,
-    ) -> StorageFuture<'_, Page<ConversationRecord>> {
-        self.inner.scan_conversations(query, limit, cursor)
-    }
-    fn task(&mut self, id: Id) -> StorageFuture<'_, Option<TaskRecord>> {
-        self.inner.task(id)
-    }
-    fn scan_tasks(
-        &mut self,
-        query: TaskQuery,
-        limit: usize,
-        cursor: Option<Cursor>,
-    ) -> StorageFuture<'_, Page<TaskRecord>> {
-        self.inner.scan_tasks(query, limit, cursor)
-    }
-    fn submission(&mut self, id: Id) -> StorageFuture<'_, Option<SubmissionRecord>> {
-        self.inner.submission(id)
-    }
-    fn scan_submissions(
-        &mut self,
-        query: SubmissionQuery,
-        limit: usize,
-        cursor: Option<Cursor>,
-    ) -> StorageFuture<'_, Page<SubmissionRecord>> {
-        self.inner.scan_submissions(query, limit, cursor)
-    }
-    fn submission_by_request(
-        &mut self,
-        conversation_id: Id,
-        request_id: &str,
-    ) -> StorageFuture<'_, Option<SubmissionRecord>> {
-        self.inner
-            .submission_by_request(conversation_id, request_id)
-    }
-    fn conversation_state(
-        &mut self,
-        conversation_id: Id,
-    ) -> StorageFuture<'_, Option<ConversationStateRecord>> {
-        self.inner.conversation_state(conversation_id)
-    }
-    fn entry(&mut self, id: Id) -> StorageFuture<'_, Option<StoredEntry>> {
-        self.inner.entry(id)
-    }
-    fn visible_entry(
-        &mut self,
-        conversation: Id,
-        id: Id,
-    ) -> StorageFuture<'_, Option<StoredEntry>> {
-        self.inner.visible_entry(conversation, id)
-    }
-    fn scan_entries(
-        &mut self,
-        query: EntryQuery,
-        limit: usize,
-        cursor: Option<Cursor>,
-    ) -> StorageFuture<'_, Page<EntryRecord>> {
-        self.inner.scan_entries(query, limit, cursor)
-    }
-    fn find_latest_head_marker(
-        &mut self,
-        conversation: Id,
-        at_or_before: Option<Id>,
-    ) -> StorageFuture<'_, Option<EntryRecord>> {
-        self.inner
-            .find_latest_head_marker(conversation, at_or_before)
-    }
-    fn close(&mut self) -> StorageFuture<'_, ()> {
-        self.inner.close()
     }
 }
 

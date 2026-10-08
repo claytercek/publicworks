@@ -20,4 +20,5 @@ test = true
 
 [dev-dependencies]
 futures-lite = "2"
+publicworks-runtime = { version = "0.1.0", path = "../runtime", features = ["test-support"] }
 publicworks-storage-sqlite = { version = "0.1.0", path = "../storage/sqlite" }

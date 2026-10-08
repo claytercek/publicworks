@@ -1,16 +1,8 @@
 use futures_lite::future::{block_on, zip};
-use publicworks_runtime::*;
+use publicworks_runtime::{test_support::TempDatabase, *};
 use publicworks_storage_sqlite::SqliteStorage;
 use serde_json::json;
-use std::{collections::BTreeMap, path::PathBuf, rc::Rc};
-
-fn path() -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "publicworks-harness-{}-{}.db",
-        std::process::id(),
-        std::thread::current().name().unwrap_or("test")
-    ))
-}
+use std::{collections::BTreeMap, rc::Rc};
 
 fn definition() -> TaskDefinition {
     let handler: PhaseHandler = Rc::new(|_, runtime| {
@@ -51,12 +43,8 @@ fn task(id: u64, conversation_id: u64, state: TaskState) -> TaskRecord {
 #[test]
 fn harness_reopens_owned_conversations_and_background_anchors() {
     block_on(async {
-        let path = path().with_file_name(format!(
-            "publicworks-harness-owned-{}-{}.db",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let _ = std::fs::remove_file(&path);
+        let db = TempDatabase::new("publicworks-harness-owned-", "harness.db");
+        let path = db.path().to_owned();
         let mut storage = SqliteStorage::open(&path).unwrap();
         let root = task(
             3,
@@ -155,15 +143,14 @@ fn harness_reopens_owned_conversations_and_background_anchors() {
             harness.close().await.unwrap();
         };
         let ((), ()) = zip(command, driver).await;
-        let _ = std::fs::remove_file(path);
     });
 }
 
 #[test]
 fn harness_reopens_runs_all_roots_and_does_not_redispatch_terminals() {
     block_on(async {
-        let path = path();
-        let _ = std::fs::remove_file(&path);
+        let db = TempDatabase::new("publicworks-harness-", "harness.db");
+        let path = db.path().to_owned();
         let mut storage = SqliteStorage::open(&path).unwrap();
         let first = task(
             3,
@@ -233,6 +220,5 @@ fn harness_reopens_runs_all_roots_and_does_not_redispatch_terminals() {
             harness.close().await.unwrap();
         };
         let ((), ()) = zip(command, driver).await;
-        let _ = std::fs::remove_file(path);
     });
 }

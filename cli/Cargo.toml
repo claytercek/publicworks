@@ -16,3 +16,6 @@ publicworks-runtime = { path = "../runtime", version = "0.1.0" }
 publicworks-storage-sqlite = { path = "../storage/sqlite", version = "0.1.0" }
 serde_json.workspace = true
 futures-lite = "2"
+
+[dev-dependencies]
+tempfile = "3"

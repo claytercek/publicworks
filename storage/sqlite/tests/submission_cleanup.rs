@@ -1,5 +1,8 @@
 use futures_lite::future::block_on;
-use publicworks_runtime::Storage;
+use publicworks_runtime::{
+    Storage, forward_storage_methods,
+    test_support::{Gate, TempDatabase},
+};
 use publicworks_storage_sqlite::SqliteStorage;
 #[path = "../../../runtime/tests/support/submission_cleanup.rs"]
 mod contracts;
@@ -31,20 +34,12 @@ fn rollback() {
 fn reopen_cleanup() {
     block_on(async {
         for (harness, aborted) in [(false, false), (true, false), (false, true), (true, true)] {
-            let path = std::env::temp_dir().join(format!(
-                "publicworks-cleanup-{}-{}.db",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            let mut store = SqliteStorage::open(&path).unwrap();
+            let db = TempDatabase::new("publicworks-cleanup-", "cleanup.db");
+            let mut store = SqliteStorage::open(db.path()).unwrap();
             contracts::stale_terminal(&mut store, aborted).await;
             store.close().await.unwrap();
             drop(store);
-            contracts::reopened(SqliteStorage::open(&path).unwrap(), harness, aborted).await;
-            std::fs::remove_file(path).unwrap();
+            contracts::reopened(SqliteStorage::open(db.path()).unwrap(), harness, aborted).await;
         }
     });
 }

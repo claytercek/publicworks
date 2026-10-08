@@ -29,18 +29,14 @@ check!(submission_tx_json);
 
 #[test]
 fn submission_tx_reopen_preserves_request_state_and_withdrawal() {
+    use publicworks_runtime::test_support::TempDatabase;
     use publicworks_storage_sqlite::SqliteStorage;
     use serde_json::{Value, json};
-    struct Database(std::path::PathBuf);
-    impl Drop for Database {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    let db = Database(std::env::temp_dir().join(format!(
-        "publicworks-submission-tx-{}-{}.db", std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-    )));
+    struct Database(TempDatabase);
+    let db = Database(TempDatabase::new(
+        "publicworks-submission-tx-",
+        "submissions.db",
+    ));
     block_on(async {
         let (session, driver) = Session::new(SqliteStorage::open(&db.0).unwrap());
         let ((c, id, state_id), ()) = zip(async {

@@ -1,59 +1,20 @@
 //! Public, host-polled bounded-tree workflows. No executor or provider is involved.
 use futures_lite::future::{block_on, zip};
 use publicworks_runtime::*;
+#[path = "../src/test_support/scaffold.rs"]
+mod scaffold;
+use scaffold::{Gate, bounded_with_budget};
 use serde_json::{Value, json};
 use std::{
     cell::{Cell, RefCell},
     future::Future,
     rc::Rc,
-    task::{Poll, Waker},
 };
 
-#[derive(Clone, Default)]
-struct Gate(Rc<RefCell<(bool, Option<Waker>)>>);
-impl Gate {
-    async fn wait(&self) {
-        std::future::poll_fn(|cx| {
-            let mut state = self.0.borrow_mut();
-            if state.0 {
-                Poll::Ready(())
-            } else {
-                state.1 = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        })
-        .await
-    }
-    fn release(&self) {
-        let wake = {
-            let mut state = self.0.borrow_mut();
-            state.0 = true;
-            state.1.take()
-        };
-        if let Some(wake) = wake {
-            wake.wake();
-        }
-    }
-}
-// A regression should fail, not hang CI. Waking this wrapper also keeps both
-// ownerless drivers polled while a deliberately withheld gate stays pending.
 async fn bounded<F: Future>(future: F) -> F::Output {
-    let mut future = std::pin::pin!(future);
-    let mut polls = 0;
-    std::future::poll_fn(|cx| {
-        polls += 1;
-        assert!(
-            polls < 20_000,
-            "tree workflow did not quiesce within poll budget"
-        );
-        let result = future.as_mut().poll(cx);
-        if result.is_pending() {
-            cx.waker().wake_by_ref();
-        }
-        result
-    })
-    .await
+    bounded_with_budget(20_000, future).await
 }
+
 fn phase<F, Fut>(f: F) -> PhaseHandler
 where
     F: Fn(TaskRecord, TaskRuntime) -> Fut + 'static,

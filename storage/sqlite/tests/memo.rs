@@ -1,67 +1,23 @@
 use futures_lite::future::{block_on, zip};
-use publicworks_runtime::*;
+use publicworks_runtime::{
+    test_support::{Gate, TempDatabase},
+    *,
+};
 use publicworks_storage_sqlite::SqliteStorage;
 use serde_json::{Value, json};
-use std::{
-    cell::{Cell, RefCell},
-    collections::BTreeMap,
-    path::PathBuf,
-    rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
-    task::Waker,
-};
+use std::{cell::Cell, collections::BTreeMap, rc::Rc};
 
-static NEXT_DATABASE: AtomicU64 = AtomicU64::new(1);
-
-struct Database(PathBuf);
+struct Database(TempDatabase);
 impl Database {
     fn new(label: &str) -> Self {
-        let sequence = NEXT_DATABASE.fetch_add(1, Ordering::Relaxed);
-        let directory = std::env::temp_dir().join(format!(
-            "publicworks-memo-{label}-{}-{sequence}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        Self(directory.join("memo.db"))
+        Self(TempDatabase::new(
+            &format!("publicworks-memo-{label}-"),
+            "memo.db",
+        ))
     }
 
     fn open(&self) -> SqliteStorage {
-        SqliteStorage::open(&self.0).unwrap()
-    }
-}
-impl Drop for Database {
-    fn drop(&mut self) {
-        if let Some(directory) = self.0.parent() {
-            let _ = std::fs::remove_dir_all(directory);
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-struct Gate(Rc<RefCell<(bool, Option<Waker>)>>);
-impl Gate {
-    async fn wait(&self) {
-        std::future::poll_fn(|cx| {
-            let mut state = self.0.borrow_mut();
-            if state.0 {
-                std::task::Poll::Ready(())
-            } else {
-                state.1 = Some(cx.waker().clone());
-                std::task::Poll::Pending
-            }
-        })
-        .await
-    }
-
-    fn release(&self) {
-        let waker = {
-            let mut state = self.0.borrow_mut();
-            state.0 = true;
-            state.1.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        SqliteStorage::open(self.0.path()).unwrap()
     }
 }
 

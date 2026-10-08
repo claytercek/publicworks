@@ -604,30 +604,24 @@ async fn agent_rounds<S: Storage + 'static>(
     zip(command, driver).await.0
 }
 
-fn db_path(label: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "publicworks-perf-{}-{label}.sqlite",
-        std::process::id()
-    ))
-}
-fn remove_db(path: &Path) {
-    for candidate in [
-        path.to_path_buf(),
-        sidecar(path, "-wal"),
-        sidecar(path, "-shm"),
-    ] {
-        let _ = fs::remove_file(candidate);
+fn database_directory(label: &str) -> std::io::Result<tempfile::TempDir> {
+    let keep = std::env::var_os("PUBLICWORKS_PERF_KEEP_DB").is_some();
+    let directory = tempfile::Builder::new()
+        .prefix(&format!("publicworks-perf-{label}-"))
+        .disable_cleanup(keep)
+        .tempdir()?;
+    if keep {
+        eprintln!(
+            "Keeping performance database in {}",
+            directory.path().display()
+        );
     }
-}
-fn cleanup_db(path: &Path) {
-    if std::env::var_os("PUBLICWORKS_PERF_KEEP_DB").is_none() {
-        remove_db(path);
-    }
+    Ok(directory)
 }
 
 async fn sqlite_reopen_cycles(profile: Profile) -> AnyResult<()> {
-    let path = db_path("cycles");
-    remove_db(&path);
+    let directory = database_directory("cycles")?;
+    let path = directory.path().join("workload.sqlite");
     let mut next = 2_u64;
     for cycle in 0..profile.reopen_cycles {
         let mut storage = measured(profile, "sqlite", "sqlite_reopen", 1, Some(&path), || {
@@ -670,7 +664,6 @@ async fn sqlite_reopen_cycles(profile: Profile) -> AnyResult<()> {
         )?;
         storage.close().await?;
     }
-    cleanup_db(&path);
     Ok(())
 }
 
@@ -678,12 +671,9 @@ fn sqlite_case(
     label: &str,
     run: impl FnOnce(SqliteStorage, &Path) -> AnyResult<()>,
 ) -> AnyResult<()> {
-    let path = db_path(label);
-    remove_db(&path);
-    let storage = SqliteStorage::open(&path)?;
-    let result = run(storage, &path);
-    cleanup_db(&path);
-    result
+    let directory = database_directory(label)?;
+    let path = directory.path().join("workload.sqlite");
+    run(SqliteStorage::open(&path)?, &path)
 }
 
 fn main() -> AnyResult<()> {

@@ -1,5 +1,10 @@
 use futures_lite::future::{block_on, poll_once};
 use publicworks_runtime::*;
+#[path = "../src/test_support/scaffold.rs"]
+mod scaffold;
+#[path = "../src/test_support/storage.rs"]
+mod storage_scaffold;
+use scaffold::Gate;
 use serde_json::json;
 use std::{
     cell::{Cell, RefCell},
@@ -7,7 +12,7 @@ use std::{
     future::Future,
     pin::{Pin, pin},
     rc::Rc,
-    task::{Context, Poll, Wake, Waker},
+    task::{Context, Wake, Waker},
 };
 
 // Poll the host-owned driver until it stops waking itself. This keeps lifecycle
@@ -62,34 +67,6 @@ async fn finish_driver(driver: &mut HarnessDriver) {
     panic!("driver did not settle");
 }
 
-#[derive(Clone, Default)]
-struct Gate(Rc<RefCell<(bool, Option<Waker>)>>);
-impl Gate {
-    async fn wait(&self) {
-        std::future::poll_fn(|cx| {
-            let mut state = self.0.borrow_mut();
-            if state.0 {
-                Poll::Ready(())
-            } else {
-                state.1 = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        })
-        .await
-    }
-
-    fn release(&self) {
-        let waker = {
-            let mut state = self.0.borrow_mut();
-            state.0 = true;
-            state.1.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CommitFault {
     Rejected,
@@ -140,6 +117,21 @@ impl ProbeStorage {
 }
 
 impl Storage for ProbeStorage {
+    forward_storage_methods!(inner;
+        mint_id,
+        conversation,
+        scan_conversations,
+        task,
+        scan_tasks,
+        submission,
+        scan_submissions,
+        submission_by_request,
+        conversation_state,
+        entry,
+        visible_entry,
+        scan_entries,
+        find_latest_head_marker,
+    );
     fn commit(&mut self, writes: Vec<StorageWrite>) -> StorageFuture<'_, Seq> {
         Box::pin(async move {
             let fault = {
@@ -173,95 +165,6 @@ impl Storage for ProbeStorage {
             }
             Ok(seq)
         })
-    }
-
-    fn mint_id(&mut self) -> StorageFuture<'_, Id> {
-        self.inner.mint_id()
-    }
-
-    fn conversation(&mut self, id: Id) -> StorageFuture<'_, Option<ConversationRecord>> {
-        self.inner.conversation(id)
-    }
-
-    fn scan_conversations(
-        &mut self,
-        query: ConversationQuery,
-        limit: usize,
-        cursor: Option<Cursor>,
-    ) -> StorageFuture<'_, Page<ConversationRecord>> {
-        self.inner.scan_conversations(query, limit, cursor)
-    }
-
-    fn task(&mut self, id: Id) -> StorageFuture<'_, Option<TaskRecord>> {
-        self.inner.task(id)
-    }
-
-    fn scan_tasks(
-        &mut self,
-        query: TaskQuery,
-        limit: usize,
-        cursor: Option<Cursor>,
-    ) -> StorageFuture<'_, Page<TaskRecord>> {
-        self.inner.scan_tasks(query, limit, cursor)
-    }
-
-    fn submission(&mut self, id: Id) -> StorageFuture<'_, Option<SubmissionRecord>> {
-        self.inner.submission(id)
-    }
-
-    fn scan_submissions(
-        &mut self,
-        query: SubmissionQuery,
-        limit: usize,
-        cursor: Option<Cursor>,
-    ) -> StorageFuture<'_, Page<SubmissionRecord>> {
-        self.inner.scan_submissions(query, limit, cursor)
-    }
-
-    fn submission_by_request(
-        &mut self,
-        conversation_id: Id,
-        request_id: &str,
-    ) -> StorageFuture<'_, Option<SubmissionRecord>> {
-        self.inner
-            .submission_by_request(conversation_id, request_id)
-    }
-
-    fn conversation_state(
-        &mut self,
-        conversation_id: Id,
-    ) -> StorageFuture<'_, Option<ConversationStateRecord>> {
-        self.inner.conversation_state(conversation_id)
-    }
-
-    fn entry(&mut self, id: Id) -> StorageFuture<'_, Option<StoredEntry>> {
-        self.inner.entry(id)
-    }
-
-    fn visible_entry(
-        &mut self,
-        conversation: Id,
-        id: Id,
-    ) -> StorageFuture<'_, Option<StoredEntry>> {
-        self.inner.visible_entry(conversation, id)
-    }
-
-    fn scan_entries(
-        &mut self,
-        query: EntryQuery,
-        limit: usize,
-        cursor: Option<Cursor>,
-    ) -> StorageFuture<'_, Page<EntryRecord>> {
-        self.inner.scan_entries(query, limit, cursor)
-    }
-
-    fn find_latest_head_marker(
-        &mut self,
-        conversation: Id,
-        at_or_before: Option<Id>,
-    ) -> StorageFuture<'_, Option<EntryRecord>> {
-        self.inner
-            .find_latest_head_marker(conversation, at_or_before)
     }
 
     fn close(&mut self) -> StorageFuture<'_, ()> {

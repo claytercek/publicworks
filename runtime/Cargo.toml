@@ -10,13 +10,15 @@ documentation = "https://docs.rs/publicworks-runtime"
 description = "Executor-neutral durable task and conversation runtime"
 
 [features]
-test-support = []
+test-support = ["dep:tempfile"]
 
 [dependencies]
 futures-channel = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 futures-lite = "2"
+tempfile = "3"

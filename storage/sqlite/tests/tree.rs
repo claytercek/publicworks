@@ -1,82 +1,31 @@
 //! Restart coverage for bounded, explicitly driven task trees.
 use futures_lite::future::{block_on, zip};
-use publicworks_runtime::*;
+use publicworks_runtime::{
+    test_support::{Gate, TempDatabase, bounded_with_budget},
+    *,
+};
 use publicworks_storage_sqlite::SqliteStorage;
 use serde_json::{Value, json};
 use std::{
     cell::{Cell, RefCell},
     future::Future,
-    path::PathBuf,
     rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
-    task::{Poll, Waker},
 };
 
-struct Database(PathBuf);
+async fn bounded<F: Future>(future: F) -> F::Output {
+    bounded_with_budget(20_000, future).await
+}
+
+struct Database(TempDatabase);
 impl Database {
     fn new() -> Self {
-        static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "publicworks-tree-{}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            NEXT_DATABASE.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&path).unwrap();
-        Self(path)
+        Self(TempDatabase::new("publicworks-tree-", "tree.db"))
     }
     fn open(&self) -> SqliteStorage {
-        SqliteStorage::open(self.0.join("tree.db")).unwrap()
+        SqliteStorage::open(self.0.path()).unwrap()
     }
 }
-impl Drop for Database {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-#[derive(Clone, Default)]
-struct Gate(Rc<RefCell<(bool, Option<Waker>)>>);
-impl Gate {
-    async fn wait(&self) {
-        std::future::poll_fn(|cx| {
-            let mut state = self.0.borrow_mut();
-            if state.0 {
-                Poll::Ready(())
-            } else {
-                state.1 = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        })
-        .await
-    }
-    fn release(&self) {
-        let wake = {
-            let mut state = self.0.borrow_mut();
-            state.0 = true;
-            state.1.take()
-        };
-        if let Some(wake) = wake {
-            wake.wake();
-        }
-    }
-}
-async fn bounded<F: Future>(future: F) -> F::Output {
-    let mut future = std::pin::pin!(future);
-    let mut polls = 0;
-    std::future::poll_fn(|cx| {
-        polls += 1;
-        assert!(polls < 20_000, "tree restart exceeded poll budget");
-        let result = future.as_mut().poll(cx);
-        if result.is_pending() {
-            cx.waker().wake_by_ref();
-        }
-        result
-    })
-    .await
-}
+
 fn phase<F, Fut>(f: F) -> PhaseHandler
 where
     F: Fn(TaskRecord, TaskRuntime) -> Fut + 'static,

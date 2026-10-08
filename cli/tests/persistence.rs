@@ -2,30 +2,7 @@ use futures_lite::future::{block_on, zip};
 use publicworks_runtime::{Id, Session, SubmissionType};
 use publicworks_storage_sqlite::SqliteStorage;
 use serde_json::Value;
-use std::{
-    path::PathBuf,
-    process::{Command, Output},
-};
-struct Directory(PathBuf);
-impl Directory {
-    fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "publicworks-cli-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&path).unwrap();
-        Self(path)
-    }
-}
-impl Drop for Directory {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use std::process::{Command, Output};
 fn invoke(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_publicworks"))
         .args(args)
@@ -82,8 +59,8 @@ fn help_and_version_need_no_database() {
 }
 #[test]
 fn create_append_show_across_processes() {
-    let dir = Directory::new();
-    let path = dir.0.join("demo.db");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("demo.db");
     let db = path.to_str().unwrap();
     let created = success(&["create", db]);
     assert_eq!(created["conversationId"], 2);
@@ -127,7 +104,7 @@ fn create_append_show_across_processes() {
         "settled"
     );
 
-    let missing = dir.0.join("missing.db");
+    let missing = dir.path().join("missing.db");
     assert!(
         !invoke(&["show", missing.to_str().unwrap(), "1"])
             .status

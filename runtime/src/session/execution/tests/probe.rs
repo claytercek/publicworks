@@ -1,29 +1,4 @@
-#[derive(Clone, Default)]
-struct Gate(Rc<RefCell<(bool, Option<Waker>)>>);
-impl Gate {
-    async fn wait(&self) {
-        std::future::poll_fn(|cx| {
-            let mut state = self.0.borrow_mut();
-            if state.0 {
-                std::task::Poll::Ready(())
-            } else {
-                state.1 = Some(cx.waker().clone());
-                std::task::Poll::Pending
-            }
-        })
-        .await
-    }
-    fn release(&self) {
-        let waker = {
-            let mut state = self.0.borrow_mut();
-            state.0 = true;
-            state.1.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-}
+use crate::test_support::Gate;
 #[derive(Clone, Copy, Default)]
 enum Fault {
     #[default]
@@ -113,7 +88,11 @@ impl Storage for Store {
             let count = self.probe.task_reads.get() + 1;
             self.probe.task_reads.set(count);
             let gate = self.probe.task_gate.borrow().clone();
-            if let Some((at, gate)) = gate && at == count { gate.wait().await; }
+            if let Some((at, gate)) = gate
+                && at == count
+            {
+                gate.wait().await;
+            }
             self.memory.task(id).await
         })
     }
@@ -127,7 +106,11 @@ impl Storage for Store {
             let count = self.probe.scan_reads.get() + 1;
             self.probe.scan_reads.set(count);
             let gate = self.probe.scan_gate.borrow().clone();
-            if let Some((at, gate)) = gate && at == count { gate.wait().await; }
+            if let Some((at, gate)) = gate
+                && at == count
+            {
+                gate.wait().await;
+            }
             self.memory.scan_tasks(query, limit, cursor).await
         })
     }
@@ -147,7 +130,8 @@ impl Storage for Store {
         conversation_id: Id,
         request_id: &str,
     ) -> StorageFuture<'_, Option<SubmissionRecord>> {
-        self.memory.submission_by_request(conversation_id, request_id)
+        self.memory
+            .submission_by_request(conversation_id, request_id)
     }
     fn conversation_state(
         &mut self,

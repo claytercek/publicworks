@@ -14,3 +14,4 @@ publicworks-storage-sqlite = { version = "0.1.0", path = "../storage/sqlite" }
 futures-lite = "2"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 serde_json.workspace = true
+tempfile = "3"

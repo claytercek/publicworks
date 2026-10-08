@@ -19,5 +19,7 @@ Run one profile per process: allocator and `VmHWM` counters are process-wide.
 
 Profiles use fixed payloads and counts. `quick` validates the harness;
 `baseline` is the documented representative workload; `stress` deliberately
-amplifies payload and cardinality. SQLite files are created under the system temp
-directory and removed after each run unless `PUBLICWORKS_PERF_KEEP_DB=1`.
+amplifies payload and cardinality. Each SQLite workload uses its own temporary
+directory; dropping it removes the database and sidecars, including on failure.
+Set `PUBLICWORKS_PERF_KEEP_DB=1` to retain those directories instead. Their paths
+are printed to stderr without changing the TSV output.

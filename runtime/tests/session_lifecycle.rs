@@ -1,6 +1,11 @@
 use futures_lite::future::{block_on, poll_once};
 use futures_util::FutureExt;
 use publicworks_runtime::*;
+#[path = "../src/test_support/scaffold.rs"]
+mod scaffold;
+#[path = "../src/test_support/storage.rs"]
+mod storage_scaffold;
+use scaffold::Gate;
 use std::{cell::RefCell, panic::AssertUnwindSafe, rc::Rc, task::Waker};
 
 // Poll the host driver until it stops waking itself. External gates remain
@@ -38,32 +43,6 @@ async fn tick(driver: &mut SessionDriver) -> Option<()> {
     }
 }
 
-#[derive(Clone, Default)]
-struct Gate(Rc<RefCell<(bool, Option<Waker>)>>);
-impl Gate {
-    async fn wait(&self) {
-        std::future::poll_fn(|cx| {
-            let mut state = self.0.borrow_mut();
-            if state.0 {
-                std::task::Poll::Ready(())
-            } else {
-                state.1 = Some(cx.waker().clone());
-                std::task::Poll::Pending
-            }
-        })
-        .await
-    }
-    fn release(&self) {
-        let waker = {
-            let mut state = self.0.borrow_mut();
-            state.0 = true;
-            state.1.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-}
 #[derive(Clone, Copy, Default)]
 enum Fault {
     #[default]
@@ -97,6 +76,19 @@ fn store(probe: Rc<Probe>) -> Store {
     }
 }
 impl Storage for Store {
+    forward_storage_methods!(memory;
+        scan_conversations,
+        task,
+        scan_tasks,
+        submission,
+        scan_submissions,
+        submission_by_request,
+        conversation_state,
+        entry,
+        visible_entry,
+        scan_entries,
+        find_latest_head_marker,
+    );
     fn commit(&mut self, writes: Vec<StorageWrite>) -> StorageFuture<'_, Seq> {
         let fault = *self.probe.fault.borrow();
         if matches!(fault, Fault::ConstructPanic) {
@@ -142,75 +134,6 @@ impl Storage for Store {
             self.probe.events.borrow_mut().push("read settled");
             result
         })
-    }
-    fn scan_conversations(
-        &mut self,
-        query: ConversationQuery,
-        limit: usize,
-        cursor: Option<Cursor>,
-    ) -> StorageFuture<'_, Page<ConversationRecord>> {
-        self.memory.scan_conversations(query, limit, cursor)
-    }
-    fn task(&mut self, id: Id) -> StorageFuture<'_, Option<TaskRecord>> {
-        self.memory.task(id)
-    }
-    fn scan_tasks(
-        &mut self,
-        query: TaskQuery,
-        limit: usize,
-        cursor: Option<Cursor>,
-    ) -> StorageFuture<'_, Page<TaskRecord>> {
-        self.memory.scan_tasks(query, limit, cursor)
-    }
-    fn submission(&mut self, id: Id) -> StorageFuture<'_, Option<SubmissionRecord>> {
-        self.memory.submission(id)
-    }
-    fn scan_submissions(
-        &mut self,
-        query: SubmissionQuery,
-        limit: usize,
-        cursor: Option<Cursor>,
-    ) -> StorageFuture<'_, Page<SubmissionRecord>> {
-        self.memory.scan_submissions(query, limit, cursor)
-    }
-    fn submission_by_request(
-        &mut self,
-        conversation_id: Id,
-        request_id: &str,
-    ) -> StorageFuture<'_, Option<SubmissionRecord>> {
-        self.memory
-            .submission_by_request(conversation_id, request_id)
-    }
-    fn conversation_state(
-        &mut self,
-        conversation_id: Id,
-    ) -> StorageFuture<'_, Option<ConversationStateRecord>> {
-        self.memory.conversation_state(conversation_id)
-    }
-    fn entry(&mut self, id: Id) -> StorageFuture<'_, Option<StoredEntry>> {
-        self.memory.entry(id)
-    }
-    fn visible_entry(
-        &mut self,
-        conversation: Id,
-        id: Id,
-    ) -> StorageFuture<'_, Option<StoredEntry>> {
-        self.memory.visible_entry(conversation, id)
-    }
-    fn scan_entries(
-        &mut self,
-        query: EntryQuery,
-        limit: usize,
-        cursor: Option<Cursor>,
-    ) -> StorageFuture<'_, Page<EntryRecord>> {
-        self.memory.scan_entries(query, limit, cursor)
-    }
-    fn find_latest_head_marker(
-        &mut self,
-        conversation: Id,
-        at: Option<Id>,
-    ) -> StorageFuture<'_, Option<EntryRecord>> {
-        self.memory.find_latest_head_marker(conversation, at)
     }
     fn close(&mut self) -> StorageFuture<'_, ()> {
         Box::pin(async move {

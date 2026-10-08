@@ -1,62 +1,19 @@
 use futures_lite::future::{block_on, zip};
-use publicworks_runtime::*;
+use publicworks_runtime::{
+    test_support::{Gate, TempDatabase},
+    *,
+};
 use publicworks_storage_sqlite::SqliteStorage;
 use serde_json::json;
-use std::{
-    cell::{Cell, RefCell},
-    collections::BTreeMap,
-    path::PathBuf,
-    rc::Rc,
-    task::Waker,
-};
+use std::{cell::Cell, collections::BTreeMap, rc::Rc};
 
-struct Database(PathBuf);
+struct Database(TempDatabase);
 impl Database {
     fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "publicworks-execution-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        Self(dir)
+        Self(TempDatabase::new("publicworks-execution-", "execution.db"))
     }
     fn open(&self) -> SqliteStorage {
-        SqliteStorage::open(self.0.join("execution.db")).unwrap()
-    }
-}
-impl Drop for Database {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-#[derive(Clone, Default)]
-struct Gate(Rc<RefCell<(bool, Option<Waker>)>>);
-impl Gate {
-    async fn wait(&self) {
-        std::future::poll_fn(|cx| {
-            let mut state = self.0.borrow_mut();
-            if state.0 {
-                std::task::Poll::Ready(())
-            } else {
-                state.1 = Some(cx.waker().clone());
-                std::task::Poll::Pending
-            }
-        })
-        .await
-    }
-    fn release(&self) {
-        let waker = {
-            let mut state = self.0.borrow_mut();
-            state.0 = true;
-            state.1.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        SqliteStorage::open(self.0.path()).unwrap()
     }
 }
 

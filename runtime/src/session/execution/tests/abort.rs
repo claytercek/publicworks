@@ -395,10 +395,7 @@ fn driver_drop_fences_abort_reservation_and_outcome_preparation_not_dispatched_s
             }
             let run = runner.run(task.id);
             pump(&mut driver, &mut tasks).await;
-            assert!(
-                gate.0.borrow().1.is_some(),
-                "stage {stage} did not reach gate"
-            );
+            assert!(gate.has_waited(), "stage {stage} did not reach gate");
             drop(tasks);
             gate.release();
             tick(&mut driver).await;

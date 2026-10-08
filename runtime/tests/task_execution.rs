@@ -1,34 +1,11 @@
 use futures_lite::future::{block_on, or, zip};
 use publicworks_runtime::*;
+#[path = "../src/test_support/scaffold.rs"]
+mod scaffold;
+use scaffold::Gate;
 use serde_json::{Value, json};
-use std::{cell::RefCell, future::Future, rc::Rc, task::Waker};
+use std::{cell::RefCell, future::Future, rc::Rc};
 
-#[derive(Clone, Default)]
-struct Gate(Rc<RefCell<(bool, Option<Waker>)>>);
-impl Gate {
-    async fn wait(&self) {
-        std::future::poll_fn(|cx| {
-            let mut state = self.0.borrow_mut();
-            if state.0 {
-                std::task::Poll::Ready(())
-            } else {
-                state.1 = Some(cx.waker().clone());
-                std::task::Poll::Pending
-            }
-        })
-        .await
-    }
-    fn release(&self) {
-        let waker = {
-            let mut state = self.0.borrow_mut();
-            state.0 = true;
-            state.1.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-}
 fn phase<F, Fut>(f: F) -> PhaseHandler
 where
     F: Fn(TaskRecord, TaskRuntime) -> Fut + 'static,
