@@ -12,15 +12,42 @@ interrupted work without depending on one async executor or model provider.
 
 ## Who is this for?
 
-Public Works is for developers building Rust applications that need work to
-survive process restarts: agent backends, long-running workflows, background
-jobs, and automation that combines model requests with local tools. It is useful
-when the host needs to own the executor, model provider, storage policy, and
-external side effects while still getting durable checkpoints and recovery.
+Public Works is for developers embedding durable work in Rust applications:
+agent backends, long-running workflows, background jobs, and automation that
+combines model requests with local tools. Choose it when you need checkpoints
+and recovery inside an application that already owns its executor, provider
+clients, storage policy, and process lifecycle. The runtime can also drive
+non-agent workflows without depending on the agent or provider crates.
 
 It is not a complete agent application, hosted workflow service, job queue, or
 sandbox. Public Works does not choose an executor, spawn background threads,
 provide authorization, or make external effects exactly once.
+
+## Why Public Works?
+
+Public Works makes a few deliberate choices about embedding and recovery:
+
+- **Host-driven execution.** You poll the driver futures and control their
+  lifetime. The runtime does not require Tokio or `Send` futures, so durable work
+  can run alongside the rest of your application without adopting a new
+  executor. Individual provider adapters may have their own executor requirements.
+- **Separately usable layers.** Use the task runtime on its own, add the agent
+  layer for model/tool turns, and choose storage and provider adapters separately.
+  Model clients, credentials, and executable callbacks stay outside durable
+  records and are supplied by the host.
+- **Explicit admission and startup.** Admitted agent input has a durable submission
+  receipt; dropping its waiter does not withdraw it. Opening a harness recovers
+  state without invoking handlers, giving the host time to install definitions
+  before enabling progress. Missing or mismatched definitions leave normal work
+  pending rather than running unknown code.
+- **Conservative tool recovery.** An interrupted external effect may have
+  succeeded even when its result was never saved. Tools are not replayed across
+  that uncertainty by default; replay requires an explicit safety opt-in. See
+  [recovery and side effects](#recovery-and-side-effects).
+
+These choices leave more work to the host: it must keep drivers polled, reinstall
+callbacks after a restart, and provide authorization, isolation, and deployment
+coordination where needed.
 
 ## How it fits together
 
@@ -177,12 +204,28 @@ outside the current OpenAI adapter's scope.
 
 ## Origins and inspiration
 
-Public Works was inspired by [`@earendil-works/pi-durable`](https://github.com/earendil-works/pi/tree/main/packages/durable), an experimental TypeScript durable agent harness. In particular, it builds on the idea that conversations, model turns, tool calls, and task progress should be committed before they are treated as visible or complete, so interrupted work can be reopened and resumed.
+Public Works was inspired by
+[`@earendil-works/pi-durable`](https://github.com/earendil-works/pi/tree/main/packages/durable),
+an experimental, embeddable TypeScript durable agent harness. pi-durable is a
+library distinct from the Pi coding-agent application; it also exposes session,
+storage, and custom-task APIs.
 
-Public Works is an independent Rust implementation with different APIs,
-storage contracts, runtime boundaries, and supported feature set. The upstream
-project remains the clearest reference for the original durable-agent design
-that motivated this project.
+Both projects build on committing conversation and task progress before treating
+it as visible or complete. Task trees, durable submissions, explicit resume,
+opt-in replay of interrupted tool calls, and keeping executable callbacks out of
+stored state are shared design ideas, not features unique to Public Works.
+
+Public Works is an independent implementation, not a compatible port. Its focus
+is a host-polled, executor-neutral runtime with separately packaged agent,
+storage, and provider layers. pi-durable integrates with `@earendil-works/pi-ai`
+for model access and `@earendil-works/chord` for document state. The projects have
+different APIs, persistence contracts, and supported feature sets.
+
+Choose Public Works when its Rust driver model and crate boundaries fit your
+application. Consider pi-durable when its TypeScript APIs, pi-ai integration,
+and document facilities fit better. Both can be embedded in applications and run
+custom durable tasks; that capability alone is not a reason to choose one over
+the other.
 
 ## Rust version
 
