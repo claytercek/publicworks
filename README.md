@@ -56,22 +56,14 @@ Use the checked-in development environment:
 ```sh
 devenv shell -- cargo fmt --all -- --check
 devenv shell -- cargo test --workspace --all-features --locked
-devenv shell -- cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-```
-
-The complete offline release check also builds rustdoc, runs both supported
-`serde_json` feature configurations, validates examples and local Markdown
-links, and packages every publishable crate:
-
-```sh
-devenv shell -- cargo fetch --locked
-devenv shell -- cargo fmt --all -- --check
-devenv shell -- cargo test --workspace --all-features --locked
 devenv shell -- cargo test --workspace --all-features --locked --features serde_json/arbitrary_precision
 devenv shell -- cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 devenv shell -- env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 devenv shell -- cargo package --workspace --locked
 ```
+
+CI also runs the local examples and repeats Clippy with the unified
+`serde_json/arbitrary_precision` feature.
 
 The Checks workflow contains the shared verification job. On `main`, Release
 calls Checks instead of starting a second verification pipeline. Its release
