@@ -7,8 +7,47 @@ Public Works is an embeddable Rust runtime for durable conversations, tasks, and
 model/tool turns. It stores progress at explicit checkpoints so a host can resume
 interrupted work without depending on one async executor or model provider.
 
-Public Works is experimental software at `0.1`. Public APIs, persisted records,
-checkpoint formats, and adapter schemas may change between releases.
+> **Experimental:** Public Works is `0.1` software. Public APIs, persisted records,
+> checkpoint formats, and adapter schemas may change between releases.
+
+## Who is this for?
+
+Public Works is for developers building Rust applications that need work to
+survive process restarts: agent backends, long-running workflows, background
+jobs, and automation that combines model requests with local tools. It is useful
+when the host needs to own the executor, model provider, storage policy, and
+external side effects while still getting durable checkpoints and recovery.
+
+It is not a complete agent application, hosted workflow service, job queue, or
+sandbox. Public Works does not choose an executor, spawn background threads,
+provide authorization, or make external effects exactly once.
+
+## How it fits together
+
+The host owns the application boundary. Public Works supplies the durable state
+and scheduling primitives inside it:
+
+```mermaid
+flowchart LR
+    H[Host application<br/>executor · providers · tools]
+    R[publicworks-runtime<br/>Session · Harness · tasks]
+    A[publicworks-agent<br/>model/tool turns · policies]
+    S[(Storage adapter<br/>Memory or SQLite)]
+    P[Optional provider<br/>OpenAI Responses]
+
+    H --> R
+    H --> A
+    A --> R
+    R --> S
+    H --> P
+    P --> A
+```
+
+A model request or tool call is first represented in durable state. The host
+then polls the runtime and supplies the executable model and tool callbacks.
+After a restart, the host installs those callbacks again and resumes the
+pending work explicitly. See the [runtime architecture and examples](runtime/)
+and the [agent turn example](agent/examples/agent_turn.rs).
 
 ## Crates
 
@@ -135,6 +174,15 @@ Public Works does not provide authorization, sandboxing, forced cancellation,
 timers, multi-process coordination, or automatic schema migration. Model
 streaming, media, reasoning-state replay, and server-side conversation state are
 outside the current OpenAI adapter's scope.
+
+## Origins and inspiration
+
+Public Works was inspired by [`@earendil-works/pi-durable`](https://github.com/earendil-works/pi/tree/main/packages/durable), an experimental TypeScript durable agent harness. In particular, it builds on the idea that conversations, model turns, tool calls, and task progress should be committed before they are treated as visible or complete, so interrupted work can be reopened and resumed.
+
+Public Works is an independent Rust implementation with different APIs,
+storage contracts, runtime boundaries, and supported feature set. The upstream
+project remains the clearest reference for the original durable-agent design
+that motivated this project.
 
 ## Rust version
 

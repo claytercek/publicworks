@@ -2,6 +2,8 @@
 
 Provider-neutral durable model/tool turns for `publicworks-runtime`.
 
+This crate was inspired by [`@earendil-works/pi-durable`](https://github.com/earendil-works/pi/tree/main/packages/durable), an experimental TypeScript durable agent harness. It is an independent Rust implementation with different APIs and provider boundaries.
+
 The host supplies a [`Model`](https://docs.rs/publicworks-agent/latest/publicworks_agent/trait.Model.html),
 local [`Tool`](https://docs.rs/publicworks-agent/latest/publicworks_agent/struct.Tool.html)
 callbacks, and the runtime driver. The agent persists request intent, projected
