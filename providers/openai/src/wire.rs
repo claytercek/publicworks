@@ -1,9 +1,7 @@
 //! Stateless Responses wire mapping. Never deserialize opaque JSON through Value's
 //! serde visitor: feature-unified arbitrary_precision reserves object keys there.
 use crate::error;
-use publicworks_agent::{
-    FinishReason, ModelError, ModelMessage, ModelRequest, ModelResponse, ToolCall,
-};
+use publicworks_agent::{ModelError, ModelMessage, ModelRequest, ModelResponse, ToolCall};
 use publicworks_runtime::{decode_native_json, validate_native_json_value};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -133,11 +131,8 @@ pub(super) fn decode_response(bytes: &[u8]) -> Result<ModelResponse, ModelError>
         // A partial is diagnostic text only. Never leak executable calls from an
         // invalid response, even when earlier calls were individually complete.
         let partial_response = (!text.is_empty()).then(|| ModelResponse {
-            message: ModelMessage::Assistant {
-                text,
-                tool_calls: Vec::new(),
-            },
-            finish_reason: FinishReason::Stop,
+            text,
+            tool_calls: Vec::new(),
             usage: None,
         });
         return Err(ModelError {
@@ -147,15 +142,8 @@ pub(super) fn decode_response(bytes: &[u8]) -> Result<ModelResponse, ModelError>
         });
     }
     Ok(ModelResponse {
-        finish_reason: if calls.is_empty() {
-            FinishReason::Stop
-        } else {
-            FinishReason::ToolCalls
-        },
-        message: ModelMessage::Assistant {
-            text,
-            tool_calls: calls,
-        },
+        text,
+        tool_calls: calls,
         usage,
     })
 }

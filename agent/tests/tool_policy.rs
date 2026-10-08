@@ -1,29 +1,17 @@
 use futures_lite::future::{block_on, zip};
 use publicworks_agent::*;
-use publicworks_runtime::*;
+use publicworks_runtime::{test_support::TempDatabase, *};
 use publicworks_storage_sqlite::SqliteStorage;
 use serde_json::json;
-use std::{cell::Cell, path::PathBuf, rc::Rc};
+use std::{cell::Cell, rc::Rc};
 
-struct Database(PathBuf);
+struct Database(TempDatabase);
 impl Database {
     fn new() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "publicworks-permissions-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&path).unwrap();
-        Self(path)
+        Self(TempDatabase::new("publicworks-permissions-", "db"))
     }
     fn open(&self) -> SqliteStorage {
-        SqliteStorage::open(self.0.join("db")).unwrap()
-    }
-}
-impl Drop for Database {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        SqliteStorage::open(self.0.path()).unwrap()
     }
 }
 
@@ -81,22 +69,15 @@ async fn exercise(storage: impl Storage + 'static, decision: Option<BeforeTool>)
             round.set(current + 1);
             Box::pin(async move {
                 Ok(ModelResponse {
-                    message: ModelMessage::Assistant {
-                        text: if current == 0 { "" } else { "done" }.into(),
-                        tool_calls: if current == 0 {
-                            vec![ToolCall {
-                                id: "call-1".into(),
-                                name: "dangerous".into(),
-                                arguments: json!({}),
-                            }]
-                        } else {
-                            vec![]
-                        },
-                    },
-                    finish_reason: if current == 0 {
-                        FinishReason::ToolCalls
+                    text: if current == 0 { "" } else { "done" }.into(),
+                    tool_calls: if current == 0 {
+                        vec![ToolCall {
+                            id: "call-1".into(),
+                            name: "dangerous".into(),
+                            arguments: json!({}),
+                        }]
                     } else {
-                        FinishReason::Stop
+                        vec![]
                     },
                     usage: None,
                 })

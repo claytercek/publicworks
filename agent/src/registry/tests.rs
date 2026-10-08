@@ -145,6 +145,63 @@ fn invalid_new_and_replacement_bundles_leave_publication_unchanged() {
 }
 
 #[test]
+fn installation_validates_declarations_at_request_wrapper_depth() {
+    let declaration_tool = |name: &str, parameters: Value| {
+        Tool::new(
+            ToolDeclaration {
+                name: name.into(),
+                version: u64::MAX,
+                description: String::new(),
+                parameters,
+            },
+            |_| Ok(()),
+            |_, _| panic!("registry must not execute tools"),
+        )
+    };
+    let nested = |depth| (0..depth).fold(Value::Null, |value, _| json!([value]));
+
+    let mut registry = AgentRegistry::new();
+    registry
+        .install(Extension::new(
+            "native",
+            vec![declaration_tool(
+                "opaque",
+                json!({
+                    "max": u64::MAX,
+                    "min": i64::MIN,
+                    "float": 1.25,
+                    "$serde_json::private::Number": "ordinary",
+                    "null": null
+                }),
+            )],
+        ))
+        .unwrap();
+    registry
+        .install(Extension::new(
+            "at-limit",
+            vec![declaration_tool(
+                "deep",
+                nested(publicworks_runtime::MAX_JSON_DEPTH - 3),
+            )],
+        ))
+        .unwrap();
+
+    let before = registry.snapshot();
+    assert!(
+        registry
+            .install(Extension::new(
+                "too-deep",
+                vec![declaration_tool(
+                    "deep",
+                    nested(publicworks_runtime::MAX_JSON_DEPTH - 2),
+                )],
+            ))
+            .is_err()
+    );
+    assert!(Rc::ptr_eq(&before.0, &registry.snapshot().0));
+}
+
+#[test]
 fn generation_exhaustion_is_atomic_for_install_and_uninstall() {
     let mut registry = registry();
     Rc::get_mut(&mut registry.current.0).unwrap().generation = u64::MAX;

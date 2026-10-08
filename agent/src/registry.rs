@@ -36,9 +36,8 @@ impl Extension {
         }
         let mut names = BTreeSet::new();
         for tool in &self.tools {
-            let declaration = wire::declaration(tool.declaration());
-            wire::decode_declaration(&declaration)?;
-            wire::validate_entry(None, Some(&declaration))?;
+            // Provider request object and tools array enclose each declaration.
+            wire::validate_declaration(tool.declaration(), 2)?;
             if !names.insert(&tool.declaration().name) {
                 return Err(invalid(format!(
                     "Duplicate tool name in extension {}: {}",

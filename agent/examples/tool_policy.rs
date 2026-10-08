@@ -37,23 +37,17 @@ impl Model for CalculatorModel {
             });
             Ok(match result {
                 Some(result) => ModelResponse {
-                    message: ModelMessage::Assistant {
-                        text: format!("The answer is {result}."),
-                        tool_calls: vec![],
-                    },
-                    finish_reason: FinishReason::Stop,
+                    text: format!("The answer is {result}."),
+                    tool_calls: vec![],
                     usage: None,
                 },
                 None => ModelResponse {
-                    message: ModelMessage::Assistant {
-                        text: "I'll calculate it.".into(),
-                        tool_calls: vec![ToolCall {
-                            id: "calculation-1".into(),
-                            name: "add".into(),
-                            arguments: json!({"left":20,"right":22}),
-                        }],
-                    },
-                    finish_reason: FinishReason::ToolCalls,
+                    text: "I'll calculate it.".into(),
+                    tool_calls: vec![ToolCall {
+                        id: "calculation-1".into(),
+                        name: "add".into(),
+                        arguments: json!({"left":20,"right":22}),
+                    }],
                     usage: None,
                 },
             })

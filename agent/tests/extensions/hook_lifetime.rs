@@ -422,11 +422,14 @@ fn sqlite_reopen_reuses_hook_memo_after_unsettled_request() {
             .install(Extension::new("stable", vec![]).with_hooks(LifecycleHooks {
                 before_request: Some(Rc::new(|mut request, context| {
                     Box::pin(async move {
+                        assert_eq!(request.model, turn_config().model);
+                        assert_eq!(request.instructions, turn_config().instructions);
                         let winner = context
                             .memo_or_insert("value", json!("loser"))
                             .await
                             .unwrap();
                         assert_eq!(winner, json!({"winner":u64::MAX}));
+                        request.model = "current-hook-model".into();
                         request.instructions = winner.to_string();
                         Ok(Some(request))
                     })
@@ -436,6 +439,7 @@ fn sqlite_reopen_reuses_hook_memo_after_unsettled_request() {
             .unwrap();
         let a = Agent::with_registry(
             |request: ModelRequest, _: Cancellation| -> ModelFuture {
+                assert_eq!(request.model, "current-hook-model");
                 assert_eq!(request.instructions, json!({"winner":u64::MAX}).to_string());
                 Box::pin(async { Ok(response(&[])) })
             },
@@ -448,12 +452,16 @@ fn sqlite_reopen_reuses_hook_memo_after_unsettled_request() {
                 let h = open.await.unwrap();
                 h.resume().unwrap();
                 let done = h.wait_task(root).await.unwrap();
-                assert!(matches!(
-                    done.state,
-                    TaskState::Terminal {
-                        outcome: TaskOutcome::Completed { .. }
-                    }
-                ));
+                assert!(
+                    matches!(
+                        done.state,
+                        TaskState::Terminal {
+                            outcome: TaskOutcome::Completed { .. }
+                        }
+                    ),
+                    "{:?}",
+                    done.state
+                );
                 assert!(done.memos.is_none());
                 assert_eq!(
                     entries(&h, c)

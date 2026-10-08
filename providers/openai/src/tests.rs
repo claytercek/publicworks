@@ -1,5 +1,5 @@
 use super::*;
-use publicworks_agent::{FinishReason, ModelMessage, ToolCall, ToolDeclaration};
+use publicworks_agent::{ModelMessage, ToolCall, ToolDeclaration};
 use publicworks_runtime::decode_native_json;
 use serde_json::{Value, json};
 
@@ -41,11 +41,7 @@ fn decode(value: &Value) -> Result<publicworks_agent::ModelResponse, ModelError>
 }
 fn assert_no_partial_calls(error: &ModelError) {
     if let Some(partial) = &error.partial_response {
-        let ModelMessage::Assistant { tool_calls, .. } = &partial.message else {
-            panic!()
-        };
-        assert!(tool_calls.is_empty());
-        assert_eq!(partial.finish_reason, FinishReason::Stop);
+        assert!(partial.tool_calls.is_empty());
     }
 }
 
@@ -159,21 +155,21 @@ fn completed_text_and_multiple_calls_keep_order_and_ignore_item_ids() {
         text("Second"),
     ]))
     .unwrap();
-    assert_eq!(response.finish_reason, FinishReason::ToolCalls);
-    let ModelMessage::Assistant { text, tool_calls } = response.message else {
-        panic!()
-    };
-    assert_eq!(text, "FirstSecond");
+    assert_eq!(response.text, "FirstSecond");
     assert_eq!(
-        tool_calls.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        response
+            .tool_calls
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
         ["z", "a"]
     );
-    assert_eq!(tool_calls[0].arguments, json!({"city":"Boston"}));
-    assert_eq!(
+    assert_eq!(response.tool_calls[0].arguments, json!({"city":"Boston"}));
+    assert!(
         decode(&envelope(vec![self::text("Done")]))
             .unwrap()
-            .finish_reason,
-        FinishReason::Stop
+            .tool_calls
+            .is_empty()
     );
 }
 
@@ -191,6 +187,7 @@ fn usage_preserves_absent_null_and_opaque_native_values_on_success_and_error() {
             .push(json!({"type":"reasoning"}));
         let error = decode(&value).unwrap_err();
         assert_eq!(error.usage, usage);
+        assert_eq!(error.partial_response.as_ref().unwrap().text, "Good");
         assert_no_partial_calls(&error);
     }
 }
@@ -206,9 +203,7 @@ fn native_json_arguments_and_reserved_objects_survive_both_directions() {
     let mut item = call("native");
     item["arguments"] = Value::String(serde_json::to_string(&opaque()).unwrap());
     let result = decode(&envelope(vec![item])).unwrap();
-    let ModelMessage::Assistant { tool_calls, .. } = result.message else {
-        panic!()
-    };
+    let tool_calls = result.tool_calls;
     assert_eq!(tool_calls[0].arguments, opaque());
     assert_eq!(tool_calls[0].arguments["i"].as_i64(), Some(i64::MIN));
     assert_eq!(tool_calls[0].arguments["u"].as_u64(), Some(u64::MAX));
@@ -268,6 +263,14 @@ fn all_invalid_output_fails_closed_without_partial_calls_and_keeps_usage() {
         value["usage"] = opaque();
         let error = decode(&value).unwrap_err();
         assert_eq!(error.usage, Some(opaque()));
+        assert!(
+            error
+                .partial_response
+                .as_ref()
+                .unwrap()
+                .text
+                .starts_with("safe")
+        );
         assert_no_partial_calls(&error);
         assert!(!error.message.contains("private"));
     }
@@ -288,6 +291,7 @@ fn bad_envelopes_and_non_completed_responses_never_succeed() {
         value["usage"] = json!(null);
         let error = decode(&value).unwrap_err();
         assert_eq!(error.usage, Some(Value::Null));
+        assert_eq!(error.partial_response.as_ref().unwrap().text, "partial");
         assert_no_partial_calls(&error);
     }
     for bad in [

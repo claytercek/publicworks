@@ -1,126 +1,42 @@
 use futures_lite::future::{block_on, or, zip};
 use publicworks_agent::*;
 use publicworks_runtime::*;
+mod support;
 use publicworks_storage_sqlite::SqliteStorage;
 use serde_json::json;
 use std::{
     cell::{Cell, RefCell},
-    collections::VecDeque,
     future::Future,
-    path::PathBuf,
     rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
-    task::{Poll, Waker},
+    task::Poll,
 };
+use support::{FakeModel, Gate, TempDatabase, bounded};
 
-struct Database(PathBuf);
+struct Database(TempDatabase);
 impl Database {
     fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "publicworks-agent-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&path).unwrap();
-        Self(path)
+        Self(TempDatabase::new("publicworks-agent-", "agent.db"))
     }
     fn open(&self) -> SqliteStorage {
-        SqliteStorage::open(self.0.join("agent.db")).unwrap()
-    }
-}
-impl Drop for Database {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        SqliteStorage::open(self.0.path()).unwrap()
     }
 }
 
-#[derive(Clone, Default)]
-struct Gate(Rc<RefCell<(bool, Option<Waker>)>>);
-impl Gate {
-    async fn wait(&self) {
-        std::future::poll_fn(|cx| {
-            let mut state = self.0.borrow_mut();
-            if state.0 {
-                Poll::Ready(())
-            } else {
-                state.1 = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        })
-        .await
-    }
-    fn release(&self) {
-        let wake = {
-            let mut state = self.0.borrow_mut();
-            state.0 = true;
-            state.1.take()
-        };
-        if let Some(wake) = wake {
-            wake.wake();
-        }
-    }
-}
-async fn bounded<F: Future>(future: F) -> F::Output {
-    let mut future = std::pin::pin!(future);
-    let mut polls = 0;
-    std::future::poll_fn(|cx| {
-        polls += 1;
-        assert!(polls < 50_000, "agent recovery exceeded poll budget");
-        let result = future.as_mut().poll(cx);
-        if result.is_pending() {
-            cx.waker().wake_by_ref();
-        }
-        result
-    })
-    .await
-}
-
-#[derive(Clone)]
-struct FakeModel {
-    replies: Rc<RefCell<VecDeque<Result<ModelResponse, ModelError>>>>,
-    requests: Rc<RefCell<Vec<ModelRequest>>>,
-}
-impl FakeModel {
-    fn new(replies: impl IntoIterator<Item = Result<ModelResponse, ModelError>>) -> Self {
-        Self {
-            replies: Rc::new(RefCell::new(replies.into_iter().collect())),
-            requests: Rc::new(RefCell::new(Vec::new())),
-        }
-    }
-}
-impl Model for FakeModel {
-    fn complete(&self, request: ModelRequest, _: Cancellation) -> ModelFuture {
-        self.requests.borrow_mut().push(request);
-        let reply = self
-            .replies
-            .borrow_mut()
-            .pop_front()
-            .expect("unexpected model call");
-        Box::pin(async move { reply })
-    }
-}
 fn final_response(text: &str) -> ModelResponse {
     ModelResponse {
-        message: ModelMessage::Assistant {
-            text: text.into(),
-            tool_calls: vec![],
-        },
-        finish_reason: FinishReason::Stop,
+        text: text.into(),
+        tool_calls: vec![],
         usage: None,
     }
 }
 fn tool_response(id: &str, name: &str) -> ModelResponse {
     ModelResponse {
-        message: ModelMessage::Assistant {
-            text: String::new(),
-            tool_calls: vec![ToolCall {
-                id: id.into(),
-                name: name.into(),
-                arguments: json!({"opaque":u64::MAX}),
-            }],
-        },
-        finish_reason: FinishReason::ToolCalls,
+        text: String::new(),
+        tool_calls: vec![ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: json!({"opaque":u64::MAX}),
+        }],
         usage: None,
     }
 }
@@ -229,7 +145,16 @@ fn restart_before_model_commit_replays_the_pinned_request_not_later_context_or_i
         let old_model = {
             let entered = entered.clone();
             let old_calls = old_calls.clone();
-            move |_: ModelRequest, cancellation: Cancellation| -> ModelFuture {
+            move |request: ModelRequest, cancellation: Cancellation| -> ModelFuture {
+                assert_eq!(request.model, "hook-selected-model");
+                assert_eq!(request.instructions, "hook instructions");
+                assert!(request.tools.is_empty());
+                assert_eq!(
+                    request.messages,
+                    vec![ModelMessage::User {
+                        text: "hook context".into()
+                    }]
+                );
                 old_calls.set(old_calls.get() + 1);
                 entered.release();
                 Box::pin(async move {
@@ -238,13 +163,34 @@ fn restart_before_model_commit_replays_the_pinned_request_not_later_context_or_i
                 })
             }
         };
-        let old_agent = Agent::new(
-            old_model,
-            vec![installed_tool("original", 7, |_, _| {
-                Box::pin(async { panic!("no tool call expected") })
-            })],
-        )
-        .unwrap();
+        let mut old_registry = AgentRegistry::new();
+        old_registry
+            .install(
+                Extension::new(
+                    "default",
+                    vec![installed_tool("original", 7, |_, _| {
+                        Box::pin(async { panic!("no tool call expected") })
+                    })],
+                )
+                .with_hooks(LifecycleHooks {
+                    before_request: Some(Rc::new(|mut request, _| {
+                        Box::pin(async move {
+                            assert_eq!(request.model, "pinned-model");
+                            assert_eq!(request.instructions, "pinned instructions");
+                            request.model = "hook-selected-model".into();
+                            request.instructions = "hook instructions".into();
+                            request.tools.clear();
+                            request.messages = vec![ModelMessage::User {
+                                text: "hook context".into(),
+                            }];
+                            Ok(Some(request))
+                        })
+                    })),
+                    ..LifecycleHooks::default()
+                }),
+            )
+            .unwrap();
+        let old_agent = Agent::with_registry(old_model, old_registry.snapshot(), None);
         let (session, sd) = Session::new(db.open());
         let (runner, td) = TaskRunner::attach(
             &session,
@@ -479,6 +425,22 @@ impl ResultCommitGate {
     }
 }
 impl Storage for ResultCommitGate {
+    publicworks_runtime::forward_storage_methods!(inner;
+        mint_id,
+        conversation,
+        scan_conversations,
+        task,
+        scan_tasks,
+        submission,
+        scan_submissions,
+        submission_by_request,
+        conversation_state,
+        entry,
+        visible_entry,
+        scan_entries,
+        find_latest_head_marker,
+        close,
+    );
     fn commit(&mut self, writes: Vec<StorageWrite>) -> StorageFuture<'_, Seq> {
         let is_result = self.armed && writes.iter().any(|write| matches!(write, StorageWrite::Entry(entry) if entry.kind == "agent.toolResult"));
         if is_result {
@@ -493,84 +455,6 @@ impl Storage for ResultCommitGate {
             }
             Ok(seq)
         })
-    }
-    fn mint_id(&mut self) -> StorageFuture<'_, Id> {
-        self.inner.mint_id()
-    }
-    fn conversation(&mut self, id: Id) -> StorageFuture<'_, Option<ConversationRecord>> {
-        self.inner.conversation(id)
-    }
-    fn scan_conversations(
-        &mut self,
-        query: ConversationQuery,
-        limit: usize,
-        cursor: Option<Cursor>,
-    ) -> StorageFuture<'_, Page<ConversationRecord>> {
-        self.inner.scan_conversations(query, limit, cursor)
-    }
-    fn task(&mut self, id: Id) -> StorageFuture<'_, Option<TaskRecord>> {
-        self.inner.task(id)
-    }
-    fn scan_tasks(
-        &mut self,
-        query: TaskQuery,
-        limit: usize,
-        cursor: Option<Cursor>,
-    ) -> StorageFuture<'_, Page<TaskRecord>> {
-        self.inner.scan_tasks(query, limit, cursor)
-    }
-    fn submission(&mut self, id: Id) -> StorageFuture<'_, Option<SubmissionRecord>> {
-        self.inner.submission(id)
-    }
-    fn scan_submissions(
-        &mut self,
-        query: SubmissionQuery,
-        limit: usize,
-        cursor: Option<Cursor>,
-    ) -> StorageFuture<'_, Page<SubmissionRecord>> {
-        self.inner.scan_submissions(query, limit, cursor)
-    }
-    fn submission_by_request(
-        &mut self,
-        conversation_id: Id,
-        request_id: &str,
-    ) -> StorageFuture<'_, Option<SubmissionRecord>> {
-        self.inner
-            .submission_by_request(conversation_id, request_id)
-    }
-    fn conversation_state(
-        &mut self,
-        conversation_id: Id,
-    ) -> StorageFuture<'_, Option<ConversationStateRecord>> {
-        self.inner.conversation_state(conversation_id)
-    }
-    fn entry(&mut self, id: Id) -> StorageFuture<'_, Option<StoredEntry>> {
-        self.inner.entry(id)
-    }
-    fn visible_entry(
-        &mut self,
-        conversation: Id,
-        id: Id,
-    ) -> StorageFuture<'_, Option<StoredEntry>> {
-        self.inner.visible_entry(conversation, id)
-    }
-    fn scan_entries(
-        &mut self,
-        query: EntryQuery,
-        limit: usize,
-        cursor: Option<Cursor>,
-    ) -> StorageFuture<'_, Page<EntryRecord>> {
-        self.inner.scan_entries(query, limit, cursor)
-    }
-    fn find_latest_head_marker(
-        &mut self,
-        conversation: Id,
-        at: Option<Id>,
-    ) -> StorageFuture<'_, Option<EntryRecord>> {
-        self.inner.find_latest_head_marker(conversation, at)
-    }
-    fn close(&mut self) -> StorageFuture<'_, ()> {
-        self.inner.close()
     }
 }
 

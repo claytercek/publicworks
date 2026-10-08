@@ -505,24 +505,18 @@ impl Model for RoundModel {
                 .count();
             if completed < rounds {
                 Ok(ModelResponse {
-                    message: ModelMessage::Assistant {
-                        text: String::new(),
-                        tool_calls: vec![ToolCall {
-                            id: format!("call-{completed}"),
-                            name: "echo".into(),
-                            arguments: json!({"round":completed}),
-                        }],
-                    },
-                    finish_reason: FinishReason::ToolCalls,
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: format!("call-{completed}"),
+                        name: "echo".into(),
+                        arguments: json!({"round":completed}),
+                    }],
                     usage: None,
                 })
             } else {
                 Ok(ModelResponse {
-                    message: ModelMessage::Assistant {
-                        text: "done".into(),
-                        tool_calls: vec![],
-                    },
-                    finish_reason: FinishReason::Stop,
+                    text: "done".into(),
+                    tool_calls: vec![],
                     usage: None,
                 })
             }

@@ -1,78 +1,22 @@
 use futures_lite::future::{block_on, zip};
 use publicworks_agent::*;
 use publicworks_runtime::*;
+mod support;
 use publicworks_storage_sqlite::SqliteStorage;
 use serde_json::{Value, json};
-use std::{
-    cell::RefCell,
-    collections::BTreeMap,
-    future::Future,
-    path::PathBuf,
-    rc::Rc,
-    task::{Poll, Waker},
-};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use support::{Gate, TempDatabase, bounded};
 
-struct Database(PathBuf);
+struct Database(TempDatabase);
 impl Database {
     fn new() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "publicworks-extensions-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&path).unwrap();
-        Self(path)
+        Self(TempDatabase::new("publicworks-extensions-", "db"))
     }
     fn open(&self) -> SqliteStorage {
-        SqliteStorage::open(self.0.join("db")).unwrap()
+        SqliteStorage::open(self.0.path()).unwrap()
     }
 }
-impl Drop for Database {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-#[derive(Clone, Default)]
-struct Gate(Rc<RefCell<(bool, Option<Waker>)>>);
-impl Gate {
-    async fn wait(&self) {
-        std::future::poll_fn(|cx| {
-            let mut s = self.0.borrow_mut();
-            if s.0 {
-                Poll::Ready(())
-            } else {
-                s.1 = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        })
-        .await
-    }
-    fn release(&self) {
-        let wake = {
-            let mut s = self.0.borrow_mut();
-            s.0 = true;
-            s.1.take()
-        };
-        if let Some(w) = wake {
-            w.wake();
-        }
-    }
-}
-async fn bounded<F: Future>(future: F) -> F::Output {
-    let mut future = std::pin::pin!(future);
-    let mut polls = 0;
-    std::future::poll_fn(|cx| {
-        polls += 1;
-        assert!(polls < 50_000, "extension test exceeded poll budget");
-        let result = future.as_mut().poll(cx);
-        if result.is_pending() {
-            cx.waker().wake_by_ref();
-        }
-        result
-    })
-    .await
-}
+
 fn turn_config() -> TurnConfig {
     TurnConfig {
         model: "fake".into(),
@@ -82,23 +26,16 @@ fn turn_config() -> TurnConfig {
 }
 fn response(names: &[&str]) -> ModelResponse {
     ModelResponse {
-        message: ModelMessage::Assistant {
-            text: "done".into(),
-            tool_calls: names
-                .iter()
-                .enumerate()
-                .map(|(i, n)| ToolCall {
-                    id: format!("call-{i}"),
-                    name: (*n).into(),
-                    arguments: json!({}),
-                })
-                .collect(),
-        },
-        finish_reason: if names.is_empty() {
-            FinishReason::Stop
-        } else {
-            FinishReason::ToolCalls
-        },
+        text: "done".into(),
+        tool_calls: names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| ToolCall {
+                id: format!("call-{i}"),
+                name: (*n).into(),
+                arguments: json!({}),
+            })
+            .collect(),
         usage: None,
     }
 }

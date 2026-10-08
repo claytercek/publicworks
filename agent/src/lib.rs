@@ -63,15 +63,13 @@ pub struct ModelRequest {
     pub tools: Vec<ToolDeclaration>,
     pub messages: Vec<ModelMessage>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FinishReason {
-    Stop,
-    ToolCalls,
-}
+/// A successful assistant response. An empty call list completes the turn;
+/// otherwise the agent executes the calls in order. Incomplete or failed output
+/// belongs in [`ModelError`], optionally with a diagnostic partial response.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelResponse {
-    pub message: ModelMessage,
-    pub finish_reason: FinishReason,
+    pub text: String,
+    pub tool_calls: Vec<ToolCall>,
     pub usage: Option<Value>,
 }
 #[derive(Clone, Debug, PartialEq)]

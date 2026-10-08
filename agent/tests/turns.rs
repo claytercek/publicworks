@@ -1,83 +1,25 @@
 use futures_lite::future::{block_on, zip};
 use publicworks_agent::*;
 use publicworks_runtime::*;
+mod support;
 use serde_json::{Value, json};
 use std::{
     cell::{Cell, RefCell},
-    collections::VecDeque,
     rc::Rc,
-    task::{Poll, Waker},
 };
-
-#[derive(Clone, Default)]
-struct Gate(Rc<RefCell<(bool, Option<Waker>)>>);
-impl Gate {
-    async fn wait(&self) {
-        std::future::poll_fn(|cx| {
-            let mut state = self.0.borrow_mut();
-            if state.0 {
-                Poll::Ready(())
-            } else {
-                state.1 = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        })
-        .await
-    }
-    fn release(&self) {
-        let wake = {
-            let mut state = self.0.borrow_mut();
-            state.0 = true;
-            state.1.take()
-        };
-        if let Some(wake) = wake {
-            wake.wake();
-        }
-    }
-}
-
-#[derive(Clone)]
-struct FakeModel {
-    replies: Rc<RefCell<VecDeque<Result<ModelResponse, ModelError>>>>,
-    requests: Rc<RefCell<Vec<ModelRequest>>>,
-}
-impl FakeModel {
-    fn new(replies: impl IntoIterator<Item = Result<ModelResponse, ModelError>>) -> Self {
-        Self {
-            replies: Rc::new(RefCell::new(replies.into_iter().collect())),
-            requests: Rc::new(RefCell::new(Vec::new())),
-        }
-    }
-}
-impl Model for FakeModel {
-    fn complete(&self, request: ModelRequest, _: Cancellation) -> ModelFuture {
-        self.requests.borrow_mut().push(request);
-        let reply = self
-            .replies
-            .borrow_mut()
-            .pop_front()
-            .expect("unexpected model invocation");
-        Box::pin(async move { reply })
-    }
-}
+use support::{FakeModel, Gate};
 
 fn response(text: &str) -> ModelResponse {
     ModelResponse {
-        message: ModelMessage::Assistant {
-            text: text.into(),
-            tool_calls: vec![],
-        },
-        finish_reason: FinishReason::Stop,
+        text: text.into(),
+        tool_calls: vec![],
         usage: None,
     }
 }
 fn calls(calls: Vec<ToolCall>, usage: Option<Value>) -> ModelResponse {
     ModelResponse {
-        message: ModelMessage::Assistant {
-            text: String::new(),
-            tool_calls: calls,
-        },
-        finish_reason: FinishReason::ToolCalls,
+        text: String::new(),
+        tool_calls: calls,
         usage,
     }
 }
@@ -203,11 +145,8 @@ fn final_answer_is_atomic_attributed_and_preserves_json_precision() {
     block_on(async {
         let usage = json!({"input":u64::MAX,"signed":i64::MIN,"opaque":{"$reserved":true}});
         let model = FakeModel::new([Ok(ModelResponse {
-            message: ModelMessage::Assistant {
-                text: "forty-two".into(),
-                tool_calls: vec![],
-            },
-            finish_reason: FinishReason::Stop,
+            text: "forty-two".into(),
+            tool_calls: vec![],
             usage: Some(usage.clone()),
         })]);
         let agent = Agent::new(model.clone(), vec![]).unwrap();
@@ -532,47 +471,44 @@ fn admission_rejects_invalid_config_and_busy_turn_without_partial_writes() {
 fn malformed_model_envelopes_fail_without_children_or_tool_effects() {
     block_on(async {
         let duplicate = call("same", "effect", json!({}));
-        let replies = vec![
+        let deep_arguments = (0..MAX_JSON_DEPTH).fold(Value::Null, |value, _| json!([value]));
+        let deep_object_arguments =
+            (0..MAX_JSON_DEPTH).fold(Value::Null, |value, _| json!({"nested":value}));
+        let mut replies = vec![
             Ok(ModelResponse {
-                message: ModelMessage::User {
-                    text: "wrong role".into(),
-                },
-                finish_reason: FinishReason::Stop,
+                text: String::new(),
+                tool_calls: vec![call("a", "", json!({}))],
                 usage: None,
             }),
             Ok(ModelResponse {
-                message: ModelMessage::Assistant {
-                    text: String::new(),
-                    tool_calls: vec![call("a", "effect", json!({}))],
-                },
-                finish_reason: FinishReason::Stop,
+                text: String::new(),
+                tool_calls: vec![call("deep", "effect", deep_arguments)],
                 usage: None,
             }),
             Ok(ModelResponse {
-                message: ModelMessage::Assistant {
-                    text: String::new(),
-                    tool_calls: vec![],
-                },
-                finish_reason: FinishReason::ToolCalls,
+                text: String::new(),
+                tool_calls: vec![call("deep-object", "effect", deep_object_arguments)],
                 usage: None,
             }),
             Ok(ModelResponse {
-                message: ModelMessage::Assistant {
-                    text: String::new(),
-                    tool_calls: vec![duplicate.clone(), duplicate],
-                },
-                finish_reason: FinishReason::ToolCalls,
+                text: String::new(),
+                tool_calls: vec![duplicate.clone(), duplicate],
                 usage: None,
             }),
             Ok(ModelResponse {
-                message: ModelMessage::Assistant {
-                    text: String::new(),
-                    tool_calls: vec![call("", "effect", json!({}))],
-                },
-                finish_reason: FinishReason::ToolCalls,
+                text: String::new(),
+                tool_calls: vec![call("", "effect", json!({}))],
                 usage: Some(json!({"bad":true})),
             }),
         ];
+        if let Ok(arguments) = serde_json::from_str::<Value>("1e999") {
+            replies.push(Ok(ModelResponse {
+                text: String::new(),
+                tool_calls: vec![call("number", "effect", arguments)],
+                usage: None,
+            }));
+        }
+        let cases = replies.len();
         let model = FakeModel::new(replies);
         let effects = Rc::new(Cell::new(0));
         let effect = tool("effect", 1, |_| Ok(()), {
@@ -594,7 +530,7 @@ fn malformed_model_envelopes_fail_without_children_or_tool_effects() {
             TaskRunner::attach(&session, TaskRegistry::new(agent.definitions()).unwrap()).unwrap();
         zip(
             async {
-                for n in 0..5 {
+                for n in 0..cases {
                     let conversation = conversation(&session).await;
                     let handle = admit(
                         &session,
@@ -631,7 +567,7 @@ fn malformed_model_envelopes_fail_without_children_or_tool_effects() {
                     .value;
                 assert_eq!(
                     all.len(),
-                    5,
+                    cases,
                     "malformed responses must create no tool children"
                 );
                 runner.close().await.unwrap();
@@ -735,11 +671,8 @@ fn max_round_exhaustion_and_provider_partial_failure_are_persisted() {
             Err(ModelError {
                 message: "provider unavailable".into(),
                 partial_response: Some(ModelResponse {
-                    message: ModelMessage::Assistant {
-                        text: "partial".into(),
-                        tool_calls: vec![],
-                    },
-                    finish_reason: FinishReason::Stop,
+                    text: "partial".into(),
+                    tool_calls: vec![],
                     usage: Some(json!({"partialTokens":u64::MAX})),
                 }),
                 usage: Some(json!({"billed":17})),

@@ -1,55 +1,15 @@
 use futures_lite::future::{block_on, zip};
 use publicworks_agent::*;
 use publicworks_runtime::*;
+mod support;
 use serde_json::json;
-use std::{
-    cell::RefCell,
-    collections::VecDeque,
-    future::Future,
-    rc::Rc,
-    task::{Poll, Waker},
-};
+use std::{cell::RefCell, collections::VecDeque, future::Future, rc::Rc};
+use support::{Gate, TempDatabase, bounded_with_budget};
 
-#[derive(Clone, Default)]
-struct Gate(Rc<RefCell<(bool, Vec<Waker>)>>);
-impl Gate {
-    async fn wait(&self) {
-        std::future::poll_fn(|cx| {
-            let mut state = self.0.borrow_mut();
-            if state.0 {
-                Poll::Ready(())
-            } else {
-                state.1.push(cx.waker().clone());
-                Poll::Pending
-            }
-        })
-        .await
-    }
-    fn release(&self) {
-        let wakes = {
-            let mut state = self.0.borrow_mut();
-            state.0 = true;
-            std::mem::take(&mut state.1)
-        };
-        for wake in wakes {
-            wake.wake();
-        }
-    }
-}
 async fn bounded<F: Future>(future: F) -> F::Output {
-    let mut future = std::pin::pin!(future);
-    let mut polls = 0;
-    std::future::poll_fn(|cx| {
-        polls += 1;
-        assert!(polls < 30_000, "submission test exceeded poll budget");
-        let result = future.as_mut().poll(cx);
-        if result.is_pending() {
-            cx.waker().wake_by_ref();
-        }
-        result
-    })
-    .await
+    bounded_with_budget(30_000, future).await
 }
+
 fn config() -> TurnConfig {
     TurnConfig {
         model: "fake".into(),
@@ -65,11 +25,8 @@ fn options(request: &str, busy: BusyMode) -> SubmitOptions {
 }
 fn answer(text: &str) -> ModelResponse {
     ModelResponse {
-        message: ModelMessage::Assistant {
-            text: text.into(),
-            tool_calls: vec![],
-        },
-        finish_reason: FinishReason::Stop,
+        text: text.into(),
+        tool_calls: vec![],
         usage: None,
     }
 }
@@ -325,15 +282,12 @@ fn boundaries_order_writes_first_select_one_or_all_and_handover_atomically() {
     for all_steers in [false, true] {
         block_on(bounded(async {
             let tools = Ok(ModelResponse {
-                message: ModelMessage::Assistant {
-                    text: "tools".into(),
-                    tool_calls: vec![ToolCall {
-                        id: "missing".into(),
-                        name: "not-installed".into(),
-                        arguments: json!({}),
-                    }],
-                },
-                finish_reason: FinishReason::ToolCalls,
+                text: "tools".into(),
+                tool_calls: vec![ToolCall {
+                    id: "missing".into(),
+                    name: "not-installed".into(),
+                    arguments: json!({}),
+                }],
                 usage: None,
             });
             let (s1, entered1, release1) = step(tools);
@@ -895,15 +849,12 @@ fn task_owned_conversation_admits_and_completes_without_taskstate_busy_policy() 
 fn reset_write_at_post_tools_settles_current_and_places_followups_in_new_context() {
     block_on(bounded(async {
         let tools = Ok(ModelResponse {
-            message: ModelMessage::Assistant {
-                text: "tools".into(),
-                tool_calls: vec![ToolCall {
-                    id: "missing".into(),
-                    name: "not-installed".into(),
-                    arguments: json!({}),
-                }],
-            },
-            finish_reason: FinishReason::ToolCalls,
+            text: "tools".into(),
+            tool_calls: vec![ToolCall {
+                id: "missing".into(),
+                name: "not-installed".into(),
+                arguments: json!({}),
+            }],
             usage: None,
         });
         let (s1, entered1, release1) = step(tools);
@@ -955,10 +906,8 @@ fn reset_write_at_post_tools_settles_current_and_places_followups_in_new_context
 fn sqlite_reopen_preserves_placed_queued_configuration_and_typed_dedup() {
     use publicworks_storage_sqlite::SqliteStorage;
     block_on(bounded(async {
-        let dir =
-            std::env::temp_dir().join(format!("publicworks-submissions-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("reopen.db");
+        let db = TempDatabase::new("publicworks-submissions-", "reopen.db");
+        let path = db.path().to_owned();
         let (s1, entered, _) = step(Ok(answer("interrupted")));
         let (a, _) = agent(vec![s1]);
         let (opening, driver) = Harness::open(
@@ -1086,7 +1035,6 @@ fn sqlite_reopen_preserves_placed_queued_configuration_and_typed_dedup() {
             driver,
         )
         .await;
-        std::fs::remove_dir_all(dir).unwrap();
     }));
 }
 

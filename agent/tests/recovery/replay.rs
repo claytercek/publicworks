@@ -304,7 +304,7 @@ async fn replay_case(sqlite: bool, stored: ReplayPolicy, current: Current, cut: 
                 let TaskState::Pending { checkpoint } = &child.state else { panic!("expected recovered pending child") };
                 if pre_intent { assert_eq!(checkpoint, &json!({"phase":"call"})); }
                 else {
-                    assert_eq!(checkpoint, &json!({"phase":"execute","callId":"call","name":"effect","version":7,"arguments":effective(),"replay":if stored == ReplayPolicy::Safe {"safe"} else {"unsafe"}}));
+                    assert_eq!(checkpoint, &json!({"phase":"execute","arguments":effective(),"replay":if stored == ReplayPolicy::Safe {"safe"} else {"unsafe"}}));
                 }
             }
             Ok(())
@@ -317,7 +317,15 @@ async fn replay_case(sqlite: bool, stored: ReplayPolicy, current: Current, cut: 
             assert_eq!(after.get(), usize::from(matches!(cut, Cut::AfterTool | Cut::ResultAck)) + usize::from(execute));
             let log = entries(&session, conversation).await;
             let assistant = log.iter().find(|e| e.kind == "agent.assistant").unwrap();
-            assert_eq!(decode_message(&assistant.model.as_ref().unwrap()[0]).unwrap(), tool_response("call", "effect").message, "assistant arguments are immutable");
+            let response = tool_response("call", "effect");
+            assert_eq!(
+                decode_message(&assistant.model.as_ref().unwrap()[0]).unwrap(),
+                ModelMessage::Assistant {
+                    text: response.text,
+                    tool_calls: response.tool_calls,
+                },
+                "assistant arguments are immutable"
+            );
             let results: Vec<_> = log.iter().filter(|e| e.kind == "agent.toolResult").collect();
             assert_eq!(results.len(), 1);
             let data = results[0].data.as_ref().unwrap();

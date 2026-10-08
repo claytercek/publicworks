@@ -87,15 +87,12 @@ fn model_failure_preserves_valid_usage_independently_of_partial_payloads() {
     }
     fn partial(arguments: Value, usage: Option<Value>) -> ModelResponse {
         ModelResponse {
-            message: ModelMessage::Assistant {
-                text: "partial".into(),
-                tool_calls: vec![ToolCall {
-                    id: "call".into(),
-                    name: "tool".into(),
-                    arguments,
-                }],
-            },
-            finish_reason: FinishReason::ToolCalls,
+            text: "partial".into(),
+            tool_calls: vec![ToolCall {
+                id: "call".into(),
+                name: "tool".into(),
+                arguments,
+            }],
             usage,
         }
     }
