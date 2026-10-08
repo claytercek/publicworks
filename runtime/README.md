@@ -3,6 +3,8 @@
 An executor-neutral runtime for durable conversations, submissions, and task
 trees.
 
+Public Works was inspired by [`@earendil-works/pi-durable`](https://github.com/earendil-works/pi/tree/main/packages/durable), an experimental TypeScript durable agent harness. This crate is an independent Rust implementation with its own runtime, storage, and recovery contracts.
+
 The crate provides three layers:
 
 - [`Session`](https://docs.rs/publicworks-runtime/latest/publicworks_runtime/struct.Session.html)
