@@ -9,9 +9,9 @@ repository.workspace = true
 description = "Deterministic performance workloads for Public Works"
 
 [dependencies]
-publicworks-runtime = { version = "0.1.0", path = "../runtime" }
-publicworks-agent = { version = "0.1.0", path = "../agent" }
-publicworks-storage-sqlite = { version = "0.1.0", path = "../storage/sqlite" }
+publicworks-runtime = { version = "0.1.1", path = "../runtime" }
+publicworks-agent = { version = "0.1.1", path = "../agent" }
+publicworks-storage-sqlite = { version = "0.1.1", path = "../storage/sqlite" }
 futures-lite = "2"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 serde_json.workspace = true
