@@ -163,9 +163,19 @@ pub(super) async fn execute(
             waiters: RefCell::new(Vec::new()),
             runner: Rc::downgrade(&owner),
         });
-        owner.0.borrow_mut().active = Rc::downgrade(&invocation);
+        owner
+            .0
+            .borrow_mut()
+            .actives
+            .insert(id, Rc::downgrade(&invocation));
         let result = phase::execute(session, registry, invocation.clone()).await;
-        let active = owner.0.borrow().active.upgrade();
+        // Handoff may have replaced the original invocation for this task.
+        let active = owner
+            .0
+            .borrow_mut()
+            .actives
+            .remove(&id)
+            .and_then(|active| active.upgrade());
         if let Some(active) = active {
             active.end();
         }

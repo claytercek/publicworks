@@ -157,9 +157,22 @@ struct RunnerState {
     dropped: bool,
     session_error: Option<SessionError>,
     waker: Option<Waker>,
-    active: Weak<Invocation>,
     actives: BTreeMap<Id, Weak<Invocation>>,
     drive: Weak<drive::Drive>,
+}
+impl RunnerState {
+    fn is_current(&self, invocation: &Invocation) -> bool {
+        self.actives
+            .get(&invocation.id)
+            .and_then(Weak::upgrade)
+            .is_some_and(|current| std::ptr::eq(current.as_ref(), invocation))
+    }
+
+    fn replace_current(&mut self, previous: &Invocation, replacement: &Rc<Invocation>) {
+        if self.is_current(previous) {
+            self.actives.insert(previous.id, Rc::downgrade(replacement));
+        }
+    }
 }
 pub(super) struct RunnerControl(RefCell<RunnerState>);
 impl RunnerControl {
@@ -172,7 +185,6 @@ impl RunnerControl {
                 state.session_error = Some(SessionError::Poisoned);
             }
             state.closing = true;
-            let active = state.active.upgrade();
             let actives = state
                 .actives
                 .values()
@@ -183,9 +195,6 @@ impl RunnerControl {
             drop(state);
             for request in requests {
                 let _ = request.sender.send(Ok(RunResult::Interrupted));
-            }
-            if let Some(active) = active {
-                active.signal();
             }
             for active in actives {
                 active.signal();
@@ -240,17 +249,7 @@ impl Invocation {
     fn check(&self) -> Result<(), SessionError> {
         let active = self.runner.upgrade().is_some_and(|runner| {
             let state = runner.0.borrow();
-            !state.closing
-                && !state.finished
-                && (state
-                    .active
-                    .upgrade()
-                    .is_some_and(|inv| std::ptr::eq(inv.as_ref(), self))
-                    || state
-                        .actives
-                        .get(&self.id)
-                        .and_then(Weak::upgrade)
-                        .is_some_and(|inv| std::ptr::eq(inv.as_ref(), self)))
+            !state.closing && !state.finished && state.is_current(self)
         });
         if self.ended.get() || !active {
             Err(SessionError::Invalid(
@@ -279,17 +278,7 @@ impl PersistenceFence {
         };
         let valid = inv.runner.upgrade().is_some_and(|runner| {
             let state = runner.0.borrow();
-            !state.finished
-                && !state.dropped
-                && (state
-                    .active
-                    .upgrade()
-                    .is_some_and(|active| Rc::ptr_eq(&active, inv))
-                    || state
-                        .actives
-                        .get(&inv.id)
-                        .and_then(Weak::upgrade)
-                        .is_some_and(|active| Rc::ptr_eq(&active, inv)))
+            !state.finished && !state.dropped && state.is_current(inv)
         });
         if !valid || (inv.ended.get() && !*ending) {
             Err(SessionError::Invalid(
@@ -327,7 +316,6 @@ impl Drop for TaskDriver {
         state.dropped = !state.finished;
         state.finished = true;
         let requests = std::mem::take(&mut state.requests);
-        let active = state.active.upgrade();
         let actives = state
             .actives
             .values()
@@ -337,9 +325,6 @@ impl Drop for TaskDriver {
             drive.ended.set(true);
         }
         drop(state);
-        if let Some(active) = active {
-            active.end();
-        }
         for active in actives {
             active.end();
         }
@@ -404,8 +389,10 @@ impl TaskRunner {
                     .catch_unwind()
                     .await;
                 drive.ended.set(true);
-                let active = owner.0.borrow().active.upgrade();
-                if let Some(active) = active {
+                // A panic may bypass per-phase cleanup. End the current identity,
+                // including a phase/abort replacement, outside the control borrow.
+                let actives = std::mem::take(&mut owner.0.borrow_mut().actives);
+                for active in actives.into_values().filter_map(|active| active.upgrade()) {
                     active.end();
                 }
                 let result =

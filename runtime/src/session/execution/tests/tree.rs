@@ -755,9 +755,10 @@ fn tree_guard_covers_reconcile_gap_after_invocation_ends() {
                 .control
                 .0
                 .borrow()
-                .active
-                .upgrade()
-                .is_none_or(|inv| inv.ended.get())
+                .actives
+                .values()
+                .filter_map(Weak::upgrade)
+                .all(|inv| inv.ended.get())
         );
         assert!(runner.control.0.borrow().drive.upgrade().unwrap().live());
         let ownership = session.commit(|tx| {

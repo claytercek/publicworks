@@ -62,16 +62,9 @@ pub(super) fn is_terminal(record: &SubmissionRecord) -> bool {
     )
 }
 
-struct SubmissionRegistration {
-    control: Weak<HarnessControl>,
-    id: Id,
-    key: u64,
-    cancelled: Rc<Cell<bool>>,
-}
-
 pub struct SubmissionWaiter {
+    registration: Option<Registration<Id, SubmissionRecord>>,
     future: LocalFuture<'static, Result<SubmissionRecord, HarnessError>>,
-    registration: Option<SubmissionRegistration>,
 }
 impl Future for SubmissionWaiter {
     type Output = Result<SubmissionRecord, HarnessError>;
@@ -81,33 +74,6 @@ impl Future for SubmissionWaiter {
             self.registration = None;
         }
         result
-    }
-}
-impl Drop for SubmissionWaiter {
-    fn drop(&mut self) {
-        let Some(registration) = self.registration.take() else {
-            return;
-        };
-        registration.cancelled.set(true);
-        if let Some(control) = registration.control.upgrade() {
-            let removed = {
-                let mut state = control.0.borrow_mut();
-                let (removed, empty) = state
-                    .submission_waiters
-                    .get_mut(&registration.id)
-                    .map(|waiters| {
-                        let removed = waiters.remove(&registration.key);
-                        (removed, waiters.is_empty())
-                    })
-                    .unwrap_or((None, false));
-                if empty {
-                    state.submission_waiters.remove(&registration.id);
-                }
-                removed
-            };
-            // Sender destruction may wake a receiver. Never do it under control.
-            drop(removed);
-        }
     }
 }
 
@@ -162,15 +128,12 @@ impl Harness {
                 registration: None,
             };
         }
-        let (key, cancelled) = {
-            let mut state = self.control.0.borrow_mut();
-            let key = state.next_waiter;
-            state.next_waiter += 1;
-            (key, Rc::new(Cell::new(false)))
-        };
+        let registration =
+            Registration::new(&self.control, id, |state| &mut state.submission_waiters);
+        let key = registration.key;
+        let callback_cancelled = registration.cancelled.clone();
         let (sender, receiver) = oneshot::channel();
         let control = self.control.clone();
-        let callback_cancelled = cancelled.clone();
         let waiter = self.session.commit(move |tx| {
             Box::pin(async move {
                 let record = tx
@@ -203,12 +166,7 @@ impl Harness {
                     None => receiver.await.unwrap_or(Err(HarnessError::DriverStopped)),
                 }
             }),
-            registration: Some(SubmissionRegistration {
-                control: Rc::downgrade(&self.control),
-                id,
-                key,
-                cancelled,
-            }),
+            registration: Some(registration),
         }
     }
 }

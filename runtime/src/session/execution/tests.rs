@@ -968,5 +968,5 @@ fn memo_only_commits_are_not_checkpoint_progress() {
 }
 
 mod abort;
-
+mod identity;
 mod tree;

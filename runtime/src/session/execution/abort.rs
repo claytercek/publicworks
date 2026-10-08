@@ -62,12 +62,15 @@ impl TaskRunner {
                         });
                     };
                     let before = tree.tasks.clone();
+                    // Foreground execution has at most one current invocation.
+                    // It may be a descendant, not the requested abort target.
                     let active = control
                         .0
                         .borrow()
-                        .active
-                        .upgrade()
-                        .filter(|inv| !inv.abort_mode && !inv.ended.get());
+                        .actives
+                        .values()
+                        .filter_map(Weak::upgrade)
+                        .find(|inv| !inv.abort_mode && !inv.ended.get());
                     let normal = active.as_ref().filter(|inv| inv.id == id).cloned();
                     if record.status() != TaskStatus::Completing
                         && !tree.owned_live(id)
@@ -142,22 +145,7 @@ pub(super) fn handoff(_session: &Session, normal: &Rc<Invocation>) -> Rc<Invocat
     });
     normal.ended.set(true);
     if let Some(runner) = normal.runner.upgrade() {
-        let mut state = runner.0.borrow_mut();
-        if state
-            .active
-            .upgrade()
-            .is_some_and(|active| Rc::ptr_eq(&active, normal))
-        {
-            state.active = Rc::downgrade(&abort);
-        }
-        if state
-            .actives
-            .get(&normal.id)
-            .and_then(Weak::upgrade)
-            .is_some_and(|active| Rc::ptr_eq(&active, normal))
-        {
-            state.actives.insert(normal.id, Rc::downgrade(&abort));
-        }
+        runner.0.borrow_mut().replace_current(normal, &abort);
     }
     normal.end();
     abort

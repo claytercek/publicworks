@@ -335,24 +335,10 @@ fn handoff(tx: &Tx, previous: &Rc<Invocation>) -> Rc<Invocation> {
         runner: previous.runner.clone(),
     });
     if let Some(runner) = previous.runner.upgrade() {
-        let mut state = runner.0.borrow_mut();
-        if state
-            .active
-            .upgrade()
-            .is_some_and(|active| Rc::ptr_eq(&active, previous))
-        {
-            state.active = Rc::downgrade(&replacement);
-        }
-        if state
-            .actives
-            .get(&previous.id)
-            .and_then(Weak::upgrade)
-            .is_some_and(|active| Rc::ptr_eq(&active, previous))
-        {
-            state
-                .actives
-                .insert(previous.id, Rc::downgrade(&replacement));
-        }
+        runner
+            .0
+            .borrow_mut()
+            .replace_current(previous, &replacement);
     }
     tx.fence(replacement.clone(), true);
     previous.end();

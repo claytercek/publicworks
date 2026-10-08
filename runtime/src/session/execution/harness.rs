@@ -1,7 +1,11 @@
 //! Harness-wide task scheduling above a private Session.
 use super::*;
+mod observers;
 mod submissions;
+#[cfg(test)]
+mod tests;
 use futures_util::{StreamExt, future::Shared, stream::FuturesUnordered};
+use observers::Registration;
 use std::{collections::BTreeSet, task::Waker};
 pub use submissions::*;
 
@@ -34,15 +38,10 @@ impl Future for HarnessOpenWaiter {
         self.0.as_mut().poll(cx)
     }
 }
-struct TaskRegistration {
-    control: Weak<HarnessControl>,
-    task: Id,
-    key: u64,
-    cancelled: Rc<Cell<bool>>,
-}
 pub struct TaskWaiter {
+    // Cancel registration before dropping the future and its channel receivers.
+    registration: Option<Registration<Id, TaskRecord>>,
     future: LocalFuture<'static, Result<TaskRecord, HarnessError>>,
-    registration: Option<TaskRegistration>,
 }
 impl Future for TaskWaiter {
     type Output = Result<TaskRecord, HarnessError>;
@@ -52,32 +51,6 @@ impl Future for TaskWaiter {
             self.registration = None;
         }
         result
-    }
-}
-impl Drop for TaskWaiter {
-    fn drop(&mut self) {
-        let Some(registration) = self.registration.take() else {
-            return;
-        };
-        registration.cancelled.set(true);
-        if let Some(control) = registration.control.upgrade() {
-            let removed = {
-                let mut state = control.0.borrow_mut();
-                let (removed, empty) = state
-                    .task_waiters
-                    .get_mut(&registration.task)
-                    .map(|waiters| {
-                        let removed = waiters.remove(&registration.key);
-                        (removed, waiters.is_empty())
-                    })
-                    .unwrap_or((None, false));
-                if empty {
-                    state.task_waiters.remove(&registration.task);
-                }
-                removed
-            };
-            drop(removed);
-        }
     }
 }
 pub struct HarnessAbortWaiter(LocalFuture<'static, Result<AbortResult, HarnessError>>);
@@ -103,15 +76,9 @@ impl Future for ConversationWaiter {
     }
 }
 
-struct IdleRegistration {
-    control: Weak<HarnessControl>,
-    scope: Option<Id>,
-    key: u64,
-    cancelled: Rc<Cell<bool>>,
-}
 pub struct IdleWaiter {
+    registration: Option<Registration<Option<Id>, ()>>,
     future: LocalFuture<'static, Result<(), HarnessError>>,
-    registration: Option<IdleRegistration>,
 }
 impl Future for IdleWaiter {
     type Output = Result<(), HarnessError>;
@@ -121,32 +88,6 @@ impl Future for IdleWaiter {
             self.registration = None;
         }
         result
-    }
-}
-impl Drop for IdleWaiter {
-    fn drop(&mut self) {
-        let Some(registration) = self.registration.take() else {
-            return;
-        };
-        registration.cancelled.set(true);
-        if let Some(control) = registration.control.upgrade() {
-            let removed = {
-                let mut state = control.0.borrow_mut();
-                let (removed, empty) = state
-                    .idle_waiters
-                    .get_mut(&registration.scope)
-                    .map(|waiters| {
-                        let removed = waiters.remove(&registration.key);
-                        (removed, waiters.is_empty())
-                    })
-                    .unwrap_or((None, false));
-                if empty {
-                    state.idle_waiters.remove(&registration.scope);
-                }
-                removed
-            };
-            drop(removed);
-        }
     }
 }
 
@@ -711,17 +652,11 @@ impl Harness {
                 registration: None,
             };
         }
-        let (key, cancelled) = {
-            let mut state = self.control.0.borrow_mut();
-            let key = state.next_waiter;
-            state.next_waiter += 1;
-            (key, Rc::new(Cell::new(false)))
-        };
+        let registration = Registration::new(&self.control, scope, |state| &mut state.idle_waiters);
+        let key = registration.key;
+        let callback_cancelled = registration.cancelled.clone();
         let (sender, receiver) = oneshot::channel();
-        let sender = Rc::new(RefCell::new(Some(sender)));
         let control = self.control.clone();
-        let callback_sender = sender.clone();
-        let callback_cancelled = cancelled.clone();
         let waiter = self.session.commit(move |tx| {
             Box::pin(async move {
                 let tree = tx.tree().await?;
@@ -741,7 +676,7 @@ impl Harness {
                     .idle_waiters
                     .entry(scope)
                     .or_default()
-                    .insert(key, callback_sender.borrow_mut().take().unwrap());
+                    .insert(key, sender);
                 Ok(false)
             })
         });
@@ -753,12 +688,7 @@ impl Harness {
                     receiver.await.unwrap_or(Err(HarnessError::DriverStopped))
                 }
             }),
-            registration: Some(IdleRegistration {
-                control: Rc::downgrade(&self.control),
-                scope,
-                key,
-                cancelled,
-            }),
+            registration: Some(registration),
         }
     }
 
@@ -815,8 +745,8 @@ impl Harness {
     }
 
     pub fn wait_task(&self, id: Id) -> TaskWaiter {
-        let (key, cancelled) = {
-            let mut state = self.control.0.borrow_mut();
+        {
+            let state = self.control.0.borrow();
             if state.stopped || state.closing {
                 let error = if state.stopped {
                     HarnessError::DriverStopped
@@ -828,15 +758,12 @@ impl Harness {
                     registration: None,
                 };
             }
-            let key = state.next_waiter;
-            state.next_waiter += 1;
-            (key, Rc::new(Cell::new(false)))
-        };
+        }
+        let registration = Registration::new(&self.control, id, |state| &mut state.task_waiters);
+        let key = registration.key;
+        let callback_cancelled = registration.cancelled.clone();
         let (sender, receiver) = oneshot::channel();
-        let sender = Rc::new(RefCell::new(Some(sender)));
         let control = self.control.clone();
-        let callback_sender = sender.clone();
-        let callback_cancelled = cancelled.clone();
         let waiter = self.session.commit(move |tx| {
             Box::pin(async move {
                 let record = tx
@@ -857,7 +784,7 @@ impl Harness {
                     .task_waiters
                     .entry(id)
                     .or_default()
-                    .insert(key, callback_sender.borrow_mut().take().unwrap());
+                    .insert(key, sender);
                 Ok(None)
             })
         });
@@ -868,12 +795,7 @@ impl Harness {
                     None => receiver.await.unwrap_or(Err(HarnessError::DriverStopped)),
                 }
             }),
-            registration: Some(TaskRegistration {
-                control: Rc::downgrade(&self.control),
-                task: id,
-                key,
-                cancelled,
-            }),
+            registration: Some(registration),
         }
     }
 
@@ -1132,6 +1054,15 @@ async fn schedule(
     result
 }
 
+// Group before computing scopes: each scope walks the ownership graph.
+fn reservation_roots(tree: &tree::Tree) -> BTreeSet<Id> {
+    tree.tasks
+        .values()
+        .filter(|task| task.status() != TaskStatus::Terminal)
+        .filter_map(|task| tree.root(task.id))
+        .collect()
+}
+
 async fn reserve_all(
     session: &Session,
     runner: &Rc<RunnerControl>,
@@ -1164,14 +1095,9 @@ async fn reserve_all(
                 resolve_idle_waiters(&control, &tree);
                 let before = tree.tasks.clone();
                 let mut scopes = BTreeMap::<Id, BTreeSet<Id>>::new();
-                for task in tree.tasks.values() {
-                    if task.status() == TaskStatus::Terminal {
-                        continue;
-                    }
-                    if let Some(root) = tree.root(task.id)
-                        && let Some(scope) = tree.scope(root)
-                    {
-                        scopes.entry(root).or_insert(scope);
+                for root in reservation_roots(&tree) {
+                    if let Some(scope) = tree.scope(root) {
+                        scopes.insert(root, scope);
                     }
                 }
                 for scope in scopes.values() {
