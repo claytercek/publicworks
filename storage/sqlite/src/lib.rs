@@ -72,7 +72,7 @@ impl SqliteStorage {
                 .map_err(other)?
                 .collect::<rusqlite::Result<_>>()
                 .map_err(other)?;
-            if versions != [(1, 5)] {
+            if versions != [(1, 6)] {
                 return Err(other(format!(
                     "Unsupported Public Works schema: {versions:?}"
                 )));

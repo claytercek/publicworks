@@ -25,7 +25,10 @@ batches, typed indexed tables, and leased ID ranges. Gaps in durable IDs are
 normal. An acknowledged commit is durable according to those SQLite settings,
 not a claim of power-loss-proof persistence.
 
-This is an early `0.1` release. The current schema has no migration guarantee;
+This is an early `0.1` release. Schema version 6 stores submission state with the
+runtime's canonical JSON codec and retains indexed status, conversation, and
+request fields. Version 5 and older databases are rejected without modification;
+there is no automatic migration. The schema has no migration guarantee, so
 recreate disposable databases when the schema changes.
 
 ## License

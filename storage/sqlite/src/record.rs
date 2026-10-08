@@ -142,43 +142,10 @@ impl Kind {
                 StorageWrite::Task(task)
             }
             Self::Submission => {
-                let submission_type: String = get(row, "submission_type")?;
-                let status: String = get(row, "status")?;
-                let entry = optional_id(row, "entry")?;
-                let answer = optional_id(row, "answer")?;
-                let reason: Option<String> = get(row, "reason")?;
-                let detail = opaque_optional(row, "detail")?;
-                let state = match (
-                    submission_type.as_str(),
-                    status.as_str(),
-                    entry,
-                    answer,
-                    reason,
-                    detail,
-                ) {
-                    ("input", "queued", None, None, None, None) => SubmissionState::InputQueued,
-                    ("write", "queued", None, None, None, None) => SubmissionState::WriteQueued,
-                    ("input", "placed", Some(entry), None, None, None) => {
-                        SubmissionState::InputPlaced { entry }
-                    }
-                    ("input", "done", Some(entry), Some(answer), None, None) => {
-                        SubmissionState::InputDone { entry, answer }
-                    }
-                    ("write", "done", Some(entry), None, None, None) => {
-                        SubmissionState::WriteDone { entry }
-                    }
-                    ("input", "unanswered", entry, None, Some(reason), detail) => {
-                        SubmissionState::InputUnanswered {
-                            entry,
-                            reason,
-                            detail,
-                        }
-                    }
-                    ("write", "unanswered", None, None, Some(reason), detail) => {
-                        SubmissionState::WriteUnanswered { reason, detail }
-                    }
-                    _ => return Err(other("Invalid submission state columns")),
-                };
+                let state: SubmissionState = json(row, "state")?;
+                if get::<String>(row, "status")? != submission_status(state.status()) {
+                    return Err(other("Submission status/state mismatch"));
+                }
                 StorageWrite::Submission(SubmissionRecord {
                     id,
                     conversation_id: self::id(row, "conversation_id")?,
@@ -272,30 +239,16 @@ pub(crate) fn validate(write: &StorageWrite) -> Result<(), StorageError> {
 pub(crate) fn write(tx: &Connection, write: &StorageWrite, seq: Seq) -> Result<(), StorageError> {
     let kind = Kind::of(write);
     let id = write.id().get();
-    let existing: Option<String> = tx
-        .prepare_cached("SELECT kind FROM publicworks_ids WHERE id=?1")
-        .map_err(other)?
-        .query_row([id], |r| r.get(0))
-        .optional()
-        .map_err(other)?;
-    match existing {
-        Some(existing) if existing == kind.name() && kind.mutable() => {
-            execute(
-                tx,
-                "UPDATE publicworks_ids SET commit_seq=?1 WHERE id=?2",
-                params![seq.get(), id],
-            )
-            .map_err(other)?;
-        }
-        Some(_) => return Err(other(format!("Duplicate/global ID collision: {id}"))),
-        None => {
-            execute(
-                tx,
-                "INSERT INTO publicworks_ids VALUES (?1,?2,?3)",
-                params![id, kind.name(), seq.get()],
-            )
-            .map_err(other)?;
-        }
+    let changed = execute(
+        tx,
+        "INSERT INTO publicworks_ids(id,kind,commit_seq) VALUES (?1,?2,?3)
+         ON CONFLICT(id) DO UPDATE SET commit_seq=excluded.commit_seq
+         WHERE publicworks_ids.kind=excluded.kind AND ?4",
+        params![id, kind.name(), seq.get(), kind.mutable()],
+    )
+    .map_err(other)?;
+    if changed != 1 {
+        return Err(other(format!("Duplicate/global ID collision: {id}")));
     }
     match write {
         StorageWrite::Conversation(r) => {
@@ -338,34 +291,10 @@ pub(crate) fn write(tx: &Connection, write: &StorageWrite, seq: Seq) -> Result<(
                 encode(&r.state)?,encode_optional(&r.memos)?]).map_err(other)?;
         }
         StorageWrite::Submission(r) => {
-            let (entry, answer, reason, detail) = match &r.state {
-                SubmissionState::InputQueued | SubmissionState::WriteQueued => {
-                    (None, None, None, None)
-                }
-                SubmissionState::InputPlaced { entry } | SubmissionState::WriteDone { entry } => {
-                    (Some(*entry), None, None, None)
-                }
-                SubmissionState::InputDone { entry, answer } => {
-                    (Some(*entry), Some(*answer), None, None)
-                }
-                SubmissionState::InputUnanswered {
-                    entry,
-                    reason,
-                    detail,
-                } => (*entry, None, Some(reason.as_str()), detail.as_ref()),
-                SubmissionState::WriteUnanswered { reason, detail } => {
-                    (None, None, Some(reason.as_str()), detail.as_ref())
-                }
-            };
-            let submission_type = match r.submission_type() {
-                SubmissionType::Input => "input",
-                SubmissionType::Write => "write",
-            };
-            execute(tx, "INSERT INTO publicworks_submissions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+            execute(tx, "INSERT INTO publicworks_submissions VALUES (?1,?2,?3,?4,?5)
                 ON CONFLICT(id) DO UPDATE SET conversation_id=excluded.conversation_id,request_id=excluded.request_id,
-                submission_type=excluded.submission_type,status=excluded.status,entry=excluded.entry,answer=excluded.answer,
-                reason=excluded.reason,detail=excluded.detail",params![id,r.conversation_id.get(),r.request_id,submission_type,
-                submission_status(r.status()),number(entry),number(answer),reason,detail.map(encode).transpose()?]).map_err(other)?;
+                status=excluded.status,state=excluded.state",params![id,r.conversation_id.get(),r.request_id,
+                submission_status(r.status()),encode(&r.state)?]).map_err(other)?;
         }
         StorageWrite::ConversationState(r) => {
             execute(tx, "INSERT INTO publicworks_conversation_states VALUES (?1,?2,?3,?4,?5)

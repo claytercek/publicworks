@@ -1,5 +1,8 @@
 use publicworks_storage_sqlite::SqliteStorage;
 
+#[path = "storage/submission_codec.rs"]
+mod submission_codec;
+
 #[test]
 fn sqlite_batches() {
     let mut store = SqliteStorage::open(":memory:").unwrap();
@@ -32,38 +35,20 @@ check!(conversation_state_storage);
 check!(submission_payload_limits);
 
 use publicworks_runtime::{
-    test_support::{conversation, entry, id, submission},
+    test_support::{TempDatabase, conversation, entry, id, submission},
     *,
 };
-use std::{
-    path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::path::PathBuf;
 
 struct Database {
-    dir: PathBuf,
+    _temp: TempDatabase,
     path: PathBuf,
 }
 impl Database {
     fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "publicworks-sqlite-{}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("store.db");
-        Self { dir, path }
-    }
-}
-impl Drop for Database {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        let temp = TempDatabase::new("publicworks-sqlite-", "store.db");
+        let path = temp.path().to_owned();
+        Self { _temp: temp, path }
     }
 }
 
@@ -337,7 +322,7 @@ fn excessive_external_nesting_fails_open_safely() {
 
 #[test]
 fn old_and_future_complete_schemas_are_not_reinterpreted() {
-    for version in [1, 2, 3, 4, 6] {
+    for version in [1, 2, 3, 4, 5, 7] {
         let db = Database::new();
         drop(SqliteStorage::open(&db.path).unwrap());
         let setup = rusqlite::Connection::open(&db.path).unwrap();
@@ -999,7 +984,7 @@ fn duplicate_request_and_state_lookups_choose_lowest_id_after_replacements() {
 }
 
 #[test]
-fn every_cross_kind_collision_is_atomic_including_same_batch() {
+fn all_registry_kind_combinations_preserve_atomic_collision_and_replacement_rules() {
     fn writes(n: u64) -> Vec<StorageWrite> {
         vec![
             StorageWrite::Conversation(conversation(n)),
@@ -1018,9 +1003,6 @@ fn every_cross_kind_collision_is_atomic_including_same_batch() {
     futures_lite::future::block_on(async {
         for (i, first) in writes(2).into_iter().enumerate() {
             for (j, second) in writes(2).into_iter().enumerate() {
-                if i == j {
-                    continue;
-                }
                 for same_batch in [false, true] {
                     let mut store = SqliteStorage::open(":memory:").unwrap();
                     let mut batch = vec![StorageWrite::Entry(entry(50, 1))];
@@ -1030,6 +1012,17 @@ fn every_cross_kind_collision_is_atomic_including_same_batch() {
                         store.commit(vec![first.clone()]).await.unwrap();
                     }
                     batch.push(second.clone());
+                    if i == j && i >= 2 {
+                        // Mutable kinds accept replacement, including a second
+                        // write with the same commit sequence in one batch.
+                        assert_eq!(
+                            store.commit(batch).await.unwrap().get(),
+                            if same_batch { 1 } else { 2 }
+                        );
+                        assert!(store.entry(id(50)).await.unwrap().is_some());
+                        assert_eq!(store.mint_id().await.unwrap(), id(51));
+                        continue;
+                    }
                     assert!(matches!(
                         store.commit(batch).await,
                         Err(StorageError::Other(_))

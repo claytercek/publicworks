@@ -1,11 +1,6 @@
-use super::*;
-
-// Owned, unpublished DDL identity. STRICT prevents affinity coercions from hiding
-// malformed scalar storage. References other than registry membership are raw
-// Storage data, not foreign keys: Session owns semantic referential integrity.
-pub(crate) const SCHEMA: &str = "
+-- Frozen version-5 schema: compatibility rejection fixture, not a migration.
 CREATE TABLE publicworks_schema (singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL) STRICT;
-INSERT INTO publicworks_schema VALUES (1, 6);
+INSERT INTO publicworks_schema VALUES (1, 5);
 CREATE TABLE publicworks_metadata (
     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
     next_id INTEGER NOT NULL CHECK(next_id BETWEEN 2 AND 9007199254740992),
@@ -41,8 +36,9 @@ CREATE TABLE publicworks_tasks (
 CREATE TABLE publicworks_submissions (
     id INTEGER PRIMARY KEY REFERENCES publicworks_ids(id),
     conversation_id INTEGER NOT NULL, request_id TEXT,
+    submission_type TEXT NOT NULL CHECK(submission_type IN ('input','write')),
     status TEXT NOT NULL CHECK(status IN ('queued','placed','done','unanswered')),
-    state TEXT NOT NULL
+    entry INTEGER, answer INTEGER, reason TEXT, detail TEXT
 ) STRICT;
 CREATE TABLE publicworks_conversation_states (
     id INTEGER PRIMARY KEY REFERENCES publicworks_ids(id),
@@ -65,80 +61,3 @@ CREATE INDEX submissions_status ON publicworks_submissions(status,id);
 CREATE INDEX submissions_conversation_status ON publicworks_submissions(conversation_id,status,id);
 CREATE INDEX submissions_request ON publicworks_submissions(conversation_id,request_id,id);
 CREATE INDEX states_conversation ON publicworks_conversation_states(conversation_id,id);
-";
-
-pub(crate) fn validate_schema(tx: &Transaction<'_>) -> Result<(), StorageError> {
-    let normalize = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut expected: Vec<_> = SCHEMA
-        .split(';')
-        .map(str::trim)
-        .filter(|sql| sql.starts_with("CREATE "))
-        .map(normalize)
-        .collect();
-    let mut actual: Vec<String> = tx
-        .prepare("SELECT sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'")
-        .map_err(other)?
-        .query_map([], |r| r.get::<_, String>(0))
-        .map_err(other)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(other)?
-        .iter()
-        .map(|sql| normalize(sql))
-        .collect();
-    expected.sort();
-    actual.sort();
-    if actual != expected {
-        return Err(other("Public Works schema definition mismatch"));
-    }
-    Ok(())
-}
-
-pub(crate) fn metadata(tx: &Connection) -> Result<(u64, u64), StorageError> {
-    let (id, seq): (u64, u64) = tx
-        .prepare_cached("SELECT next_id,next_seq FROM publicworks_metadata WHERE singleton=1")
-        .map_err(other)?
-        .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .map_err(other)?;
-    if !(2..=MAX_NUMBER + 1).contains(&id) || !(1..=MAX_NUMBER + 1).contains(&seq) {
-        return Err(other("Invalid allocator metadata"));
-    }
-    Ok((id, seq))
-}
-
-// Streaming in one read transaction: no whole-database RecordSnapshot, and at
-// most one decoded row alive at a time. This is the corruption boundary: later
-// reads validate selected rows, not unrelated externally modified records.
-pub(crate) fn audit(tx: &Connection) -> Result<(), StorageError> {
-    let (next_id, next_seq) = metadata(tx)?;
-    let mut check = tx.prepare("PRAGMA integrity_check").map_err(other)?;
-    let mut rows = check.query([]).map_err(other)?;
-    while let Some(row) = rows.next().map_err(other)? {
-        let result: String = row.get(0).map_err(other)?;
-        if result != "ok" {
-            return Err(other(result));
-        }
-    }
-    for kind in Kind::ALL {
-        let mut statement = tx.prepare(&kind.select("ORDER BY t.id")).map_err(other)?;
-        let mut rows = statement.query([]).map_err(other)?;
-        while let Some(row) = rows.next().map_err(other)? {
-            let (record, seq) = kind.decode(row)?;
-            if record.id().get() >= next_id || seq.get() >= next_seq {
-                return Err(other("Allocator metadata trails stored records"));
-            }
-        }
-        let sql = format!(
-            "SELECT id FROM publicworks_ids r WHERE kind=?1 AND NOT EXISTS (SELECT 1 FROM {} t WHERE t.id=r.id) LIMIT 1",
-            kind.table()
-        );
-        if tx
-            .query_row(&sql, [kind.name()], |r| r.get::<_, u64>(0))
-            .optional()
-            .map_err(other)?
-            .is_some()
-        {
-            return Err(other("Registry row has no typed record"));
-        }
-    }
-    Ok(())
-}

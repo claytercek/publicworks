@@ -1,6 +1,6 @@
 use super::*;
+use publicworks_runtime::snapshot::visible_segments;
 use rusqlite::{params_from_iter, types::Value};
-use std::collections::BTreeSet;
 
 pub(crate) fn select<T: Record>(
     tx: &Connection,
@@ -65,37 +65,8 @@ impl Filter {
     }
 }
 
-// Do not sort or deduplicate segments. Raw Storage permits dangling links,
-// cycles, and child IDs preceding fork cutoffs. Match the shared adapter's
-// child-first traversal and ID-only continuation even for those raw graphs.
 fn segments(tx: &Connection, query: &EntryQuery) -> Result<Vec<(Id, u64, u64)>, StorageError> {
-    let mut current = query.conversation_id;
-    let mut upper = query.max_entry_id.map_or(MAX_NUMBER, Id::get);
-    let lower = query.min_entry_id.map_or(1, Id::get);
-    let mut visited = BTreeSet::new();
-    let mut segments = Vec::new();
-    loop {
-        if !visited.insert(current) {
-            return Err(other("Cyclic conversation ancestry"));
-        }
-        let conversation: ConversationRecord =
-            exact(tx, current)?.ok_or_else(|| other(format!("Unknown conversation: {current}")))?;
-        if lower > upper {
-            break;
-        }
-        segments.push((current, lower, upper));
-        match conversation.parent {
-            Some(parent) => {
-                upper = upper.min(parent.at.get());
-                if upper < lower {
-                    break;
-                }
-                current = parent.conversation_id;
-            }
-            None => break,
-        }
-    }
-    Ok(segments)
+    visible_segments(query, |id| exact(tx, id))
 }
 fn segment_entries(
     tx: &Connection,
