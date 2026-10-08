@@ -96,5 +96,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_PR: ${{ steps.release-pr.outputs.pr }}
         run: |
-          branch=$(jq -er '.head_branch | select(startswith("release-plz-"))' <<< "$RELEASE_PR")
+          # release-plz emits an empty object when there is no release PR to update.
+          # Keep this step a no-op in that case rather than passing a non-string to
+          # startswith (or dispatching checks for an unrelated branch).
+          branch=$(jq -r '
+            if type == "object" and (.head_branch | type) == "string"
+            then .head_branch
+            else empty
+            end
+          ' <<< "$RELEASE_PR")
+
+          if [[ -z "$branch" || "$branch" != release-plz-* ]]; then
+            echo "No release-plz PR branch to check."
+            exit 0
+          fi
+
           gh workflow run checks.yml --ref "$branch"
