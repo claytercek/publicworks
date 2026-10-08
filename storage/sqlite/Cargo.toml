@@ -2,12 +2,14 @@
 name = "publicworks-storage-sqlite"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
 documentation = "https://docs.rs/publicworks-storage-sqlite"
 description = "SQLite storage adapter for the Public Works runtime"
+keywords = ["sqlite", "storage", "durable", "workflow", "persistence"]
 
 [dependencies]
 publicworks-runtime = { path = "../../runtime", version = "0.1.0" }

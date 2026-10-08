@@ -20,6 +20,24 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  msrv:
+    name: Check MSRV
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: 1.88.0
+
+      - name: Check workspace at MSRV
+        run: cargo check --workspace --all-targets --all-features --locked
+
   release-checks:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

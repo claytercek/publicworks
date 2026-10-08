@@ -2,12 +2,14 @@
 name = "publicworks-runtime"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
 documentation = "https://docs.rs/publicworks-runtime"
 description = "Executor-neutral durable task and conversation runtime"
+keywords = ["durable", "workflow", "runtime", "tasks", "agents"]
 
 [features]
 test-support = ["dep:tempfile"]

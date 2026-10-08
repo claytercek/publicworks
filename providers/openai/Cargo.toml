@@ -2,12 +2,14 @@
 name = "publicworks-provider-openai"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
 documentation = "https://docs.rs/publicworks-provider-openai"
 description = "OpenAI Responses adapter for Public Works agents"
+keywords = ["openai", "llm", "agent", "responses-api", "rustls"]
 
 [dependencies]
 publicworks-agent = { version = "0.1.0", path = "../../agent" }

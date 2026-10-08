@@ -2,12 +2,14 @@
 name = "publicworks-agent"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
 documentation = "https://docs.rs/publicworks-agent"
 description = "Provider-neutral durable agent turns and extension hooks"
+keywords = ["ai", "agent", "llm", "tools", "durable"]
 
 [dependencies]
 publicworks-runtime = { version = "0.1.0", path = "../runtime" }

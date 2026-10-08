@@ -1,81 +1,151 @@
 # Public Works
 
-Public Works is an experimental Rust runtime for durable conversations, tasks,
-and model/tool turns. Hosts provide storage, task definitions, model providers,
-and tools; Public Works persists progress and recovers interrupted work.
+[![CI](https://github.com/claytercek/publicworks/actions/workflows/release.yml/badge.svg)](https://github.com/claytercek/publicworks/actions/workflows/release.yml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](#rust-version)
 
-The project is at `0.1`. Persisted schemas, task checkpoints, and public APIs may
-change between releases. Public Works does not provide exactly-once external I/O,
-forced cancellation, authorization, or sandboxing.
+Public Works is an embeddable Rust runtime for durable conversations, tasks, and
+model/tool turns. It stores progress at explicit checkpoints so a host can resume
+interrupted work without depending on one async executor or model provider.
+
+Public Works is experimental software at `0.1`. Public APIs, persisted records,
+checkpoint formats, and adapter schemas may change between releases.
 
 ## Crates
 
-| Package | Purpose |
-| --- | --- |
-| [`publicworks-runtime`](runtime/) | Executor-neutral sessions, durable task trees, submissions, and an in-memory storage adapter |
-| [`publicworks-storage-sqlite`](storage/sqlite/) | Bundled SQLite storage for a single logical owner |
-| [`publicworks-agent`](agent/) | Provider-neutral durable model/tool turns and extension hooks |
-| [`publicworks-provider-openai`](providers/openai/) | Optional non-streaming OpenAI Responses adapter |
+| Package | Purpose | Documentation |
+| --- | --- | --- |
+| [`publicworks-runtime`](https://crates.io/crates/publicworks-runtime) | Executor-neutral sessions, durable task trees, submissions, and in-memory storage | [API docs](https://docs.rs/publicworks-runtime) · [Source](runtime/) |
+| [`publicworks-storage-sqlite`](https://crates.io/crates/publicworks-storage-sqlite) | Bundled SQLite storage for one logical owner | [API docs](https://docs.rs/publicworks-storage-sqlite) · [Source](storage/sqlite/) |
+| [`publicworks-agent`](https://crates.io/crates/publicworks-agent) | Provider-neutral durable model/tool turns and extension hooks | [API docs](https://docs.rs/publicworks-agent) · [Source](agent/) |
+| [`publicworks-provider-openai`](https://crates.io/crates/publicworks-provider-openai) | Optional non-streaming OpenAI Responses adapter | [API docs](https://docs.rs/publicworks-provider-openai) · [Source](providers/openai/) |
 
-The `publicworks-cli` persistence utility and `publicworks-perf` workload runner
-are source-only workspace packages.
+Most agent applications use the runtime, agent, and one storage adapter. Add the
+OpenAI provider only when the host sends requests to OpenAI.
 
-## Try it
+## Installation
 
-Run a complete agent turn with a local fake model and tool:
+A durable agent with SQLite storage uses these dependencies:
 
-```sh
-devenv shell -- cargo run -p publicworks-agent --example agent_turn
+```toml
+[dependencies]
+futures-lite = "2"
+publicworks-runtime = "0.1"
+publicworks-storage-sqlite = "0.1"
+publicworks-agent = "0.1"
 ```
 
-Or try the SQLite persistence utility:
+Add the OpenAI adapter when needed:
 
-```sh
-devenv shell -- cargo run -p publicworks-cli -- create /tmp/publicworks.db
-devenv shell -- cargo run -p publicworks-cli -- append /tmp/publicworks.db 2 "hello"
-devenv shell -- cargo run -p publicworks-cli -- show /tmp/publicworks.db 2
+```toml
+publicworks-provider-openai = "0.1"
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time"] }
 ```
 
-Each runtime entry point returns a driver future. The host must keep that driver
-polled while commands run and through orderly shutdown. The runtime does not
-spawn an executor and its futures need not be `Send`. The built-in memory and
-SQLite adapters perform synchronous work when polled; the OpenAI adapter uses
-asynchronous I/O and requires a Tokio host.
-
-Package READMEs and rustdoc contain the setup, lifecycle, recovery, and safety
-notes for each crate. Runnable examples live beside the crate that owns the API:
-
-- `runtime/examples/` covers task execution, task trees, cancellation, and memos.
-- `agent/examples/` covers a durable turn and host-defined tool policy.
-- `providers/openai/examples/` contains the opt-in live provider example.
-
-## Development
-
-Use the checked-in development environment:
+The crates can also be added with Cargo:
 
 ```sh
-devenv shell -- cargo fmt --all -- --check
-devenv shell -- cargo test --workspace --all-features --locked
-devenv shell -- cargo test --workspace --all-features --locked --features serde_json/arbitrary_precision
-devenv shell -- cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-devenv shell -- env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
-devenv shell -- cargo package --workspace --locked
+cargo add publicworks-runtime publicworks-storage-sqlite publicworks-agent
+cargo add publicworks-provider-openai
 ```
 
-CI also runs the local examples and repeats Clippy with the unified
-`serde_json/arbitrary_precision` feature.
+## Open a durable session
 
-The Checks workflow contains the shared verification job. On `main`, Release
-calls Checks instead of starting a second verification pipeline. Its release
-jobs depend on that result and are gated by the `RELEASE_PR_ENABLED` and
-`RELEASE_PUBLISH_ENABLED` repository variables. Verification has read-only
-permissions; release jobs receive only their required write permissions. A newer
-main-branch commit does not interrupt an in-progress release. To run verification
-and release automation manually, dispatch Release on `main`.
+The following program creates or opens a SQLite database, appends one entry, and
+shuts the session down cleanly:
 
-The publish job uses crates.io trusted publishing through OIDC; the first
-publication of a new crate must still be performed deliberately by a maintainer
-before configuring its trusted publisher.
+```rust
+use futures_lite::future::{block_on, zip};
+use publicworks_runtime::{EntryDraft, Session, SessionError};
+use publicworks_storage_sqlite::SqliteStorage;
+use std::error::Error;
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let storage = SqliteStorage::open("publicworks.db")?;
+
+    block_on(async move {
+        let (session, driver) = Session::new(storage);
+        let commands = async {
+            let receipt = session
+                .commit(|tx| Box::pin(async move {
+                    let conversation = tx.create_conversation().await?;
+                    tx.append_entry(conversation.id, EntryDraft::new("example"))
+                        .await
+                }))
+                .await?;
+
+            session.close().await?;
+            Ok::<_, SessionError>(receipt.value)
+        };
+
+        let (entry, ()) = zip(commands, driver).await;
+        println!("stored entry {}", entry?.id);
+        Ok::<_, SessionError>(())
+    })?;
+
+    Ok(())
+}
+```
+
+`Session::new` returns a handle and a driver future. The host must keep the driver
+polled while commands run and until `Session::close` completes. Public Works does
+not spawn an executor, and its futures do not need to be `Send`.
+
+For durable task execution, start with the
+[`publicworks-runtime` examples](runtime/examples/) and the
+[`Harness` documentation](https://docs.rs/publicworks-runtime/latest/publicworks_runtime/struct.Harness.html).
+
+## Run durable agent turns
+
+`publicworks-agent` adds checkpointed model requests, local tools, recovery
+policies, and lifecycle hooks. The host supplies a model implementation and tools,
+then opens a runtime `Harness` with the definitions returned by the agent.
+
+The [complete agent example](agent/examples/agent_turn.rs) uses a deterministic
+local model and tool, so it needs no network access or credentials. The
+[tool policy example](agent/examples/tool_policy.rs) shows how a host can inspect
+or rewrite tool calls before execution.
+
+`publicworks-provider-openai` implements the agent's model interface for the
+OpenAI Responses API. It uses asynchronous I/O and must be polled inside a Tokio
+runtime. See the [provider guide](providers/openai/README.md) for configuration,
+supported response types, and credential handling.
+
+## Recovery and side effects
+
+Task handlers commit progress through the runtime. External effects happen outside
+the storage transaction. A crash can therefore leave an effect completed without
+a matching durable result.
+
+Agent tools default to `ReplayPolicy::Unsafe`. If execution was interrupted after
+its intent was stored, recovery records an uncertain-effect error instead of
+running the tool again. Use `ReplayPolicy::Safe` only when repeating the stored
+arguments is acceptable. Public Works does not provide exactly-once external I/O.
+
+The built-in storage implementations assume one logical owner. The SQLite adapter
+does not provide a multi-process ownership lock and performs synchronous database
+work when polled.
+
+## Compatibility and limits
+
+The `0.1` release line has no migration guarantee for stored records, task
+checkpoints, agent checkpoints, definition versions, or SQLite schemas. Review the
+crate release notes before upgrading an application with unfinished durable work.
+
+Public Works does not provide authorization, sandboxing, forced cancellation,
+timers, multi-process coordination, or automatic schema migration. Model
+streaming, media, reasoning-state replay, and server-side conversation state are
+outside the current OpenAI adapter's scope.
+
+## Rust version
+
+Public Works supports Rust 1.88 and newer. The workspace uses Rust 2024 edition.
+A future release may raise the minimum supported Rust version in a minor release
+while the project remains below `1.0`.
+
+## Project policies
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) to build and test the workspace. Report
+security issues through the process in [SECURITY.md](SECURITY.md).
 
 ## License
 
