@@ -3,6 +3,8 @@
 release = false
 # Publishing is only eligible after a release-plz PR is merged.
 release_always = false
+# Docs, CI, and maintenance commits do not need a release PR on their own.
+release_commits = "^(feat|fix|perf)"
 changelog_update = true
 git_tag_enable = true
 git_release_enable = true

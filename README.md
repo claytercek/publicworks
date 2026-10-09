@@ -14,6 +14,14 @@ interrupted work without depending on one async executor or model provider.
 > **Experimental:** Public Works is `0.1` software. Public APIs, persisted records,
 > checkpoint formats, and adapter schemas may change between releases.
 
+## Feedback wanted
+
+Public Works is early `0.1` software, and feedback is welcome. In particular, I’d
+like to hear whether the host-polled driver model, crate boundaries, and recovery
+semantics make sense for the kinds of durable work you build. If you try it, open
+an issue with what you were building, where the API helped, and where it got in
+your way.
+
 ## Who is this for?
 
 Public Works is for developers embedding durable work in Rust applications:
