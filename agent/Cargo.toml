@@ -12,7 +12,7 @@ description = "Provider-neutral durable agent turns and extension hooks"
 keywords = ["ai", "agent", "llm", "tools", "durable"]
 
 [dependencies]
-publicworks-runtime = { version = "0.1.0", path = "../runtime" }
+publicworks-runtime = { version = "0.1.1", path = "../runtime" }
 serde_json.workspace = true
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 
@@ -22,5 +22,5 @@ test = true
 
 [dev-dependencies]
 futures-lite = "2"
-publicworks-runtime = { version = "0.1.0", path = "../runtime", features = ["test-support"] }
-publicworks-storage-sqlite = { version = "0.1.0", path = "../storage/sqlite" }
+publicworks-runtime = { version = "0.1.1", path = "../runtime", features = ["test-support"] }
+publicworks-storage-sqlite = { version = "0.1.1", path = "../storage/sqlite" }
