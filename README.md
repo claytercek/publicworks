@@ -7,6 +7,10 @@ Public Works is an embeddable Rust runtime for durable conversations, tasks, and
 model/tool turns. It stores progress at explicit checkpoints so a host can resume
 interrupted work without depending on one async executor or model provider.
 
+> **Yes, agents helped build this.** Public Works is developed with coding agents,
+> which seems appropriate for software meant to support them. They do a meaningful
+> amount of the typing. A human owns the design, review, and release decisions.
+
 > **Experimental:** Public Works is `0.1` software. Public APIs, persisted records,
 > checkpoint formats, and adapter schemas may change between releases.
 
